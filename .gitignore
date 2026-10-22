@@ -1,0 +1,36 @@
+# Rust builds and temporary compiler output
+/target/
+**/*.rs.bk
+*.profraw
+*.profdata
+
+# Keep Cargo.lock in version control for this binary project.
+
+# Local editor / OS metadata
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Temporary output and crash logs
+*.log
+core
+core.*
+
+# Local environment and credentials — never commit secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Development lesson backups (Git commits become the checkpoints)
+*.rs.lesson*
+*.rs.bak
+*.rs.backup
+*.rs.orig
+*.rs.rej
+*.patch

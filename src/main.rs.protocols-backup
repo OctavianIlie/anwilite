@@ -1,0 +1,185 @@
+use std::{sync::Arc, thread, time::Duration};
+
+use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
+use smithay::{
+    delegate_shm,
+    wayland::{
+        buffer::BufferHandler,
+        shm::{ShmHandler, ShmState},
+    },
+};
+
+use smithay::{
+    delegate_compositor, delegate_seat, delegate_xdg_shell,
+    input::{Seat, SeatHandler, SeatState, pointer::CursorImageStatus},
+    reexports::wayland_server::{
+        Client, Display, ListeningSocket,
+        backend::ClientData,
+        protocol::{wl_seat::WlSeat, wl_surface::WlSurface},
+    },
+    utils::Serial,
+    wayland::{
+        compositor::{CompositorClientState, CompositorHandler, CompositorState},
+        shell::xdg::{
+            PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
+        },
+    },
+};
+
+// Global Octlitch state
+struct Octlitch {
+    compositor_state: CompositorState,
+    xdg_shell_state: XdgShellState,
+    seat_state: SeatState<Self>,
+    _seat: Seat<Self>,
+    shm_state: ShmState,
+}
+
+// Per-client state
+#[derive(Default)]
+struct OctlitchClient {
+    compositor_state: CompositorClientState,
+}
+
+impl ClientData for OctlitchClient {}
+
+// Handle core Wayland surfaces
+impl CompositorHandler for Octlitch {
+    fn compositor_state(&mut self) -> &mut CompositorState {
+        &mut self.compositor_state
+    }
+
+    fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
+        &client
+            .get_data::<OctlitchClient>()
+            .unwrap()
+            .compositor_state
+    }
+
+    fn commit(&mut self, surface: &WlSurface) {
+        println!("Surface committed: {:?}", surface);
+    }
+}
+
+impl AsMut<CompositorState> for Octlitch {
+    fn as_mut(&mut self) -> &mut CompositorState {
+        &mut self.compositor_state
+    }
+}
+
+// Handle input seats
+impl SeatHandler for Octlitch {
+    type KeyboardFocus = WlSurface;
+    type PointerFocus = WlSurface;
+    type TouchFocus = WlSurface;
+
+    fn seat_state(&mut self) -> &mut SeatState<Self> {
+        &mut self.seat_state
+    }
+
+    fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {
+        // Keyboard focus handling comes later.
+    }
+
+    fn cursor_image(&mut self, _seat: &Seat<Self>, _image: CursorImageStatus) {
+        // Cursor rendering comes later.
+    }
+}
+
+// Handle application windows
+impl XdgShellHandler for Octlitch {
+    fn xdg_shell_state(&mut self) -> &mut XdgShellState {
+        &mut self.xdg_shell_state
+    }
+
+    fn new_toplevel(&mut self, surface: ToplevelSurface) {
+        println!("New Octlitch window: {:?}", surface.wl_surface());
+
+        surface.send_configure();
+    }
+
+    fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
+        println!("New popup: {:?}", surface.wl_surface());
+    }
+
+    fn grab(&mut self, _surface: PopupSurface, _seat: WlSeat, _serial: Serial) {
+        // Popup grabs will be implemented later.
+    }
+
+    fn reposition_request(
+        &mut self,
+        _surface: PopupSurface,
+        _positioner: PositionerState,
+        _token: u32,
+    ) {
+        // Popup positioning will be implemented later.
+    }
+}
+
+impl BufferHandler for Octlitch {
+    fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {
+        //add later
+    }
+}
+
+impl ShmHandler for Octlitch {
+    fn shm_state(&self) -> &ShmState {
+        &self.shm_state
+    }
+}
+
+// Connect Smithay's protocol implementations
+delegate_compositor!(Octlitch);
+delegate_seat!(Octlitch);
+delegate_xdg_shell!(Octlitch);
+delegate_shm!(Octlitch);
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("Starting Octlitch Compositor...");
+
+    let mut display = Display::<Octlitch>::new()?;
+    let mut dh = display.handle();
+
+    let shm_state = ShmState::new::<Octlitch>(&dh, vec![]);
+
+    // Core surface protocol
+    let compositor_state = CompositorState::new::<Octlitch>(&dh);
+
+    // Application window protocol
+    let xdg_shell_state = XdgShellState::new::<Octlitch>(&dh);
+
+    // Create an input seat
+    let mut seat_state = SeatState::new();
+    let seat = seat_state.new_wl_seat(&dh, "octlitch-seat-0");
+
+    let mut state = Octlitch {
+        compositor_state,
+        xdg_shell_state,
+        seat_state,
+        _seat: seat,
+        shm_state,
+    };
+
+    // Create the Wayland socket
+    let socket = ListeningSocket::bind_auto("octlitch", 0..32)?;
+
+    let socket_name = socket
+        .socket_name()
+        .expect("Missing socket name")
+        .to_string_lossy();
+
+    println!("Listening on: {}", socket_name);
+
+    loop {
+        if let Some(stream) = socket.accept()? {
+            dh.insert_client(stream, Arc::new(OctlitchClient::default()))?;
+
+            println!("Wayland client connected!");
+        }
+
+        display.dispatch_clients(&mut state)?;
+        display.flush_clients()?;
+
+        thread::sleep(Duration::from_millis(10));
+    }
+}

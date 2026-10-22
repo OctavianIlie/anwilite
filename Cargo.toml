@@ -1,0 +1,12 @@
+[package]
+name = "anwilite"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+calloop = "0.14"
+smithay = { version = "0.7", default-features = false, features = ["backend_winit", "desktop", "renderer_gl", "wayland_frontend"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wayland-protocols = { version = "0.32", features = ["server"] }
+wayland-server = "0.31"
+winit = { version = "0.30", default-features = false, features = ["wayland", "wayland-dlopen", "x11", "rwh_06"] }
