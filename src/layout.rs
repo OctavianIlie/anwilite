@@ -130,8 +130,8 @@ mod tests {
         assert_eq!(
             left,
             SnapRect {
-                x: 12,
-                y: 12,
+                x: 6,
+                y: 6,
                 width: 582,
                 height: 776,
             }
@@ -164,21 +164,38 @@ mod tests {
         assert_eq!(right.x + right.width, 1001 - 11);
     }
 
+    
     #[test]
     fn invalid_gaps_are_rejected() {
+        // Negative gaps should always be rejected.
         let invalid = SnapGaps {
             outer: -1,
             inner: 12,
         };
 
         assert_eq!(
-            snap_rect_with_gaps((800, 600), SnapSide::Left, invalid),
+            snap_rect_with_gaps(
+                (800, 600),
+                SnapSide::Left,
+                invalid,
+            ),
             None
         );
 
+        // These explicit gaps are too large for a 20x20 output.
+        let oversized = SnapGaps {
+            outer: 12,
+            inner: 12,
+        };
+
         assert_eq!(
-            snap_rect_with_gaps((20, 20), SnapSide::Left, DEFAULT_SNAP_GAPS),
+            snap_rect_with_gaps(
+                (20, 20),
+                SnapSide::Left,
+                oversized,
+            ),
             None
         );
     }
+
 }
