@@ -164,7 +164,6 @@ mod tests {
         assert_eq!(right.x + right.width, 1001 - 11);
     }
 
-    
     #[test]
     fn invalid_gaps_are_rejected() {
         // Negative gaps should always be rejected.
@@ -174,11 +173,7 @@ mod tests {
         };
 
         assert_eq!(
-            snap_rect_with_gaps(
-                (800, 600),
-                SnapSide::Left,
-                invalid,
-            ),
+            snap_rect_with_gaps((800, 600), SnapSide::Left, invalid,),
             None
         );
 
@@ -189,13 +184,8 @@ mod tests {
         };
 
         assert_eq!(
-            snap_rect_with_gaps(
-                (20, 20),
-                SnapSide::Left,
-                oversized,
-            ),
+            snap_rect_with_gaps((20, 20), SnapSide::Left, oversized,),
             None
         );
     }
-
 }

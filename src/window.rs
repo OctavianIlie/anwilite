@@ -351,7 +351,6 @@ impl WindowManager {
             return false;
         }
 
-        
         let Some(target) = snap_rect_with_gaps(output_size, side, DEFAULT_SNAP_GAPS) else {
             return false;
         };
@@ -390,8 +389,8 @@ impl WindowManager {
         window.x = target.x - geometry.loc.x;
         window.y = target.y - geometry.loc.y;
         if window.pending_unsnap.is_some() {
-                    return false;
-                }
+            return false;
+        }
 
         // Ask the Wayland client to resize its content.
         window.surface.with_pending_state(|state| {
@@ -409,7 +408,6 @@ impl WindowManager {
         if self.dragging.is_some() || self.resizing.is_some() {
             return false;
         }
-
 
         if self
             .settling
@@ -442,9 +440,7 @@ impl WindowManager {
         window.x = -geometry.loc.x;
         window.y = -geometry.loc.y;
         if window.pending_unsnap.is_some() {
-
             return false;
-
         }
 
         surface.with_pending_state(|state| {
