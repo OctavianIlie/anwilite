@@ -1,4 +1,4 @@
-use crate::layout::{DEFAULT_SNAP_GAPS, SnapRect, SnapSide, snap_rect_with_gaps};
+use crate::layout::{DEFAULT_SNAP_GAPS, SnapRect, SnapSide, snap_rect_with_gaps, tile_rects};
 use crate::workspace::{WORKSPACE_COUNT, Workspaces};
 
 use smithay::{
@@ -47,6 +47,8 @@ pub struct ManagedWindow {
     restoring: Option<(NormalGeometry, Instant)>,
     pub workspace: usize,
     pending_unsnap: Option<PendingUnsnap>,
+    tiled: Option<SnapRect>,
+    pre_tile: Option<NormalGeometry>,
 }
 
 struct DragState {
@@ -133,6 +135,13 @@ fn window_geometry(window: &ManagedWindow) -> Option<Rectangle<i32, Logical>> {
     (geometry.size.w > 0 && geometry.size.h > 0).then_some(geometry)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LayoutMode {
+    #[default]
+    Floating,
+    Tiled,
+}
+
 #[derive(Default)]
 pub struct WindowManager {
     pub windows: Vec<ManagedWindow>,
@@ -143,6 +152,7 @@ pub struct WindowManager {
     dragging: Option<DragState>,
     resizing: Option<ResizeState>,
     settling: Option<SettlingResize>,
+    layout_modes: [LayoutMode; WORKSPACE_COUNT],
 }
 
 impl WindowManager {
@@ -164,12 +174,123 @@ impl WindowManager {
                 restoring: None,
                 snapped: None,
                 pending_unsnap: None,
+                tiled: None,
+                pre_tile: None,
             },
         );
     }
 
     pub fn current_workspace(&self) -> usize {
         self.workspaces.current_number()
+    }
+
+    pub fn current_layout_mode(&self) -> LayoutMode {
+        self.layout_modes[self.current_workspace() - 1]
+    }
+
+    pub fn toggle_tiling(&mut self, output_size: (i32, i32)) -> bool {
+        if self.dragging.is_some() || self.resizing.is_some() || self.settling.is_some() {
+            return false;
+        }
+
+        let current = self.current_workspace();
+        let slot = current - 1;
+
+        // TILED -> FLOATING
+        if self.layout_modes[slot] == LayoutMode::Tiled {
+            for window in self
+                .windows
+                .iter_mut()
+                .filter(|window| window.workspace == current)
+            {
+                let Some(normal) = window.pre_tile.take() else {
+                    continue;
+                };
+
+                window.tiled = None;
+
+                if let Some(geometry) = window_geometry(window) {
+                    window.x = normal.left - geometry.loc.x;
+                    window.y = normal.top - geometry.loc.y;
+                }
+
+                window.restoring = Some((normal, Instant::now()));
+
+                window.surface.with_pending_state(|state| {
+                    state.size = Some((normal.width, normal.height).into());
+                });
+
+                window.surface.send_configure();
+            }
+
+            self.layout_modes[slot] = LayoutMode::Floating;
+            return true;
+        }
+
+        // FLOATING -> TILED
+
+        let indices: Vec<usize> = self
+            .windows
+            .iter()
+            .enumerate()
+            .filter(|(_, window)| window.workspace == current && window.surface.alive())
+            .map(|(index, _)| index)
+            .collect();
+
+        if indices.is_empty() {
+            return false;
+        }
+
+        let Some(rectangles) = tile_rects(output_size, indices.len(), DEFAULT_SNAP_GAPS) else {
+            return false;
+        };
+
+        let mut planned = Vec::new();
+
+        for (index, target) in indices.into_iter().zip(rectangles) {
+            let window = &self.windows[index];
+
+            if window.maximized
+                || window.snapped.is_some()
+                || window.restoring.is_some()
+                || window.pending_unsnap.is_some()
+                || window.tiled.is_some()
+            {
+                return false;
+            }
+
+            let Some(geometry) = window_geometry(window) else {
+                return false;
+            };
+
+            let normal = NormalGeometry {
+                left: window.x + geometry.loc.x,
+                top: window.y + geometry.loc.y,
+                width: geometry.size.w,
+                height: geometry.size.h,
+            };
+
+            planned.push((index, target, normal, geometry.loc.x, geometry.loc.y));
+        }
+
+        for (index, target, normal, offset_x, offset_y) in planned {
+            let window = &mut self.windows[index];
+
+            window.pre_tile = Some(normal);
+            window.tiled = Some(target);
+
+            window.x = target.x - offset_x;
+            window.y = target.y - offset_y;
+
+            window.surface.with_pending_state(|state| {
+                state.size = Some((target.width, target.height).into());
+            });
+
+            window.surface.send_configure();
+        }
+
+        self.layout_modes[slot] = LayoutMode::Tiled;
+        true
     }
 
     pub fn switch_to_workspace(&mut self, number: usize) -> bool {
@@ -180,19 +301,22 @@ impl WindowManager {
     }
 
     pub fn move_focused_to_workspace(&mut self, focused: &WlSurface, number: usize) -> bool {
-        // Don't move a window during an interactive drag or resize.
         if self.is_dragging() || self.is_resizing() {
             return false;
         }
 
         let current = self.current_workspace();
 
-        // Validate the destination.
         if !(1..=WORKSPACE_COUNT).contains(&number) || number == current {
             return false;
         }
 
-        // Find the window that actually has keyboard focus.
+        if self.layout_modes[current - 1] == LayoutMode::Tiled
+            || self.layout_modes[number - 1] == LayoutMode::Tiled
+        {
+            return false;
+        }
+
         let Some(index) = self.windows.iter().position(|window| {
             window.workspace == current
                 && window.surface.alive()
@@ -201,12 +325,10 @@ impl WindowManager {
             return false;
         };
 
-        // Switch to the destination workspace.
         if !self.workspaces.switch_to(number) {
             return false;
         }
 
-        // Move the window and place it at the front.
         let mut window = self.windows.remove(index);
         window.workspace = number;
         self.windows.insert(0, window);
@@ -235,7 +357,6 @@ impl WindowManager {
             }
         }
 
-        // Fallback: choose the frontmost living window.
         self.windows
             .iter()
             .find(|window| window.workspace == current && window.surface.alive())
@@ -381,18 +502,17 @@ impl WindowManager {
             });
         }
 
+        if window.tiled.is_some() || window.pending_unsnap.is_some() {
+            return false;
+        }
+
         window.restoring = None;
         window.maximized = false;
         window.snapped = Some((side, target));
 
-        // Position the visible window geometry.
         window.x = target.x - geometry.loc.x;
         window.y = target.y - geometry.loc.y;
-        if window.pending_unsnap.is_some() {
-            return false;
-        }
 
-        // Ask the Wayland client to resize its content.
         window.surface.with_pending_state(|state| {
             state.states.unset(xdg_toplevel::State::Maximized);
             state.size = Some((target.width, target.height).into());
@@ -403,7 +523,6 @@ impl WindowManager {
         true
     }
 
-    /// Respond to xdg_toplevel.set_maximized for a single nested output.
     pub fn maximize(&mut self, surface: &ToplevelSurface, output_size: (i32, i32)) -> bool {
         if self.dragging.is_some() || self.resizing.is_some() {
             return false;
@@ -433,26 +552,25 @@ impl WindowManager {
                 height: geometry.size.h,
             });
         }
+        if window.tiled.is_some() || window.pending_unsnap.is_some() {
+            return false;
+        }
 
         window.restoring = None;
         window.maximized = true;
         window.snapped = None;
         window.x = -geometry.loc.x;
         window.y = -geometry.loc.y;
-        if window.pending_unsnap.is_some() {
-            return false;
-        }
 
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Maximized);
             state.size = Some(output_size.into());
         });
-        // A maximize request must receive a configure even if already maximized.
+
         surface.send_configure();
         true
     }
 
-    /// Restore both the normal geometry and the XDG maximized state.
     pub fn restore(&mut self, surface: &ToplevelSurface) -> bool {
         let Some(window) = self.windows.iter_mut().find(|w| &w.surface == surface) else {
             return false;
@@ -467,7 +585,7 @@ impl WindowManager {
                 window.x = normal.left - geometry.loc.x;
                 window.y = normal.top - geometry.loc.y;
             }
-            // Keep the visual origin stable until the restored size arrives.
+
             window.restoring = Some((normal, Instant::now()));
         }
         window.maximized = false;
@@ -479,8 +597,6 @@ impl WindowManager {
         surface.send_configure();
         true
     }
-
-    /// Reconfigure maximized clients when the nested Winit output changes size.
 
     pub fn resize_placed_windows(&mut self, output_size: (i32, i32)) {
         for window in &mut self.windows {
@@ -496,6 +612,50 @@ impl WindowManager {
                 };
 
                 window.snapped = Some((side, target));
+
+                if let Some(geometry) = window_geometry(window) {
+                    window.x = target.x - geometry.loc.x;
+                    window.y = target.y - geometry.loc.y;
+                }
+
+                window.surface.with_pending_state(|state| {
+                    state.size = Some((target.width, target.height).into());
+                });
+
+                window.surface.send_pending_configure();
+            }
+        }
+
+        // Recalculate tiled geometry for every tiled workspace.
+        for workspace in 1..=WORKSPACE_COUNT {
+            if self.layout_modes[workspace - 1] != LayoutMode::Tiled {
+                continue;
+            }
+
+            let indices: Vec<usize> = self
+                .windows
+                .iter()
+                .enumerate()
+                .filter(|(_, window)| {
+                    window.workspace == workspace
+                        && window.tiled.is_some()
+                        && window.surface.alive()
+                })
+                .map(|(index, _)| index)
+                .collect();
+
+            let Some(rectangles) = tile_rects(output_size, indices.len(), DEFAULT_SNAP_GAPS) else {
+                continue;
+            };
+
+            for (index, target) in indices.into_iter().zip(rectangles) {
+                let window = &mut self.windows[index];
+
+                if window.tiled == Some(target) {
+                    continue;
+                }
+
+                window.tiled = Some(target);
 
                 if let Some(geometry) = window_geometry(window) {
                     window.x = target.x - geometry.loc.x;
@@ -541,6 +701,11 @@ impl WindowManager {
             }
             return;
         }
+        if let Some(target) = window.tiled {
+            window.x = target.x - geometry.loc.x;
+            window.y = target.y - geometry.loc.y;
+            return;
+        }
 
         if window.maximized {
             window.x = -geometry.loc.x;
@@ -582,7 +747,7 @@ impl WindowManager {
             return false;
         };
 
-        if window.maximized || window.pending_unsnap.is_some() {
+        if window.maximized || window.pending_unsnap.is_some() || window.tiled.is_some() {
             return false;
         }
 
@@ -591,7 +756,6 @@ impl WindowManager {
                 return false;
             };
 
-            // Retrieve the size saved before the window was snapped.
             let Some(normal) = window.saved_normal.take() else {
                 return false;
             };
@@ -682,7 +846,7 @@ impl WindowManager {
         else {
             return false;
         };
-        if window.maximized || window.snapped.is_some() {
+        if window.maximized || window.snapped.is_some() || window.pending_unsnap.is_some() {
             return false;
         }
         let Some(geometry) = window_geometry(window) else {

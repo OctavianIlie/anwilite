@@ -260,6 +260,7 @@ enum WorkspaceCommand {
     Snap(SnapSide),
     Maximize,
     Restore,
+    ToggleTiling,
 }
 
 struct App {
@@ -417,6 +418,11 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
                                 // Get the unmodified keyboard symbol.
                                 let symbol = handle.raw_syms().first().map(|sym| sym.raw());
+                                if modifiers.shift
+                                    && matches!(symbol, Some(keysyms::KEY_t | keysyms::KEY_T))
+                                {
+                                    return FilterResult::Intercept(WorkspaceCommand::ToggleTiling);
+                                }
 
                                 if !modifiers.shift {
                                     let placement = match symbol {
@@ -467,6 +473,10 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                 // Avoid switching while a mouse press is active.
                                 if state.move_press.is_none() {
                                     let changed = match command {
+                                        WorkspaceCommand::ToggleTiling => {
+                                            state.windows.toggle_tiling(state.output_size)
+                                        }
+
                                         WorkspaceCommand::SwitchTo(number) => {
                                             state.windows.switch_to_workspace(number)
                                         }
@@ -523,6 +533,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                             command,
                                             WorkspaceCommand::SwitchTo(_)
                                                 | WorkspaceCommand::MoveAndFollow(_)
+                                                | WorkspaceCommand::ToggleTiling
                                         ) {
                                             let focus = state.windows.focused_surface();
 
