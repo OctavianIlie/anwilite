@@ -505,11 +505,14 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
                                         WorkspaceCommand::MoveAndFollow(number) => {
                                             let focused = keyboard.current_focus();
+                                            let output_size = state.output_size;
 
                                             focused.as_ref().is_some_and(|surface| {
-                                                state
-                                                    .windows
-                                                    .move_focused_to_workspace(surface, number)
+                                                state.windows.move_focused_to_workspace(
+                                                    surface,
+                                                    number,
+                                                    output_size,
+                                                )
                                             })
                                         }
 

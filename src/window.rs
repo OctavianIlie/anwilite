@@ -142,6 +142,23 @@ pub enum LayoutMode {
     Tiled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransferAction {
+    KeepPlacement,
+    RestoreFloating,
+    Retile,
+}
+
+fn transfer_action(source: LayoutMode, destination: LayoutMode) -> TransferAction {
+    match (source, destination) {
+        (LayoutMode::Floating, LayoutMode::Floating) => TransferAction::KeepPlacement,
+
+        (LayoutMode::Tiled, LayoutMode::Floating) => TransferAction::RestoreFloating,
+
+        (_, LayoutMode::Tiled) => TransferAction::Retile,
+    }
+}
+
 #[derive(Default)]
 pub struct WindowManager {
     pub windows: Vec<ManagedWindow>,
@@ -295,9 +312,15 @@ impl WindowManager {
             };
 
             let normal = if window.tiled.is_none() {
-                if window.snapped.is_some() {
+                if let Some(saved) = window.pre_tile {
+                    Some(saved)
+                } else if window.snapped.is_some() {
+                    // Snapped -> Tiled:
+                    // Keep geometry saved before snapping.
                     window.saved_normal
                 } else {
+                    // Floating -> Tiled:
+                    // Capture the current floating geometry.
                     Some(NormalGeometry {
                         left: window.x + geometry.loc.x,
                         top: window.y + geometry.loc.y,
@@ -396,20 +419,19 @@ impl WindowManager {
         self.workspaces.switch_to(number)
     }
 
-    pub fn move_focused_to_workspace(&mut self, focused: &WlSurface, number: usize) -> bool {
-        if self.is_dragging() || self.is_resizing() {
+    pub fn move_focused_to_workspace(
+        &mut self,
+        focused: &WlSurface,
+        number: usize,
+        output_size: (i32, i32),
+    ) -> bool {
+        if self.is_dragging() || self.is_resizing() || self.settling.is_some() {
             return false;
         }
 
         let current = self.current_workspace();
 
         if !(1..=WORKSPACE_COUNT).contains(&number) || number == current {
-            return false;
-        }
-
-        if self.layout_modes[current - 1] == LayoutMode::Tiled
-            || self.layout_modes[number - 1] == LayoutMode::Tiled
-        {
             return false;
         }
 
@@ -421,12 +443,56 @@ impl WindowManager {
             return false;
         };
 
+        let source_mode = self.layout_modes[current - 1];
+        let destination_mode = self.layout_modes[number - 1];
+
+        let action = transfer_action(source_mode, destination_mode);
+
+        // Validate the window before modifying workspace state.
+        let window = &self.windows[index];
+
+        if window.pending_unsnap.is_some() || window.restoring.is_some() || window.maximized {
+            return false;
+        }
+
+        if action == TransferAction::RestoreFloating
+            && window.tiled.is_some()
+            && window.pre_tile.is_none()
+        {
+            return false;
+        }
+
+        // Switch to the target workspace first.
         if !self.workspaces.switch_to(number) {
             return false;
         }
 
         let mut window = self.windows.remove(index);
+
         window.workspace = number;
+
+        // TILED -> FLOATING:
+        // Return the window to its original floating geometry.
+        if action == TransferAction::RestoreFloating {
+            if window.tiled.take().is_some() {
+                if let Some(normal) = window.pre_tile.take() {
+                    if let Some(geometry) = window_geometry(&window) {
+                        window.x = normal.left - geometry.loc.x;
+                        window.y = normal.top - geometry.loc.y;
+                    }
+
+                    // The client still needs time to resize.
+                    window.restoring = Some((normal, Instant::now()));
+
+                    window.surface.with_pending_state(|state| {
+                        state.size = Some((normal.width, normal.height).into());
+                    });
+
+                    window.surface.send_configure();
+                }
+            }
+        }
+
         self.windows.insert(0, window);
 
         if self.last_focused[current - 1].as_ref() == Some(focused) {
@@ -434,6 +500,16 @@ impl WindowManager {
         }
 
         self.last_focused[number - 1] = Some(focused.clone());
+
+        // Source workspace might have lost a tile.
+        if source_mode == LayoutMode::Tiled {
+            self.reflow_tiled_workspace(current, output_size);
+        }
+
+        // Destination workspace might have gained a tile.
+        if destination_mode == LayoutMode::Tiled {
+            self.reflow_tiled_workspace(number, output_size);
+        }
 
         true
     }
@@ -1143,5 +1219,42 @@ impl WindowManager {
             state.states.unset(xdg_toplevel::State::Resizing);
         });
         resize.anchor.surface.send_pending_configure();
+    }
+}
+
+#[cfg(test)]
+mod transfer_tests {
+    use super::*;
+
+    #[test]
+    fn floating_to_floating_keeps_placement() {
+        assert_eq!(
+            transfer_action(LayoutMode::Floating, LayoutMode::Floating,),
+            TransferAction::KeepPlacement
+        );
+    }
+
+    #[test]
+    fn floating_to_tiled_retiles() {
+        assert_eq!(
+            transfer_action(LayoutMode::Floating, LayoutMode::Tiled,),
+            TransferAction::Retile
+        );
+    }
+
+    #[test]
+    fn tiled_to_floating_restores_geometry() {
+        assert_eq!(
+            transfer_action(LayoutMode::Tiled, LayoutMode::Floating,),
+            TransferAction::RestoreFloating
+        );
+    }
+
+    #[test]
+    fn tiled_to_tiled_retiles() {
+        assert_eq!(
+            transfer_action(LayoutMode::Tiled, LayoutMode::Tiled,),
+            TransferAction::Retile
+        );
     }
 }
