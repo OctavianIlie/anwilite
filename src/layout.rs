@@ -123,7 +123,54 @@ pub fn tile_rects(
             Some(vec![left, right])
         }
 
-        _ => None,
+        n => {
+            let master = snap_rect_with_gaps(output_size, SnapSide::Left, gaps)?;
+
+            let stack_area = snap_rect_with_gaps(output_size, SnapSide::Right, gaps)?;
+
+            let stack_count = i32::try_from(n - 1).ok()?;
+
+            let gap_count = stack_count.checked_sub(1)?;
+
+            let total_inner_gaps = gaps.inner.checked_mul(gap_count)?;
+
+            let usable_height = stack_area.height.checked_sub(total_inner_gaps)?;
+
+            if usable_height < stack_count {
+                return None;
+            }
+
+            let base_height = usable_height / stack_count;
+
+            let remainder = usable_height % stack_count;
+
+            let mut rects = Vec::with_capacity(n);
+
+            rects.push(master);
+
+            let mut y = stack_area.y;
+
+            for i in 0..stack_count {
+                let extra = if i < remainder { 1 } else { 0 };
+
+                let height = base_height + extra;
+
+                rects.push(SnapRect {
+                    x: stack_area.x,
+                    y,
+                    width: stack_area.width,
+                    height,
+                });
+
+                y = y.checked_add(height)?;
+
+                if i + 1 < stack_count {
+                    y = y.checked_add(gaps.inner)?;
+                }
+            }
+
+            Some(rects)
+        }
     }
 }
 
@@ -316,14 +363,11 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_or_invalid_layouts_fail() {
+    fn invalid_layouts_fail() {
         let gaps = SnapGaps {
             outer: 12,
             inner: 12,
         };
-
-        // Three-window layouts aren't supported yet.
-        assert_eq!(tile_rects((1200, 800), 3, gaps), None);
 
         // Insufficient space for the outer gaps.
         assert_eq!(tile_rects((20, 20), 1, gaps), None);
@@ -340,5 +384,50 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn three_windows_use_master_and_stack() {
+        let rects = tile_rects((1200, 800), 3, DEFAULT_SNAP_GAPS).unwrap();
+        assert_eq!(rects.len(), 3);
+        assert_eq!(
+            rects[0],
+            SnapRect {
+                x: 6,
+                y: 6,
+                width: 591,
+                height: 788,
+            }
+        );
+    }
+
+    #[test]
+    fn four_windows_distribute_remainder_pixels() {
+        let rects = tile_rects((1200, 800), 4, DEFAULT_SNAP_GAPS).unwrap();
+
+        assert_eq!(rects.len(), 4);
+
+        // Master stays the same size.
+        assert_eq!(rects[0].height, 788);
+
+        // Three stacked windows share the right column.
+        assert_eq!(rects[1].height, 259);
+        assert_eq!(rects[2].height, 259);
+        assert_eq!(rects[3].height, 258);
+
+        // Exact 6-pixel gaps between stacked windows.
+        assert_eq!(rects[2].y - (rects[1].y + rects[1].height), 6);
+
+        assert_eq!(rects[3].y - (rects[2].y + rects[2].height), 6);
+
+        // Final window ends at the bottom outer gap.
+        assert_eq!(rects[3].y + rects[3].height, 794);
+    }
+
+    #[test]
+    fn stack_rejects_insufficient_vertical_space() {
+        // Four stack windows need three 6-pixel gaps,
+        // but this output is too short.
+        assert_eq!(tile_rects((1200, 25), 5, DEFAULT_SNAP_GAPS,), None);
     }
 }
