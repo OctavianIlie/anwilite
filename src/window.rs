@@ -278,6 +278,29 @@ impl WindowManager {
             .map(|(index, _)| index)
             .collect();
 
+        let maximized_surfaces: Vec<ToplevelSurface> = 
+        if indices.len() > 1 {
+            indices
+                .iter()
+                .filter_map(|&index| {
+                    let window = &self.windows[index];
+
+                    if window.tiled.is_some() && window.maximized {
+                        Some(window.surface.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for surface in maximized_surfaces {
+            if !self.restore(&surface) {
+                return false;
+            }
+        }
+
         if indices.len() > 2 {
             eprintln!(
                 "Anwilite: workspace {} has {} windows; \
@@ -380,6 +403,13 @@ impl WindowManager {
 
         // TILED -> FLOATING
         if self.layout_modes[slot] == LayoutMode::Tiled {
+            let has_maximized_tile = self.windows.iter().any(|window| {
+                window.workspace == workspace && window.maximized && window.tiled.is_some()
+            });
+            if has_maximized_tile {
+                return false;
+            }
+
             self.stop_tiling_workspace(workspace);
             return true;
         }
@@ -712,10 +742,46 @@ impl WindowManager {
     }
 
     pub fn maximize(&mut self, surface: &ToplevelSurface, output_size: (i32, i32)) -> bool {
+        // Don't maximize during an interactive drag or resize.
         if self.dragging.is_some() || self.resizing.is_some() {
             return false;
         }
 
+        let active_workspace = self.current_workspace();
+
+        // Count tiled windows before borrowing a window mutably.
+        let tiled_count = self
+            .windows
+            .iter()
+            .filter(|window| {
+                window.workspace == active_workspace
+                    && window.surface.alive()
+                    && window.tiled.is_some()
+            })
+            .count();
+
+        // Locate the requested window.
+        let Some(index) = self
+            .windows
+            .iter()
+            .position(|window| &window.surface == surface)
+        else {
+            return false;
+        };
+
+        // Validate the transition before changing anything.
+        if self.windows[index].pending_unsnap.is_some() {
+            return false;
+        }
+
+        if self.windows[index].tiled.is_some()
+            && (self.windows[index].workspace != active_workspace || tiled_count != 1)
+        {
+            // Multi-window tiled maximization comes in 27C.2.
+            return false;
+        }
+
+        // Clear an old resize-settling state for this surface.
         if self
             .settling
             .as_ref()
@@ -723,13 +789,37 @@ impl WindowManager {
         {
             self.settling = None;
         }
-        let Some(window) = self.windows.iter_mut().find(|w| &w.surface == surface) else {
-            return false;
-        };
+
+        // Now obtain mutable access to the target window.
+        let window = &mut self.windows[index];
+
         let Some(geometry) = window_geometry(window) else {
             return false;
         };
 
+        // TILED -> MAXIMIZED
+
+        if window.tiled.is_some() {
+            // Preserve window.tiled and window.pre_tile.
+            window.maximized = true;
+
+            // Maximized windows cover the entire output.
+            window.x = -geometry.loc.x;
+            window.y = -geometry.loc.y;
+
+            window.surface.with_pending_state(|state| {
+                state.states.set(xdg_toplevel::State::Maximized);
+                state.size = Some(output_size.into());
+            });
+
+            window.surface.send_configure();
+
+            return true;
+        }
+
+        // FLOATING OR SNAPPED -> MAXIMIZED
+
+        // Preserve original floating geometry.
         if let Some((normal, _)) = window.restoring {
             window.saved_normal = Some(normal);
         } else if !window.maximized && window.snapped.is_none() {
@@ -740,13 +830,11 @@ impl WindowManager {
                 height: geometry.size.h,
             });
         }
-        if window.tiled.is_some() || window.pending_unsnap.is_some() {
-            return false;
-        }
 
         window.restoring = None;
         window.maximized = true;
         window.snapped = None;
+
         window.x = -geometry.loc.x;
         window.y = -geometry.loc.y;
 
@@ -756,6 +844,7 @@ impl WindowManager {
         });
 
         surface.send_configure();
+
         true
     }
 
@@ -763,6 +852,23 @@ impl WindowManager {
         let Some(window) = self.windows.iter_mut().find(|w| &w.surface == surface) else {
             return false;
         };
+        if window.maximized {
+            if let Some(target) = window.tiled {
+                window.maximized = false;
+
+                if let Some(geometry) = window_geometry(window) {
+                    window.x = target.x - geometry.loc.x;
+                    window.y = target.y - geometry.loc.y;
+                }
+
+                window.surface.with_pending_state(|state| {
+                    state.states.unset(xdg_toplevel::State::Maximized);
+                    state.size = Some((target.width, target.height).into());
+                });
+                window.surface.send_configure();
+                return true;
+            }
+        }
         if !window.maximized && window.snapped.is_none() {
             return false;
         }
@@ -844,6 +950,9 @@ impl WindowManager {
                 }
 
                 window.tiled = Some(target);
+                if window.maximized {
+                    continue;
+                }
 
                 if let Some(geometry) = window_geometry(window) {
                     window.x = target.x - geometry.loc.x;
@@ -889,10 +998,12 @@ impl WindowManager {
             }
             return;
         }
-        if let Some(target) = window.tiled {
-            window.x = target.x - geometry.loc.x;
-            window.y = target.y - geometry.loc.y;
-            return;
+        if !window.maximized {
+            if let Some(target) = window.tiled {
+                window.x = target.x - geometry.loc.x;
+                window.y = target.y - geometry.loc.y;
+                return;
+            }
         }
 
         if window.maximized {

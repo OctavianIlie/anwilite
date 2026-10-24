@@ -768,32 +768,6 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
         let previous_count = state.windows.windows.len();
 
-        let current_focus = keyboard.current_focus();
-
-        let focus_valid = current_focus
-            .as_ref()
-            .is_some_and(|surface| state.windows.focus_is_valid(surface));
-
-        if !focus_valid {
-            let replacement = state.windows.focused_surface();
-
-            if current_focus != replacement {
-                println!(
-                    "Anwilite focus recovery: previous={}, replacement={}",
-                    current_focus.is_some(),
-                    replacement.is_some(),
-                );
-
-                keyboard.set_focus(
-                    &mut state,
-                    replacement,
-                    smithay::utils::SERIAL_COUNTER.next_serial(),
-                );
-
-                state.needs_redraw = true;
-            }
-        }
-
         state.windows.retain_live();
 
         if state.windows.windows.len() != previous_count {
@@ -803,19 +777,34 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                 state.windows.windows.len()
             );
 
-            state.windows.reflow_all_tiled_workspaces(state.output_size);
+            if state.windows.reflow_all_tiled_workspaces(state.output_size) {
+                state.needs_redraw = true;
+            }
+            state.needs_redraw = true;
+        }
 
-            let focus = state.windows.focused_surface();
+        let current_focus = keyboard.current_focus();
 
-            if keyboard.current_focus() != focus {
+        let focus_valid = current_focus
+            .as_ref()
+            .is_some_and(|surface| state.windows.focus_is_valid(surface));
+        if !focus_valid {
+            let replacement = state.windows.focused_surface();
+
+            if current_focus != replacement {
+                println!(
+                    "Andwilite focus recovery: previous={}, replacement={}",
+                    current_focus.is_some(),
+                    replacement.is_some(),
+                );
+
                 keyboard.set_focus(
                     &mut state,
-                    focus,
+                    replacement,
                     smithay::utils::SERIAL_COUNTER.next_serial(),
                 );
+                state.needs_redraw = true;
             }
-
-            state.needs_redraw = true;
         }
 
         display.flush_clients()?;
