@@ -188,73 +188,104 @@ impl WindowManager {
         self.layout_modes[self.current_workspace() - 1]
     }
 
-    pub fn toggle_tiling(&mut self, output_size: (i32, i32)) -> bool {
-        if self.dragging.is_some() || self.resizing.is_some() || self.settling.is_some() {
+    fn stop_tiling_workspace(&mut self, workspace: usize) {
+        for window in self
+            .windows
+            .iter_mut()
+            .filter(|window| window.workspace == workspace)
+        {
+            let saved = window.pre_tile.take();
+
+            window.tiled = None;
+
+            let Some(normal) = saved else {
+                continue;
+            };
+
+            if let Some(geometry) = window_geometry(window) {
+                window.x = normal.left - geometry.loc.x;
+                window.y = normal.top - geometry.loc.y;
+            }
+
+            // Reuse our existing asynchronous restore mechanism.
+            window.restoring = Some((normal, Instant::now()));
+
+            window.surface.with_pending_state(|state| {
+                state.size = Some((normal.width, normal.height).into());
+            });
+
+            window.surface.send_configure();
+        }
+
+        self.layout_modes[workspace - 1] = LayoutMode::Floating;
+    }
+
+    pub fn reflow_for_surface(&mut self, surface: &WlSurface, output_size: (i32, i32)) -> bool {
+        let Some(workspace) = self
+            .windows
+            .iter()
+            .find(|window| window.surface.wl_surface() == surface)
+            .map(|window| window.workspace)
+        else {
+            return false;
+        };
+
+        self.reflow_tiled_workspace(workspace, output_size)
+    }
+
+    pub fn reflow_all_tiled_workspaces(&mut self, output_size: (i32, i32)) -> bool {
+        let mut changed = false;
+
+        for workspace in 1..=WORKSPACE_COUNT {
+            changed |= self.reflow_tiled_workspace(workspace, output_size);
+        }
+
+        changed
+    }
+
+    pub fn reflow_tiled_workspace(&mut self, workspace: usize, output_size: (i32, i32)) -> bool {
+        if !(1..=WORKSPACE_COUNT).contains(&workspace) {
             return false;
         }
 
-        let current = self.current_workspace();
-        let slot = current - 1;
-
-        // TILED -> FLOATING
-        if self.layout_modes[slot] == LayoutMode::Tiled {
-            for window in self
-                .windows
-                .iter_mut()
-                .filter(|window| window.workspace == current)
-            {
-                let Some(normal) = window.pre_tile.take() else {
-                    continue;
-                };
-
-                window.tiled = None;
-
-                if let Some(geometry) = window_geometry(window) {
-                    window.x = normal.left - geometry.loc.x;
-                    window.y = normal.top - geometry.loc.y;
-                }
-
-                window.restoring = Some((normal, Instant::now()));
-
-                window.surface.with_pending_state(|state| {
-                    state.size = Some((normal.width, normal.height).into());
-                });
-
-                window.surface.send_configure();
-            }
-
-            self.layout_modes[slot] = LayoutMode::Floating;
-            return true;
+        if self.layout_modes[workspace - 1] != LayoutMode::Tiled {
+            return false;
         }
 
-        // FLOATING -> TILED
-
+        // Find all living windows that belong to this workspace.
         let indices: Vec<usize> = self
             .windows
             .iter()
             .enumerate()
-            .filter(|(_, window)| window.workspace == current && window.surface.alive())
+            .filter(|(_, window)| window.workspace == workspace && window.surface.alive())
             .map(|(index, _)| index)
             .collect();
 
-        if indices.is_empty() {
-            return false;
+        if indices.len() > 2 {
+            eprintln!(
+                "Anwilite: workspace {} has {} windows; \
+                returning to floating mode",
+                workspace,
+                indices.len(),
+            );
+
+            self.stop_tiling_workspace(workspace);
+            return true;
         }
 
-        let Some(rectangles) = tile_rects(output_size, indices.len(), DEFAULT_SNAP_GAPS) else {
+        let Some(targets) = tile_rects(output_size, indices.len(), DEFAULT_SNAP_GAPS) else {
             return false;
         };
 
         let mut planned = Vec::new();
 
-        for (index, target) in indices.into_iter().zip(rectangles) {
+        for (index, target) in indices.into_iter().zip(targets) {
             let window = &self.windows[index];
 
             if window.maximized
-                || window.snapped.is_some()
-                || window.restoring.is_some()
                 || window.pending_unsnap.is_some()
-                || window.tiled.is_some()
+                || window.restoring.is_some()
+                || (window.snapped.is_some() && window.saved_normal.is_none())
             {
                 return false;
             }
@@ -263,20 +294,44 @@ impl WindowManager {
                 return false;
             };
 
-            let normal = NormalGeometry {
-                left: window.x + geometry.loc.x,
-                top: window.y + geometry.loc.y,
-                width: geometry.size.w,
-                height: geometry.size.h,
+            let normal = if window.tiled.is_none() {
+                if window.snapped.is_some() {
+                    window.saved_normal
+                } else {
+                    Some(NormalGeometry {
+                        left: window.x + geometry.loc.x,
+                        top: window.y + geometry.loc.y,
+                        width: geometry.size.w,
+                        height: geometry.size.h,
+                    })
+                }
+            } else {
+                None
             };
+
+            if window.tiled == Some(target) {
+                continue;
+            }
 
             planned.push((index, target, normal, geometry.loc.x, geometry.loc.y));
         }
 
+        let changed = !planned.is_empty();
+
+        // Application phase: all windows passed validation.
         for (index, target, normal, offset_x, offset_y) in planned {
             let window = &mut self.windows[index];
 
-            window.pre_tile = Some(normal);
+            if window.snapped.is_some() {
+                window.snapped = None;
+                window.saved_normal = None;
+            }
+
+            // Only save the floating geometry on first tiling.
+            if let Some(normal) = normal {
+                window.pre_tile = Some(normal);
+            }
+
             window.tiled = Some(target);
 
             window.x = target.x - offset_x;
@@ -286,10 +341,51 @@ impl WindowManager {
                 state.size = Some((target.width, target.height).into());
             });
 
-            window.surface.send_configure();
+            window.surface.send_pending_configure();
+        }
+
+        changed
+    }
+
+    pub fn toggle_tiling(&mut self, output_size: (i32, i32)) -> bool {
+        if self.dragging.is_some() || self.resizing.is_some() || self.settling.is_some() {
+            return false;
+        }
+
+        let workspace = self.current_workspace();
+        let slot = workspace - 1;
+
+        // TILED -> FLOATING
+        if self.layout_modes[slot] == LayoutMode::Tiled {
+            self.stop_tiling_workspace(workspace);
+            return true;
+        }
+
+        // FLOATING -> TILED
+        let windows: Vec<&ManagedWindow> = self
+            .windows
+            .iter()
+            .filter(|window| window.workspace == workspace && window.surface.alive())
+            .collect();
+
+        if windows.iter().any(|window| {
+            window.maximized
+                || window.restoring.is_some()
+                || window.pending_unsnap.is_some()
+                || window.tiled.is_some()
+                || (window.snapped.is_some() && window.saved_normal.is_none())
+        }) {
+            return false;
+        }
+
+        if tile_rects(output_size, windows.len(), DEFAULT_SNAP_GAPS).is_none() {
+            return false;
         }
 
         self.layout_modes[slot] = LayoutMode::Tiled;
+
+        self.reflow_tiled_workspace(workspace, output_size);
+
         true
     }
 
@@ -361,6 +457,16 @@ impl WindowManager {
             .iter()
             .find(|window| window.workspace == current && window.surface.alive())
             .map(|window| window.surface.wl_surface().clone())
+    }
+
+    pub fn focus_is_valid(&self, surface: &WlSurface) -> bool {
+        let current = self.current_workspace();
+
+        self.windows.iter().any(|window| {
+            window.workspace == current
+                && window.surface.alive()
+                && window.surface.wl_surface() == surface
+        })
     }
 
     pub fn remember_focus(&mut self, focused: Option<&WlSurface>) {
@@ -458,12 +564,18 @@ impl WindowManager {
     }
 
     pub fn raise_at(&mut self, px: f64, py: f64) -> Option<WlSurface> {
-        let index = self.windows.iter().position(|window| {
-            window.workspace == self.current_workspace() && Self::hit_window(window, px, py)
-        })?;
-        let window = self.windows.remove(index);
-        let surface = window.surface.wl_surface().clone();
-        self.windows.insert(0, window);
+        let current = self.current_workspace();
+
+        let index = self
+            .windows
+            .iter()
+            .position(|window| window.workspace == current && Self::hit_window(window, px, py))?;
+
+        let surface = self.windows[index].surface.wl_surface().clone();
+        if self.layout_modes[current - 1] == LayoutMode::Floating {
+            let window = self.windows.remove(index);
+            self.windows.insert(0, window);
+        }
         Some(surface)
     }
 
@@ -846,7 +958,11 @@ impl WindowManager {
         else {
             return false;
         };
-        if window.maximized || window.snapped.is_some() || window.pending_unsnap.is_some() {
+        if window.maximized
+            || window.snapped.is_some()
+            || window.pending_unsnap.is_some()
+            || window.tiled.is_some()
+        {
             return false;
         }
         let Some(geometry) = window_geometry(window) else {

@@ -79,12 +79,19 @@ impl XdgShellHandler for App {
         self.windows.add(surface.clone());
         self.needs_redraw = true;
 
-        // Tell the application that its window is activated.
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Activated);
         });
 
         surface.send_configure();
+        let workspace = self.windows.current_workspace();
+
+        if self
+            .windows
+            .reflow_tiled_workspace(workspace, self.output_size)
+        {
+            self.needs_redraw = true;
+        }
 
         // Give the new window actual keyboard focus.
         if let Some(keyboard) = self.seat.get_keyboard() {
@@ -222,6 +229,9 @@ impl CompositorHandler for App {
         on_commit_buffer_handler::<Self>(surface);
         self.windows.sync_resize_position(surface);
         self.windows.sync_mode_position(surface);
+
+        self.windows.reflow_for_surface(surface, self.output_size);
+
         self.surface_commit_count += 1;
         self.needs_redraw = true;
     }
@@ -402,7 +412,19 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                     InputEvent::Keyboard { event } => {
                         let serial = smithay::utils::SERIAL_COUNTER.next_serial();
                         let time = start_time.elapsed().as_millis() as u32;
+                        if event.state() == KeyState::Pressed {
+                            let focused = keyboard.current_focus();
 
+                            println!(
+                                "Anwilite keyboard: key={:?}, focus={}, valid={}, modifiers={:?}",
+                                event.key_code(),
+                                focused.is_some(),
+                                focused.as_ref().is_some_and(|surface| {
+                                    state.windows.focus_is_valid(surface)
+                                }),
+                                keyboard.modifier_state(),
+                            );
+                        }
                         let requested_command = keyboard.input::<WorkspaceCommand, _>(
                             &mut state,
                             event.key_code(),
@@ -645,9 +667,17 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         if event.state() == ButtonState::Pressed {
-                            let focus = state.windows.raise_at(x, y);
+                            let clicked_window = state.windows.raise_at(x, y);
 
-                            keyboard.set_focus(&mut state, focus, serial);
+                            if let Some(surface) = clicked_window {
+                                keyboard.set_focus(&mut state, Some(surface.clone()), serial);
+                                println!(
+                                    "Anwilite focus: clicked window, focus_matched={}",
+                                    keyboard.current_focus().as_ref() == Some(&surface),
+                                );
+                            } else {
+                                println!("Anwilite focus: background click, preserving focus");
+                            }
                             state.needs_redraw = true;
                         }
 
@@ -715,10 +745,63 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                 _ => (),
             }
         }
+
         state.windows.flush_resize();
+
+        // 1. Register newly connected Wayland clients.
+        for stream in pending_clients.drain(..) {
+            println!("Anwilite: new Wayland client connected");
+
+            let client = display
+                .handle()
+                .insert_client(stream, Arc::new(ClientState::default()))?;
+
+            clients.push(client);
+        }
+
+        // 2. Process pending client requests FIRST.
+
+        display.dispatch_clients(&mut state)?;
+
         let previous_count = state.windows.windows.len();
+
+        let current_focus = keyboard.current_focus();
+
+        let focus_valid = current_focus
+            .as_ref()
+            .is_some_and(|surface| state.windows.focus_is_valid(surface));
+
+        if !focus_valid {
+            let replacement = state.windows.focused_surface();
+
+            if current_focus != replacement {
+                println!(
+                    "Anwilite focus recovery: previous={}, replacement={}",
+                    current_focus.is_some(),
+                    replacement.is_some(),
+                );
+
+                keyboard.set_focus(
+                    &mut state,
+                    replacement,
+                    smithay::utils::SERIAL_COUNTER.next_serial(),
+                );
+
+                state.needs_redraw = true;
+            }
+        }
+
         state.windows.retain_live();
+
         if state.windows.windows.len() != previous_count {
+            println!(
+                "Anwilite: window count changed: {} -> {}",
+                previous_count,
+                state.windows.windows.len()
+            );
+
+            state.windows.reflow_all_tiled_workspaces(state.output_size);
+
             let focus = state.windows.focused_surface();
 
             if keyboard.current_focus() != focus {
@@ -732,18 +815,6 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             state.needs_redraw = true;
         }
 
-        // Register each new Wayland client.
-        for stream in pending_clients.drain(..) {
-            println!("Octlitch: new Wayland client connected");
-
-            let client = display
-                .handle()
-                .insert_client(stream, Arc::new(ClientState::default()))?;
-
-            clients.push(client);
-        }
-
-        display.dispatch_clients(&mut state)?;
         display.flush_clients()?;
 
         if state.needs_redraw {
@@ -751,7 +822,6 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
             let size = backend.window_size();
 
-            // Reset history whenever the output size changes.
             if size != tracked_size {
                 tracked_size = size;
                 damage_tracker = OutputDamageTracker::new(size, 1.0, Transform::Flipped180);
@@ -769,7 +839,6 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                 age_over_one_samples += 1;
             }
 
-            // Render only the areas Smithay reports as damaged.
             let submit_damage = {
                 let (renderer, mut framebuffer) = backend.bind().unwrap();
 
