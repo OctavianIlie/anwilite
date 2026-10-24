@@ -79,12 +79,19 @@ impl XdgShellHandler for App {
         self.windows.add(surface.clone());
         self.needs_redraw = true;
 
-        // Tell the application that its window is activated.
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Activated);
         });
 
         surface.send_configure();
+        let workspace = self.windows.current_workspace();
+
+        if self
+            .windows
+            .reflow_tiled_workspace(workspace, self.output_size)
+        {
+            self.needs_redraw = true;
+        }
 
         // Give the new window actual keyboard focus.
         if let Some(keyboard) = self.seat.get_keyboard() {
@@ -108,6 +115,28 @@ impl XdgShellHandler for App {
             self.needs_redraw = true;
         } else {
             surface.send_configure();
+        }
+    }
+
+    fn minimize_request(&mut self, surface: ToplevelSurface) {
+        if self.windows.minimize_window(&surface, self.output_size) {
+            if let Some(keyboard) = self.seat.get_keyboard() {
+                let current_focus = keyboard.current_focus();
+
+                let valid = current_focus
+                    .as_ref()
+                    .is_some_and(|focused| self.windows.focus_is_valid(focused));
+                if !valid {
+                    let replacement = self.windows.focused_surface();
+
+                    keyboard.set_focus(
+                        self,
+                        replacement,
+                        smithay::utils::SERIAL_COUNTER.next_serial(),
+                    );
+                }
+            }
+            self.needs_redraw = true;
         }
     }
 
@@ -222,6 +251,9 @@ impl CompositorHandler for App {
         on_commit_buffer_handler::<Self>(surface);
         self.windows.sync_resize_position(surface);
         self.windows.sync_mode_position(surface);
+
+        self.windows.reflow_for_surface(surface, self.output_size);
+
         self.surface_commit_count += 1;
         self.needs_redraw = true;
     }
@@ -260,6 +292,9 @@ enum WorkspaceCommand {
     Snap(SnapSide),
     Maximize,
     Restore,
+    ToggleTiling,
+    Minimize,
+    RestoreMinimized,
 }
 
 struct App {
@@ -401,7 +436,19 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                     InputEvent::Keyboard { event } => {
                         let serial = smithay::utils::SERIAL_COUNTER.next_serial();
                         let time = start_time.elapsed().as_millis() as u32;
+                        if event.state() == KeyState::Pressed {
+                            let focused = keyboard.current_focus();
 
+                            println!(
+                                "Anwilite keyboard: key={:?}, focus={}, valid={}, modifiers={:?}",
+                                event.key_code(),
+                                focused.is_some(),
+                                focused.as_ref().is_some_and(|surface| {
+                                    state.windows.focus_is_valid(surface)
+                                }),
+                                keyboard.modifier_state(),
+                            );
+                        }
                         let requested_command = keyboard.input::<WorkspaceCommand, _>(
                             &mut state,
                             event.key_code(),
@@ -417,6 +464,19 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
                                 // Get the unmodified keyboard symbol.
                                 let symbol = handle.raw_syms().first().map(|sym| sym.raw());
+                                if matches!(symbol, Some(keysyms::KEY_m | keysyms::KEY_M)) {
+                                    return FilterResult::Intercept(if modifiers.shift {
+                                        WorkspaceCommand::RestoreMinimized
+                                    } else {
+                                        WorkspaceCommand::Minimize
+                                    });
+                                }
+
+                                if modifiers.shift
+                                    && matches!(symbol, Some(keysyms::KEY_t | keysyms::KEY_T))
+                                {
+                                    return FilterResult::Intercept(WorkspaceCommand::ToggleTiling);
+                                }
 
                                 if !modifiers.shift {
                                     let placement = match symbol {
@@ -467,17 +527,58 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                 // Avoid switching while a mouse press is active.
                                 if state.move_press.is_none() {
                                     let changed = match command {
+                                        WorkspaceCommand::Minimize => {
+                                            let focused = keyboard.current_focus();
+
+                                            focused
+                                                .as_ref()
+                                                .and_then(|surface| {
+                                                    state.windows.toplevel_for_surface(surface)
+                                                })
+                                                .is_some_and(|surface| {
+                                                    state.windows.minimize_window(
+                                                        &surface,
+                                                        state.output_size,
+                                                    )
+                                                })
+                                        }
+
+                                        WorkspaceCommand::RestoreMinimized => {
+                                            if let Some(surface) = state
+                                                .windows
+                                                .restore_last_minimized(state.output_size)
+                                            {
+                                                // Immediately focus the restored window.
+                                                keyboard.set_focus(
+                                                    &mut state,
+                                                    Some(surface),
+                                                    smithay::utils::SERIAL_COUNTER.next_serial(),
+                                                );
+
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        }
+
+                                        WorkspaceCommand::ToggleTiling => {
+                                            state.windows.toggle_tiling(state.output_size)
+                                        }
+
                                         WorkspaceCommand::SwitchTo(number) => {
                                             state.windows.switch_to_workspace(number)
                                         }
 
                                         WorkspaceCommand::MoveAndFollow(number) => {
                                             let focused = keyboard.current_focus();
+                                            let output_size = state.output_size;
 
                                             focused.as_ref().is_some_and(|surface| {
-                                                state
-                                                    .windows
-                                                    .move_focused_to_workspace(surface, number)
+                                                state.windows.move_focused_to_workspace(
+                                                    surface,
+                                                    number,
+                                                    output_size,
+                                                )
                                             })
                                         }
 
@@ -523,6 +624,8 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                             command,
                                             WorkspaceCommand::SwitchTo(_)
                                                 | WorkspaceCommand::MoveAndFollow(_)
+                                                | WorkspaceCommand::ToggleTiling
+                                                | WorkspaceCommand::Minimize
                                         ) {
                                             let focus = state.windows.focused_surface();
 
@@ -634,9 +737,17 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         if event.state() == ButtonState::Pressed {
-                            let focus = state.windows.raise_at(x, y);
+                            let clicked_window = state.windows.raise_at(x, y);
 
-                            keyboard.set_focus(&mut state, focus, serial);
+                            if let Some(surface) = clicked_window {
+                                keyboard.set_focus(&mut state, Some(surface.clone()), serial);
+                                println!(
+                                    "Anwilite focus: clicked window, focus_matched={}",
+                                    keyboard.current_focus().as_ref() == Some(&surface),
+                                );
+                            } else {
+                                println!("Anwilite focus: background click, preserving focus");
+                            }
                             state.needs_redraw = true;
                         }
 
@@ -704,26 +815,12 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                 _ => (),
             }
         }
+
         state.windows.flush_resize();
-        let previous_count = state.windows.windows.len();
-        state.windows.retain_live();
-        if state.windows.windows.len() != previous_count {
-            let focus = state.windows.focused_surface();
 
-            if keyboard.current_focus() != focus {
-                keyboard.set_focus(
-                    &mut state,
-                    focus,
-                    smithay::utils::SERIAL_COUNTER.next_serial(),
-                );
-            }
-
-            state.needs_redraw = true;
-        }
-
-        // Register each new Wayland client.
+        // 1. Register newly connected Wayland clients.
         for stream in pending_clients.drain(..) {
-            println!("Octlitch: new Wayland client connected");
+            println!("Anwilite: new Wayland client connected");
 
             let client = display
                 .handle()
@@ -732,7 +829,51 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             clients.push(client);
         }
 
+        // 2. Process pending client requests FIRST.
+
         display.dispatch_clients(&mut state)?;
+
+        let previous_count = state.windows.windows.len();
+
+        state.windows.retain_live();
+
+        if state.windows.windows.len() != previous_count {
+            println!(
+                "Anwilite: window count changed: {} -> {}",
+                previous_count,
+                state.windows.windows.len()
+            );
+
+            if state.windows.reflow_all_tiled_workspaces(state.output_size) {
+                state.needs_redraw = true;
+            }
+            state.needs_redraw = true;
+        }
+
+        let current_focus = keyboard.current_focus();
+
+        let focus_valid = current_focus
+            .as_ref()
+            .is_some_and(|surface| state.windows.focus_is_valid(surface));
+        if !focus_valid {
+            let replacement = state.windows.focused_surface();
+
+            if current_focus != replacement {
+                println!(
+                    "Andwilite focus recovery: previous={}, replacement={}",
+                    current_focus.is_some(),
+                    replacement.is_some(),
+                );
+
+                keyboard.set_focus(
+                    &mut state,
+                    replacement,
+                    smithay::utils::SERIAL_COUNTER.next_serial(),
+                );
+                state.needs_redraw = true;
+            }
+        }
+
         display.flush_clients()?;
 
         if state.needs_redraw {
@@ -740,7 +881,6 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
             let size = backend.window_size();
 
-            // Reset history whenever the output size changes.
             if size != tracked_size {
                 tracked_size = size;
                 damage_tracker = OutputDamageTracker::new(size, 1.0, Transform::Flipped180);
@@ -758,7 +898,6 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                 age_over_one_samples += 1;
             }
 
-            // Render only the areas Smithay reports as damaged.
             let submit_damage = {
                 let (renderer, mut framebuffer) = backend.bind().unwrap();
 
@@ -766,7 +905,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                     .windows
                     .windows
                     .iter()
-                    .filter(|window| window.workspace == state.windows.current_workspace())
+                    .filter(|window| state.windows.is_window_visible(window))
                     .flat_map(|window| {
                         render_elements_from_surface_tree(
                             renderer,
@@ -812,7 +951,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                 .windows
                 .windows
                 .iter()
-                .filter(|window| window.workspace == state.windows.current_workspace())
+                .filter(|window| state.windows.is_window_visible(window))
             {
                 send_frames_surface_tree(
                     window.surface.wl_surface(),
