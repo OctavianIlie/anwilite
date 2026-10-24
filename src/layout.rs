@@ -165,42 +165,37 @@ mod tests {
         assert_eq!(snap_rect((1, 800), SnapSide::Left), None);
     }
 
-    
     #[test]
     fn gaps_create_correct_rectangles() {
-     
         let gaps = SnapGaps {
             outer: 12,
             inner: 12,
         };
 
-        let left = snap_rect_with_gaps(
-            (1200, 800),
-            SnapSide::Left,
-            gaps,
-        ).unwrap();
+        let left = snap_rect_with_gaps((1200, 800), SnapSide::Left, gaps).unwrap();
 
-        let right = snap_rect_with_gaps(
-            (1200, 800),
-            SnapSide::Right,
-            gaps,
-        ).unwrap();
+        let right = snap_rect_with_gaps((1200, 800), SnapSide::Right, gaps).unwrap();
 
-        assert_eq!(left, SnapRect {
-            x: 12,
-            y: 12,
-            width: 582,
-            height: 776,
-        });
+        assert_eq!(
+            left,
+            SnapRect {
+                x: 12,
+                y: 12,
+                width: 582,
+                height: 776,
+            }
+        );
 
-        assert_eq!(right, SnapRect {
-            x: 606,
-            y: 12,
-            width: 582,
-            height: 776,
-        });
+        assert_eq!(
+            right,
+            SnapRect {
+                x: 606,
+                y: 12,
+                width: 582,
+                height: 776,
+            }
+        );
     }
-
 
     #[test]
     fn odd_inner_gap_has_exact_spacing() {

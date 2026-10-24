@@ -278,8 +278,24 @@ impl WindowManager {
             .map(|(index, _)| index)
             .collect();
 
-        let maximized_surfaces: Vec<ToplevelSurface> = 
-        if indices.len() > 1 {
+        if indices.len() == 1 {
+            let index = indices[0];
+
+            if self.windows[index].maximized && self.windows[index].tiled.is_some() {
+                let Some(target) = tile_rects(output_size, 1, DEFAULT_SNAP_GAPS)
+                    .and_then(|rectangles| rectangles.into_iter().next())
+                else {
+                    return false;
+                };
+
+                let changed = self.windows[index].tiled != Some(target);
+                self.windows[index].tiled = Some(target);
+
+                return changed;
+            }
+        }
+
+        let maximized_surfaces: Vec<ToplevelSurface> = if indices.len() > 1 {
             indices
                 .iter()
                 .filter_map(|&index| {
@@ -295,6 +311,15 @@ impl WindowManager {
         } else {
             Vec::new()
         };
+
+        let both_windows_already_tiled = indices.len() == 2
+            && indices
+                .iter()
+                .all(|&index| self.windows[index].tiled.is_some());
+        if !maximized_surfaces.is_empty() && both_windows_already_tiled {
+            return false;
+        }
+
         for surface in maximized_surfaces {
             if !self.restore(&surface) {
                 return false;
@@ -531,12 +556,10 @@ impl WindowManager {
 
         self.last_focused[number - 1] = Some(focused.clone());
 
-        // Source workspace might have lost a tile.
         if source_mode == LayoutMode::Tiled {
             self.reflow_tiled_workspace(current, output_size);
         }
 
-        // Destination workspace might have gained a tile.
         if destination_mode == LayoutMode::Tiled {
             self.reflow_tiled_workspace(number, output_size);
         }
@@ -549,9 +572,7 @@ impl WindowManager {
 
         if let Some(saved) = &self.last_focused[current - 1] {
             let still_valid = self.windows.iter().any(|window| {
-                window.workspace == current
-                    && window.surface.alive()
-                    && window.surface.wl_surface() == saved
+                self.is_window_visible(window) && window.surface.wl_surface() == saved
             });
 
             if still_valid {
@@ -561,18 +582,33 @@ impl WindowManager {
 
         self.windows
             .iter()
-            .find(|window| window.workspace == current && window.surface.alive())
+            .find(|window| self.is_window_visible(window))
             .map(|window| window.surface.wl_surface().clone())
     }
 
-    pub fn focus_is_valid(&self, surface: &WlSurface) -> bool {
+    pub fn is_window_visible(&self, window: &ManagedWindow) -> bool {
         let current = self.current_workspace();
 
-        self.windows.iter().any(|window| {
-            window.workspace == current
-                && window.surface.alive()
-                && window.surface.wl_surface() == surface
-        })
+        if window.workspace != current || !window.surface.alive() {
+            return false;
+        }
+
+        let maximized_tile = self.windows.iter().find(|other| {
+            other.workspace == current
+                && other.surface.alive()
+                && other.tiled.is_some()
+                && other.maximized
+        });
+        match maximized_tile {
+            Some(zoomed) => zoomed.surface == window.surface,
+            None => true,
+        }
+    }
+
+    pub fn focus_is_valid(&self, surface: &WlSurface) -> bool {
+        self.windows
+            .iter()
+            .any(|window| self.is_window_visible(window) && window.surface.wl_surface() == surface)
     }
 
     pub fn remember_focus(&mut self, focused: Option<&WlSurface>) {
@@ -629,19 +665,15 @@ impl WindowManager {
     }
 
     pub fn toplevel_at(&self, px: f64, py: f64) -> Option<ToplevelSurface> {
-        let current = self.current_workspace();
-
         self.windows
             .iter()
-            .find(|window| window.workspace == current && Self::hit_window(window, px, py))
+            .find(|window| self.is_window_visible(window) && Self::hit_window(window, px, py))
             .map(|window| window.surface.clone())
     }
 
     pub fn surface_at(&self, px: f64, py: f64) -> Option<(WlSurface, Point<f64, Logical>)> {
-        let current = self.current_workspace();
-
         self.windows.iter().find_map(|window| {
-            if window.workspace != current {
+            if !self.is_window_visible(window) {
                 return None;
             }
 
@@ -657,31 +689,28 @@ impl WindowManager {
     }
 
     pub fn toplevel_for_surface(&self, focused: &WlSurface) -> Option<ToplevelSurface> {
-        let current = self.current_workspace();
-
         self.windows
             .iter()
-            .find(|window| {
-                window.workspace == current
-                    && window.surface.alive()
-                    && window.surface.wl_surface() == focused
-            })
+            .find(|window| self.is_window_visible(window) && window.surface.wl_surface() == focused)
             .map(|window| window.surface.clone())
     }
 
     pub fn raise_at(&mut self, px: f64, py: f64) -> Option<WlSurface> {
         let current = self.current_workspace();
 
-        let index = self
-            .windows
-            .iter()
-            .position(|window| window.workspace == current && Self::hit_window(window, px, py))?;
+        let index = self.windows.iter().position(|window| {
+            self.is_window_visible(window) && Self::hit_window(window, px, py)
+        })?;
 
         let surface = self.windows[index].surface.wl_surface().clone();
+
+        // Floating windows are raised when clicked.
+        // Tiled windows keep their layout order.
         if self.layout_modes[current - 1] == LayoutMode::Floating {
             let window = self.windows.remove(index);
             self.windows.insert(0, window);
         }
+
         Some(surface)
     }
 
@@ -769,30 +798,47 @@ impl WindowManager {
             return false;
         };
 
+        let workspace_window_count = self
+            .windows
+            .iter()
+            .filter(|window| window.workspace == active_workspace && window.surface.alive())
+            .count();
+
         // Validate the transition before changing anything.
         if self.windows[index].pending_unsnap.is_some() {
             return false;
         }
 
+        // Only one tiled window may be maximized at a time.
+        let another_tile_is_maximized =
+            self.windows
+                .iter()
+                .enumerate()
+                .any(|(other_index, window)| {
+                    other_index != index
+                        && window.workspace == active_workspace
+                        && window.surface.alive()
+                        && window.tiled.is_some()
+                        && window.maximized
+                });
+
         if self.windows[index].tiled.is_some()
-            && (self.windows[index].workspace != active_workspace || tiled_count != 1)
+            && (self.windows[index].workspace != active_workspace
+                || tiled_count == 0
+                || tiled_count > 2
+                || tiled_count != workspace_window_count
+                || another_tile_is_maximized)
         {
-            // Multi-window tiled maximization comes in 27C.2.
             return false;
         }
-
-        // Clear an old resize-settling state for this surface.
         if self
             .settling
             .as_ref()
             .is_some_and(|s| &s.anchor.surface == surface)
-        {
-            self.settling = None;
-        }
-
-        // Now obtain mutable access to the target window.
+            {
+                self.settling = None;
+            }
         let window = &mut self.windows[index];
-
         let Some(geometry) = window_geometry(window) else {
             return false;
         };

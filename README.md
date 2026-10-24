@@ -1,6 +1,6 @@
 # Anwilite
 
-**A custom Wayland compositor and hybrid window manager for [Octlitch Linux](https://octlitch.com).**
+**WORK IN PROGRESS: A custom Wayland compositor and hybrid window manager for [Octlitch Linux](https://octlitch.com).**
 
 > **Project status: experimental, pre-alpha.** The nested compositor and core floating/window-placement workflows are working; native DRM/KMS, a complete desktop shell, XWayland, and several essential Wayland protocols are still planned. Anwilite is not ready to replace a daily-driver desktop session.
 

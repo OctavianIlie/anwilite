@@ -838,7 +838,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                     .windows
                     .windows
                     .iter()
-                    .filter(|window| window.workspace == state.windows.current_workspace())
+                    .filter(|window| state.windows.is_window_visible(window))
                     .flat_map(|window| {
                         render_elements_from_surface_tree(
                             renderer,
@@ -884,7 +884,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                 .windows
                 .windows
                 .iter()
-                .filter(|window| window.workspace == state.windows.current_workspace())
+                .filter(|window| state.windows.is_window_visible(window))
             {
                 send_frames_surface_tree(
                     window.surface.wl_surface(),
