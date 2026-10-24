@@ -49,6 +49,8 @@ pub struct ManagedWindow {
     pending_unsnap: Option<PendingUnsnap>,
     tiled: Option<SnapRect>,
     pre_tile: Option<NormalGeometry>,
+    minimized: bool,
+    minimized_order: u64,
 }
 
 struct DragState {
@@ -170,6 +172,7 @@ pub struct WindowManager {
     resizing: Option<ResizeState>,
     settling: Option<SettlingResize>,
     layout_modes: [LayoutMode; WORKSPACE_COUNT],
+    minimize_counter: u64,
 }
 
 impl WindowManager {
@@ -193,6 +196,8 @@ impl WindowManager {
                 pending_unsnap: None,
                 tiled: None,
                 pre_tile: None,
+                minimized: false,
+                minimized_order: 0,
             },
         );
     }
@@ -270,11 +275,14 @@ impl WindowManager {
         }
 
         // Find all living windows that belong to this workspace.
+
         let indices: Vec<usize> = self
             .windows
             .iter()
             .enumerate()
-            .filter(|(_, window)| window.workspace == workspace && window.surface.alive())
+            .filter(|(_, window)| {
+                window.workspace == workspace && window.surface.alive() && !window.minimized
+            })
             .map(|(index, _)| index)
             .collect();
 
@@ -589,7 +597,7 @@ impl WindowManager {
     pub fn is_window_visible(&self, window: &ManagedWindow) -> bool {
         let current = self.current_workspace();
 
-        if window.workspace != current || !window.surface.alive() {
+        if window.workspace != current || !window.surface.alive() || window.minimized {
             return false;
         }
 
@@ -598,6 +606,7 @@ impl WindowManager {
                 && other.surface.alive()
                 && other.tiled.is_some()
                 && other.maximized
+                && !other.minimized
         });
         match maximized_tile {
             Some(zoomed) => zoomed.surface == window.surface,
@@ -835,9 +844,9 @@ impl WindowManager {
             .settling
             .as_ref()
             .is_some_and(|s| &s.anchor.surface == surface)
-            {
-                self.settling = None;
-            }
+        {
+            self.settling = None;
+        }
         let window = &mut self.windows[index];
         let Some(geometry) = window_geometry(window) else {
             return false;
@@ -936,6 +945,82 @@ impl WindowManager {
         });
         surface.send_configure();
         true
+    }
+
+    pub fn minimize_window(&mut self, surface: &ToplevelSurface, output_size: (i32, i32)) -> bool {
+        // Don't interrupt an active interactive operation.
+        if self.is_dragging() || self.is_resizing() {
+            return false;
+        }
+
+        let Some(index) = self
+            .windows
+            .iter()
+            .position(|window| &window.surface == surface && window.surface.alive())
+        else {
+            return false;
+        };
+
+        if self.windows[index].minimized || self.windows[index].pending_unsnap.is_some() {
+            return false;
+        }
+
+        let workspace = self.windows[index].workspace;
+        let tiled_mode = self.layout_modes[workspace - 1] == LayoutMode::Tiled;
+
+        // A maximized tile must first leave maximized mode.
+        // Otherwise it could keep hiding its neighboring tile.
+        if self.windows[index].tiled.is_some()
+            && self.windows[index].maximized
+            && !self.restore(surface)
+        {
+            return false;
+        }
+
+        self.minimize_counter = self.minimize_counter.saturating_add(1);
+
+        {
+            let window = &mut self.windows[index];
+
+            window.minimized = true;
+            window.minimized_order = self.minimize_counter;
+
+            if tiled_mode {
+                window.tiled = None;
+            }
+        }
+
+        if tiled_mode {
+            self.reflow_tiled_workspace(workspace, output_size);
+        }
+
+        true
+    }
+
+    pub fn restore_last_minimized(&mut self, output_size: (i32, i32)) -> Option<WlSurface> {
+        let workspace = self.current_workspace();
+
+        let surface = self
+            .windows
+            .iter()
+            .filter(|window| {
+                window.workspace == workspace && window.surface.alive() && window.minimized
+            })
+            .max_by_key(|window| window.minimized_order)
+            .map(|window| window.surface.clone())?;
+
+        let index = self
+            .windows
+            .iter()
+            .position(|window| window.surface == surface)?;
+
+        self.windows[index].minimized = false;
+
+        if self.layout_modes[workspace - 1] == LayoutMode::Tiled {
+            self.reflow_tiled_workspace(workspace, output_size);
+        }
+
+        Some(surface.wl_surface().clone())
     }
 
     pub fn resize_placed_windows(&mut self, output_size: (i32, i32)) {

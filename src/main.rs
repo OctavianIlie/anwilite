@@ -118,6 +118,28 @@ impl XdgShellHandler for App {
         }
     }
 
+    fn minimize_request(&mut self, surface: ToplevelSurface) {
+        if self.windows.minimize_window(&surface, self.output_size) {
+            if let Some(keyboard) = self.seat.get_keyboard() {
+                let current_focus = keyboard.current_focus();
+
+                let valid = current_focus
+                    .as_ref()
+                    .is_some_and(|focused| self.windows.focus_is_valid(focused));
+                if !valid {
+                    let replacement = self.windows.focused_surface();
+
+                    keyboard.set_focus(
+                        self,
+                        replacement,
+                        smithay::utils::SERIAL_COUNTER.next_serial(),
+                    );
+                }
+            }
+            self.needs_redraw = true;
+        }
+    }
+
     fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {
         // Handle popup creation here
     }
@@ -271,6 +293,8 @@ enum WorkspaceCommand {
     Maximize,
     Restore,
     ToggleTiling,
+    Minimize,
+    RestoreMinimized,
 }
 
 struct App {
@@ -440,6 +464,14 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
                                 // Get the unmodified keyboard symbol.
                                 let symbol = handle.raw_syms().first().map(|sym| sym.raw());
+                                if matches!(symbol, Some(keysyms::KEY_m | keysyms::KEY_M)) {
+                                    return FilterResult::Intercept(if modifiers.shift {
+                                        WorkspaceCommand::RestoreMinimized
+                                    } else {
+                                        WorkspaceCommand::Minimize
+                                    });
+                                }
+
                                 if modifiers.shift
                                     && matches!(symbol, Some(keysyms::KEY_t | keysyms::KEY_T))
                                 {
@@ -495,6 +527,40 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                 // Avoid switching while a mouse press is active.
                                 if state.move_press.is_none() {
                                     let changed = match command {
+                                        WorkspaceCommand::Minimize => {
+                                            let focused = keyboard.current_focus();
+
+                                            focused
+                                                .as_ref()
+                                                .and_then(|surface| {
+                                                    state.windows.toplevel_for_surface(surface)
+                                                })
+                                                .is_some_and(|surface| {
+                                                    state.windows.minimize_window(
+                                                        &surface,
+                                                        state.output_size,
+                                                    )
+                                                })
+                                        }
+
+                                        WorkspaceCommand::RestoreMinimized => {
+                                            if let Some(surface) = state
+                                                .windows
+                                                .restore_last_minimized(state.output_size)
+                                            {
+                                                // Immediately focus the restored window.
+                                                keyboard.set_focus(
+                                                    &mut state,
+                                                    Some(surface),
+                                                    smithay::utils::SERIAL_COUNTER.next_serial(),
+                                                );
+
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        }
+
                                         WorkspaceCommand::ToggleTiling => {
                                             state.windows.toggle_tiling(state.output_size)
                                         }
@@ -559,6 +625,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                             WorkspaceCommand::SwitchTo(_)
                                                 | WorkspaceCommand::MoveAndFollow(_)
                                                 | WorkspaceCommand::ToggleTiling
+                                                | WorkspaceCommand::Minimize
                                         ) {
                                             let focus = state.windows.focused_surface();
 
