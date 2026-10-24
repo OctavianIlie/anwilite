@@ -274,37 +274,21 @@ impl WindowManager {
             return false;
         }
 
-        // Find all living windows that belong to this workspace.
-
         let indices: Vec<usize> = self
             .windows
             .iter()
             .enumerate()
             .filter(|(_, window)| {
-                window.workspace == workspace && window.surface.alive() && !window.minimized
+                window.workspace == workspace
+                    && window.surface.alive()
+                    && !window.minimized
+                    && !window.minimized
             })
             .map(|(index, _)| index)
             .collect();
 
-        if indices.len() == 1 {
-            let index = indices[0];
-
-            if self.windows[index].maximized && self.windows[index].tiled.is_some() {
-                let Some(target) = tile_rects(output_size, 1, DEFAULT_SNAP_GAPS)
-                    .and_then(|rectangles| rectangles.into_iter().next())
-                else {
-                    return false;
-                };
-
-                let changed = self.windows[index].tiled != Some(target);
-                self.windows[index].tiled = Some(target);
-
-                return changed;
-            }
-        }
-
-        let maximized_surfaces: Vec<ToplevelSurface> = if indices.len() > 1 {
-            indices
+        let Some(targets) = tile_rects(output_size, indices.len(), DEFAULT_SNAP_GAPS) else {
+            let maximized_surfaces: Vec<ToplevelSurface> = indices
                 .iter()
                 .filter_map(|&index| {
                     let window = &self.windows[index];
@@ -315,47 +299,49 @@ impl WindowManager {
                         None
                     }
                 })
-                .collect()
-        } else {
-            Vec::new()
-        };
+                .collect();
 
-        let both_windows_already_tiled = indices.len() == 2
-            && indices
-                .iter()
-                .all(|&index| self.windows[index].tiled.is_some());
-        if !maximized_surfaces.is_empty() && both_windows_already_tiled {
-            return false;
-        }
-
-        for surface in maximized_surfaces {
-            if !self.restore(&surface) {
-                return false;
+            for surface in maximized_surfaces {
+                if !self.restore(&surface) {
+                    return false;
+                }
             }
-        }
-
-        if indices.len() > 2 {
-            eprintln!(
-                "Anwilite: workspace {} has {} windows; \
-                returning to floating mode",
-                workspace,
-                indices.len(),
-            );
 
             self.stop_tiling_workspace(workspace);
             return true;
-        }
-
-        let Some(targets) = tile_rects(output_size, indices.len(), DEFAULT_SNAP_GAPS) else {
-            return false;
         };
+
+        let has_new_tile = indices
+            .iter()
+            .any(|&index| self.windows[index].tiled.is_none());
+
+        if has_new_tile {
+            let maximized_surfaces: Vec<ToplevelSurface> = indices
+                .iter()
+                .filter_map(|&index| {
+                    let window = &self.windows[index];
+
+                    if window.tiled.is_some() && window.maximized {
+                        Some(window.surface.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            for surface in maximized_surfaces {
+                if !self.restore(&surface) {
+                    return false;
+                }
+            }
+        }
 
         let mut planned = Vec::new();
 
         for (index, target) in indices.into_iter().zip(targets) {
             let window = &self.windows[index];
 
-            if window.maximized
+            if (window.maximized && window.tiled.is_none())
                 || window.pending_unsnap.is_some()
                 || window.restoring.is_some()
                 || (window.snapped.is_some() && window.saved_normal.is_none())
@@ -367,16 +353,13 @@ impl WindowManager {
                 return false;
             };
 
+            // Preserve the original floating geometry.
             let normal = if window.tiled.is_none() {
                 if let Some(saved) = window.pre_tile {
                     Some(saved)
                 } else if window.snapped.is_some() {
-                    // Snapped -> Tiled:
-                    // Keep geometry saved before snapping.
                     window.saved_normal
                 } else {
-                    // Floating -> Tiled:
-                    // Capture the current floating geometry.
                     Some(NormalGeometry {
                         left: window.x + geometry.loc.x,
                         top: window.y + geometry.loc.y,
@@ -397,7 +380,6 @@ impl WindowManager {
 
         let changed = !planned.is_empty();
 
-        // Application phase: all windows passed validation.
         for (index, target, normal, offset_x, offset_y) in planned {
             let window = &mut self.windows[index];
 
@@ -406,12 +388,15 @@ impl WindowManager {
                 window.saved_normal = None;
             }
 
-            // Only save the floating geometry on first tiling.
             if let Some(normal) = normal {
                 window.pre_tile = Some(normal);
             }
 
             window.tiled = Some(target);
+
+            if window.maximized {
+                continue;
+            }
 
             window.x = target.x - offset_x;
             window.y = target.y - offset_y;
@@ -451,7 +436,9 @@ impl WindowManager {
         let windows: Vec<&ManagedWindow> = self
             .windows
             .iter()
-            .filter(|window| window.workspace == workspace && window.surface.alive())
+            .filter(|window| {
+                window.workspace == workspace && window.surface.alive() && !window.minimized
+            })
             .collect();
 
         if windows.iter().any(|window| {
@@ -794,6 +781,7 @@ impl WindowManager {
             .filter(|window| {
                 window.workspace == active_workspace
                     && window.surface.alive()
+                    && !window.minimized
                     && window.tiled.is_some()
             })
             .count();
@@ -810,7 +798,9 @@ impl WindowManager {
         let workspace_window_count = self
             .windows
             .iter()
-            .filter(|window| window.workspace == active_workspace && window.surface.alive())
+            .filter(|window| {
+                window.workspace == active_workspace && window.surface.alive() && !window.minimized
+            })
             .count();
 
         // Validate the transition before changing anything.
@@ -831,15 +821,19 @@ impl WindowManager {
                         && window.maximized
                 });
 
+        if self.windows[index].minimized {
+            return false;
+        }
+
         if self.windows[index].tiled.is_some()
             && (self.windows[index].workspace != active_workspace
                 || tiled_count == 0
-                || tiled_count > 2
                 || tiled_count != workspace_window_count
                 || another_tile_is_maximized)
         {
             return false;
         }
+
         if self
             .settling
             .as_ref()
@@ -1014,6 +1008,20 @@ impl WindowManager {
             .iter()
             .position(|window| window.surface == surface)?;
 
+        if self.layout_modes[workspace - 1] == LayoutMode::Tiled {
+            let visible_count = self
+                .windows
+                .iter()
+                .filter(|window| {
+                    window.workspace == workspace && window.surface.alive() && !window.minimized
+                })
+                .count();
+
+            let next_count = visible_count.checked_add(1)?;
+
+            tile_rects(output_size, next_count, DEFAULT_SNAP_GAPS)?;
+        }
+
         self.windows[index].minimized = false;
 
         if self.layout_modes[workspace - 1] == LayoutMode::Tiled {
@@ -1065,6 +1073,7 @@ impl WindowManager {
                     window.workspace == workspace
                         && window.tiled.is_some()
                         && window.surface.alive()
+                        && !window.minimized
                 })
                 .map(|(index, _)| index)
                 .collect();

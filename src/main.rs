@@ -424,6 +424,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
         if output_dims != state.output_size {
             state.output_size = output_dims;
             state.windows.resize_placed_windows(output_dims);
+            state.windows.reflow_all_tiled_workspaces(output_dims);
             state.needs_redraw = true;
         }
         let events = std::mem::take(&mut *winit_events.borrow_mut());
