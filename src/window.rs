@@ -170,6 +170,12 @@ pub enum TileFocusDirection {
     Next,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum TileSwapTarget {
+    Adjacent(TileFocusDirection),
+    Master,
+}
+
 fn adjacent_tile_index(
     current_index: usize,
     tile_count: usize,
@@ -209,6 +215,16 @@ fn adjacent_swap_pair(
     let neighbor_position = adjacent_tile_index(focused_position, tile_indices.len(), direction)?;
 
     Some((focused_index, tile_indices[neighbor_position]))
+}
+
+fn master_swap_pair(tile_indices: &[usize], focused_index: usize) -> Option<(usize, usize)> {
+    let &master_index = tile_indices.first()?;
+
+    if focused_index == master_index || !tile_indices.contains(&focused_index) {
+        return None;
+    }
+
+    Some((focused_index, master_index))
 }
 
 #[derive(Default)]
@@ -745,6 +761,19 @@ impl WindowManager {
         direction: TileFocusDirection,
         output_size: (i32, i32),
     ) -> bool {
+        self.swap_tile(focused, TileSwapTarget::Adjacent(direction), output_size)
+    }
+
+    pub fn promote_focused_tile(&mut self, focused: &WlSurface, output_size: (i32, i32)) -> bool {
+        self.swap_tile(focused, TileSwapTarget::Master, output_size)
+    }
+
+    fn swap_tile(
+        &mut self,
+        focused: &WlSurface,
+        target: TileSwapTarget,
+        output_size: (i32, i32),
+    ) -> bool {
         if self.current_layout_mode() != LayoutMode::Tiled
             || self.is_dragging()
             || self.is_resizing()
@@ -794,7 +823,14 @@ impl WindowManager {
             return false;
         };
 
-        let Some((first, second)) = adjacent_swap_pair(&indices, focused_index, direction) else {
+        let pair = match target {
+            TileSwapTarget::Adjacent(direction) => {
+                adjacent_swap_pair(&indices, focused_index, direction)
+            }
+            TileSwapTarget::Master => master_swap_pair(&indices, focused_index),
+        };
+
+        let Some((first, second)) = pair else {
             return false;
         };
 
@@ -1847,5 +1883,33 @@ mod tile_swap_tests {
             adjacent_swap_pair(&[0, 3, 7], 5, TileFocusDirection::Previous),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod master_promotion_tests {
+    use super::master_swap_pair;
+
+    #[test]
+    fn stack_tile_can_be_promoted() {
+        let indices = [0, 3, 7, 10];
+
+        assert_eq!(master_swap_pair(&indices, 7), Some((7, 0)));
+    }
+
+    #[test]
+    fn current_master_cannot_be_promoted_again() {
+        let indices = [0, 3, 7];
+
+        assert_eq!(master_swap_pair(&indices, 0), None);
+    }
+
+    #[test]
+    fn invalid_or_missing_tiles_are_rejected() {
+        assert_eq!(master_swap_pair(&[], 0), None);
+
+        assert_eq!(master_swap_pair(&[2, 5, 8], 3), None);
+
+        assert_eq!(master_swap_pair(&[2, 5, 8], 8), Some((8, 2)));
     }
 }

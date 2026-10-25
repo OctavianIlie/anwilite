@@ -297,6 +297,7 @@ enum WorkspaceCommand {
     ResetMasterRatio,
     FocusTile(TileFocusDirection),
     SwapTile(TileFocusDirection),
+    PromoteTile,
     Minimize,
     RestoreMinimized,
 }
@@ -536,6 +537,10 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                             WorkspaceCommand::SwapTile(TileFocusDirection::Next),
                                         ),
 
+                                        Some(keysyms::KEY_p | keysyms::KEY_P) => {
+                                            Some(WorkspaceCommand::PromoteTile)
+                                        }
+
                                         _ => None,
                                     };
 
@@ -675,6 +680,17 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                                     direction,
                                                     output_size,
                                                 )
+                                            })
+                                        }
+
+                                        WorkspaceCommand::PromoteTile => {
+                                            let focused = keyboard.current_focus();
+                                            let output_size = state.output_size;
+
+                                            focused.as_ref().is_some_and(|surface| {
+                                                state
+                                                    .windows
+                                                    .promote_focused_tile(surface, output_size)
                                             })
                                         }
 
