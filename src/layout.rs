@@ -242,6 +242,76 @@ pub fn tile_rects_with_ratio(
     }
 }
 
+pub fn focus_border_rects(rect: SnapRect, thickness: i32) -> Option<[SnapRect; 4]> {
+    let double = thickness.checked_mul(2)?;
+
+    if thickness <= 0 || rect.width <= double || rect.height <= double {
+        return None;
+    }
+
+    let right = rect.x.checked_add(rect.width)?;
+    let bottom = rect.y.checked_add(rect.height)?;
+    let inner_y = rect.y.checked_add(thickness)?;
+    let inner_height = rect.height - double;
+
+    Some([
+        // Top
+        SnapRect {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: thickness,
+        },
+        // Bottom
+        SnapRect {
+            x: rect.x,
+            y: bottom - thickness,
+            width: rect.width,
+            height: thickness,
+        },
+        // Left
+        SnapRect {
+            x: rect.x,
+            y: inner_y,
+            width: thickness,
+            height: inner_height,
+        },
+        // Right
+        SnapRect {
+            x: right - thickness,
+            y: inner_y,
+            width: thickness,
+            height: inner_height,
+        },
+    ])
+}
+
+/// Draw a focus outline in the *gap outside* the compositor-owned tile.
+/// `clearance` pixels remain between the tile and the outline; the outline
+/// itself occupies `thickness` pixels. This avoids matching client-drawn
+/// frames/shadows, whose visible pixels vary from application to application.
+pub fn focus_border_outside_tile(
+    tile: SnapRect,
+    thickness: i32,
+    clearance: i32,
+) -> Option<[SnapRect; 4]> {
+    if thickness <= 0 || clearance < 0 {
+        return None;
+    }
+
+    let margin = thickness.checked_add(clearance)?;
+    let double_margin = margin.checked_mul(2)?;
+
+    let outside = SnapRect {
+        x: tile.x.checked_sub(margin)?,
+        y: tile.y.checked_sub(margin)?,
+        width: tile.width.checked_add(double_margin)?,
+        height: tile.height.checked_add(double_margin)?,
+    };
+
+    focus_border_rects(outside, thickness)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,5 +649,122 @@ mod tests {
         // At this width, the 20% master column cannot fit
         // the required gaps and a positive drawable width.
         assert_eq!(tile_rects_with_ratio((24, 800), 3, gaps, 20), None,);
+    }
+
+    #[test]
+    fn focus_border_has_correct_edges() {
+        let rect = SnapRect {
+            x: 6,
+            y: 6,
+            width: 100,
+            height: 80,
+        };
+
+        let edges = focus_border_rects(rect, 3).unwrap();
+
+        assert_eq!(
+            edges,
+            [
+                SnapRect {
+                    x: 6,
+                    y: 6,
+                    width: 100,
+                    height: 3,
+                },
+                SnapRect {
+                    x: 6,
+                    y: 83,
+                    width: 100,
+                    height: 3,
+                },
+                SnapRect {
+                    x: 6,
+                    y: 9,
+                    width: 3,
+                    height: 74,
+                },
+                SnapRect {
+                    x: 103,
+                    y: 9,
+                    width: 3,
+                    height: 74,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn focus_border_in_gap_stays_outside_tile() {
+        let tile = SnapRect {
+            x: 6,
+            y: 6,
+            width: 100,
+            height: 80,
+        };
+
+        let edges = focus_border_outside_tile(tile, 2, 1).unwrap();
+        assert_eq!(
+            edges[0],
+            SnapRect {
+                x: 3,
+                y: 3,
+                width: 106,
+                height: 2
+            }
+        );
+        assert_eq!(
+            edges[1],
+            SnapRect {
+                x: 3,
+                y: 87,
+                width: 106,
+                height: 2
+            }
+        );
+        assert_eq!(
+            edges[2],
+            SnapRect {
+                x: 3,
+                y: 5,
+                width: 2,
+                height: 82
+            }
+        );
+        assert_eq!(
+            edges[3],
+            SnapRect {
+                x: 107,
+                y: 5,
+                width: 2,
+                height: 82
+            }
+        );
+    }
+
+    #[test]
+    fn focus_border_in_gap_rejects_invalid_parameters() {
+        let tile = SnapRect {
+            x: 6,
+            y: 6,
+            width: 100,
+            height: 80,
+        };
+        assert_eq!(focus_border_outside_tile(tile, 0, 1), None);
+        assert_eq!(focus_border_outside_tile(tile, 2, -1), None);
+        assert_eq!(focus_border_outside_tile(tile, i32::MAX, 1), None);
+    }
+
+    #[test]
+    fn focus_border_rejects_invalid_sizes() {
+        let rect = SnapRect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 80,
+        };
+
+        assert_eq!(focus_border_rects(rect, 0), None);
+        assert_eq!(focus_border_rects(rect, -1), None);
+        assert_eq!(focus_border_rects(rect, 50), None);
     }
 }

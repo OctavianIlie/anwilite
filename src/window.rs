@@ -55,6 +55,53 @@ pub struct ManagedWindow {
     minimized_order: u64,
 }
 
+impl ManagedWindow {
+    pub fn tiled_rect_for_render(&self) -> Option<SnapRect> {
+        if self.maximized {
+            return None;
+        }
+
+        let tile = self.tiled?;
+        // A client may still be between its initial configure and first
+        // committed buffer. Keep tile cropping active in that case.
+        let Some(geometry) = window_geometry(self) else {
+            return Some(tile);
+        };
+
+        // The XDG geometry describes the committed window, excluding
+        // client-drawn shadow margins when the client reports them.
+        let visible = Rectangle::<i32, Logical>::new(
+            (
+                self.x.checked_add(geometry.loc.x)?,
+                self.y.checked_add(geometry.loc.y)?,
+            )
+                .into(),
+            geometry.size,
+        );
+
+        let slot = Rectangle::<i32, Logical>::new(
+            (tile.x, tile.y).into(),
+            (tile.width, tile.height).into(),
+        );
+
+        // One authoritative rectangle drives BOTH GPU cropping and borders.
+        // Never draw into another window's tile while a resize is pending.
+        let Some(clipped) = visible.intersection(slot) else {
+            return Some(tile);
+        };
+        if clipped.size.w <= 0 || clipped.size.h <= 0 {
+            return None;
+        }
+
+        Some(SnapRect {
+            x: clipped.loc.x,
+            y: clipped.loc.y,
+            width: clipped.size.w,
+            height: clipped.size.h,
+        })
+    }
+}
+
 struct DragState {
     surface: ToplevelSurface,
     offset_x: f64,
@@ -124,6 +171,31 @@ fn changes_bottom(edges: xdg_toplevel::ResizeEdge) -> bool {
     )
 }
 
+// The compositor must not request a tile size outside the client's
+// advertised xdg_toplevel bounds. A zero constraint means unspecified.
+fn tile_fits_size_constraints(tile: SnapRect, minimum: (i32, i32), maximum: (i32, i32)) -> bool {
+    let (min_w, min_h) = minimum;
+    let (max_w, max_h) = maximum;
+    tile.width > 0
+        && tile.height > 0
+        && tile.width >= min_w
+        && tile.height >= min_h
+        && (max_w == 0 || tile.width <= max_w)
+        && (max_h == 0 || tile.height <= max_h)
+}
+
+fn window_can_fit_tile(window: &ManagedWindow, tile: SnapRect) -> bool {
+    let (minimum, maximum) = with_states(window.surface.wl_surface(), |states| {
+        let mut cached = states.cached_state.get::<SurfaceCachedState>();
+        let state = cached.current();
+        (
+            (state.min_size.w, state.min_size.h),
+            (state.max_size.w, state.max_size.h),
+        )
+    });
+    tile_fits_size_constraints(tile, minimum, maximum)
+}
+
 fn window_geometry(window: &ManagedWindow) -> Option<Rectangle<i32, Logical>> {
     let bounds = bbox_from_surface_tree(window.surface.wl_surface(), (0, 0));
     let geometry = with_states(window.surface.wl_surface(), |states| {
@@ -137,6 +209,25 @@ fn window_geometry(window: &ManagedWindow) -> Option<Rectangle<i32, Logical>> {
     .unwrap_or(bounds);
 
     (geometry.size.w > 0 && geometry.size.h > 0).then_some(geometry)
+}
+
+// Update the xdg_toplevel tiled-edge hints. The caller must send a configure
+// after changing these pending states.
+fn set_tiled_edges(surface: &ToplevelSurface, tiled: bool) {
+    surface.with_pending_state(|state| {
+        for edge in [
+            xdg_toplevel::State::TiledLeft,
+            xdg_toplevel::State::TiledRight,
+            xdg_toplevel::State::TiledTop,
+            xdg_toplevel::State::TiledBottom,
+        ] {
+            if tiled {
+                state.states.set(edge);
+            } else {
+                state.states.unset(edge);
+            }
+        }
+    });
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -352,6 +443,9 @@ impl WindowManager {
             let was_maximized_tile = window.tiled.is_some() && window.maximized;
             let saved = window.pre_tile.take();
 
+            // The client is leaving tiled mode; restore ordinary decorations.
+            set_tiled_edges(&window.surface, false);
+
             window.tiled = None;
             if was_maximized_tile {
                 window.maximized = false;
@@ -364,6 +458,9 @@ impl WindowManager {
                         state.size = None;
                     });
                     window.surface.send_configure();
+                } else {
+                    // Also commit cleared tile flags for hidden/minimized windows.
+                    window.surface.send_pending_configure();
                 }
                 continue;
             };
@@ -461,6 +558,23 @@ impl WindowManager {
             self.stop_tiling_workspace(workspace);
             return true;
         };
+
+        // A newly opened client or output resize may make the layout too
+        // small for an existing window. Preserve all windows by returning
+        // this workspace to floating mode rather than overlapping tiles.
+        if indices
+            .iter()
+            .zip(targets.iter())
+            .any(|(&index, &target)| !window_can_fit_tile(&self.windows[index], target))
+        {
+            eprintln!(
+                "Anwilite: workspace {} cannot fit all {} tiled windows; restoring floating mode",
+                workspace,
+                indices.len(),
+            );
+            self.stop_tiling_workspace(workspace);
+            return true;
+        }
 
         let has_new_tile = indices
             .iter()
@@ -562,6 +676,8 @@ impl WindowManager {
             window.x = target.x - offset_x;
             window.y = target.y - offset_y;
 
+            // Ask clients to suppress CSD shadows beyond their tiled edges.
+            set_tiled_edges(&window.surface, true);
             window.surface.with_pending_state(|state| {
                 if entering_from_maximized {
                     state.states.unset(xdg_toplevel::State::Maximized);
@@ -608,14 +724,26 @@ impl WindowManager {
             return false;
         }
 
-        if tile_rects_with_ratio(
+        let Some(targets) = tile_rects_with_ratio(
             output_size,
             windows.len(),
             DEFAULT_SNAP_GAPS,
             self.master_ratio_for_workspace(workspace),
-        )
-        .is_none()
+        ) else {
+            return false;
+        };
+
+        if let Some(target) = windows
+            .iter()
+            .zip(targets.iter())
+            .find_map(|(window, &target)| (!window_can_fit_tile(window, target)).then_some(target))
         {
+            eprintln!(
+                "Anwilite: cannot tile {} windows: one client rejects a {}x{} slot; keeping floating layout",
+                windows.len(),
+                target.width,
+                target.height,
+            );
             return false;
         }
 
@@ -692,6 +820,7 @@ impl WindowManager {
         // TILED -> FLOATING:
         // Return the window to its original floating geometry.
         if action == TransferAction::RestoreFloating {
+            set_tiled_edges(&window.surface, false);
             if window.tiled.take().is_some() {
                 if let Some(normal) = window.pre_tile.take() {
                     if let Some(geometry) = window_geometry(&window) {
@@ -739,8 +868,6 @@ impl WindowManager {
             return None;
         }
 
-        // reflow_tiled_workspace() uses this same Vec order for master + stack.
-        // is_window_visible() excludes minimized and maximization-hidden tiles.
         let tiles: Vec<WlSurface> = self
             .windows
             .iter()
@@ -753,6 +880,25 @@ impl WindowManager {
         let next_index = adjacent_tile_index(current_index, tiles.len(), direction)?;
 
         Some(tiles[next_index].clone())
+    }
+
+    pub fn focused_tiled_rect(&self, focused: Option<&WlSurface>) -> Option<SnapRect> {
+        if self.current_layout_mode() != LayoutMode::Tiled {
+            return None;
+        }
+
+        let focused = focused?;
+
+        // Reuse the exact same committed-and-clipped rectangle that the
+        // renderer uses; no client-specific bottom/side offsets.
+        self.windows
+            .iter()
+            .find(|window| {
+                window.surface.wl_surface() == focused
+                    && self.is_window_visible(window)
+                    && !window.maximized
+            })
+            .and_then(|window| window.tiled_rect_for_render())
     }
 
     pub fn swap_focused_tile(
@@ -1135,6 +1281,8 @@ impl WindowManager {
 
         if window.tiled.is_some() {
             // Preserve window.tiled and window.pre_tile.
+            // Maximized windows are not presented as ordinary tiled windows.
+            set_tiled_edges(&window.surface, false);
             window.maximized = true;
 
             // Maximized windows cover the entire output.
@@ -1188,6 +1336,7 @@ impl WindowManager {
         };
         if window.maximized {
             if let Some(target) = window.tiled {
+                set_tiled_edges(&window.surface, true);
                 window.maximized = false;
 
                 if let Some(geometry) = window_geometry(window) {
@@ -1766,6 +1915,36 @@ impl WindowManager {
             state.states.unset(xdg_toplevel::State::Resizing);
         });
         resize.anchor.surface.send_pending_configure();
+    }
+}
+
+#[cfg(test)]
+mod tile_constraint_tests {
+    use super::{SnapRect, tile_fits_size_constraints};
+
+    #[test]
+    fn unconstrained_client_can_be_tiled() {
+        let tile = SnapRect {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 120,
+        };
+        assert!(tile_fits_size_constraints(tile, (0, 0), (0, 0)));
+    }
+
+    #[test]
+    fn too_small_or_too_large_tiles_are_rejected() {
+        let tile = SnapRect {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 120,
+        };
+        assert!(!tile_fits_size_constraints(tile, (201, 100), (0, 0)));
+        assert!(!tile_fits_size_constraints(tile, (100, 121), (0, 0)));
+        assert!(!tile_fits_size_constraints(tile, (0, 0), (199, 0)));
+        assert!(tile_fits_size_constraints(tile, (100, 90), (400, 180)));
     }
 }
 

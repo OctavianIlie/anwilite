@@ -3,7 +3,7 @@ mod window;
 mod workspace;
 
 use calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic};
-use layout::SnapSide;
+use layout::{SnapSide, focus_border_outside_tile};
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::wayland::socket::ListeningSocketSource;
 use smithay::{
@@ -14,8 +14,10 @@ use smithay::{
         },
         renderer::{
             element::{
-                Kind,
+                Kind, render_elements,
+                solid::{SolidColorBuffer, SolidColorRenderElement},
                 surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
+                utils::CropRenderElement,
             },
             gles::GlesRenderer,
             utils::on_commit_buffer_handler,
@@ -29,7 +31,7 @@ use smithay::{
         pointer::{ButtonEvent, MotionEvent},
     },
     reexports::wayland_server::{Display, protocol::wl_seat},
-    utils::{Serial, Transform},
+    utils::{Physical, Rectangle, Serial, Transform},
     wayland::{
         buffer::BufferHandler,
         compositor::{
@@ -64,6 +66,22 @@ use wayland_server::{
     },
 };
 use window::{TileFocusDirection, WindowManager};
+
+const FOCUS_BORDER_THICKNESS: i32 = 2;
+
+const FOCUS_BORDER_COLOR: [f32; 4] = [
+    0.18, //RED
+    0.85, //GREEN
+    0.68, //BLUE
+    1.0,  //ALPHA
+];
+
+render_elements! {
+    AnwiliteRenderElement<=GlesRenderer>;
+    Surface=WaylandSurfaceRenderElement<GlesRenderer>,
+    ClippedSurface=CropRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>,
+    FocusBorder=SolidColorRenderElement,
+}
 
 impl BufferHandler for App {
     fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
@@ -276,6 +294,7 @@ impl SeatHandler for App {
 
     fn focus_changed(&mut self, _seat: &Seat<Self>, focused: Option<&WlSurface>) {
         self.windows.remember_focus(focused);
+        self.needs_redraw = true;
     }
     fn cursor_image(
         &mut self,
@@ -405,6 +424,9 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
     let mut damage_rectangles: u64 = 0;
     let mut damage_area: u128 = 0;
     let mut presented_area: u128 = 0;
+
+    let mut focus_border_buffers: [SolidColorBuffer; 4] =
+        std::array::from_fn(|_| SolidColorBuffer::new((1, 1), FOCUS_BORDER_COLOR));
 
     let keyboard = state
         .seat
@@ -1029,12 +1051,23 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             let submit_damage = {
                 let (renderer, mut framebuffer) = backend.bind().unwrap();
 
-                let elements = state
+                let mut elements = state
                     .windows
                     .windows
                     .iter()
                     .filter(|window| state.windows.is_window_visible(window))
                     .flat_map(|window| {
+                        // A client can commit a buffer larger than its configured
+                        // tile. Crop its render elements so it cannot cover a
+                        // neighboring tiled window. Floating/maximized windows
+                        // continue to render without cropping.
+                        let clip = window.tiled_rect_for_render().map(|tile| {
+                            Rectangle::<i32, Physical>::new(
+                                (tile.x, tile.y).into(),
+                                (tile.width, tile.height).into(),
+                            )
+                        });
+
                         render_elements_from_surface_tree(
                             renderer,
                             window.surface.wl_surface(),
@@ -1043,8 +1076,39 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                             1.0,
                             Kind::Unspecified,
                         )
+                        .into_iter()
+                        .filter_map(move |element| match clip {
+                            Some(rect) => CropRenderElement::from_element(element, 1.0, rect)
+                                .map(AnwiliteRenderElement::ClippedSurface),
+                            None => Some(AnwiliteRenderElement::Surface(element)),
+                        })
+                        .collect::<Vec<_>>()
                     })
-                    .collect::<Vec<WaylandSurfaceRenderElement<GlesRenderer>>>();
+                    .collect::<Vec<AnwiliteRenderElement>>();
+
+                // Get the window with keyboard focus.
+                let focused = keyboard.current_focus();
+
+                // Render the focus outline in the tile gap, outside client decorations.
+                if let Some(rect) = state.windows.focused_tiled_rect(focused.as_ref()) {
+                    if let Some(edges) = focus_border_outside_tile(rect, FOCUS_BORDER_THICKNESS, 0)
+                    {
+                        for (buffer, edge) in focus_border_buffers.iter_mut().zip(edges) {
+                            // Update the buffer only when its size changes.
+                            buffer.resize((edge.width, edge.height));
+
+                            let border = SolidColorRenderElement::from_buffer(
+                                buffer,
+                                (edge.x, edge.y),
+                                1.0,
+                                1.0,
+                                Kind::Unspecified,
+                            );
+                            // Insert the border before the application surfaces.
+                            elements.insert(0, AnwiliteRenderElement::FocusBorder(border));
+                        }
+                    }
+                }
 
                 let result = damage_tracker.render_output(
                     renderer,
