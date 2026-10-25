@@ -1,7 +1,9 @@
+mod appearance;
 mod layout;
 mod window;
 mod workspace;
 
+use appearance::ACTIVE_BORDER;
 use calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic};
 use layout::{SnapSide, focus_border_outside_tile};
 use smithay::backend::renderer::damage::OutputDamageTracker;
@@ -66,15 +68,6 @@ use wayland_server::{
     },
 };
 use window::{TileFocusDirection, WindowManager};
-
-const FOCUS_BORDER_THICKNESS: i32 = 2;
-
-const FOCUS_BORDER_COLOR: [f32; 4] = [
-    0.18, //RED
-    0.85, //GREEN
-    0.68, //BLUE
-    1.0,  //ALPHA
-];
 
 render_elements! {
     AnwiliteRenderElement<=GlesRenderer>;
@@ -349,6 +342,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
+    // Fail immediately if a developer sets an invalid compile-time border style.
+    assert!(ACTIVE_BORDER.is_valid(), "Invalid focus border style");
+
     let mut display: Display<App> = Display::new()?;
     let dh = display.handle();
 
@@ -426,7 +422,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
     let mut presented_area: u128 = 0;
 
     let mut focus_border_buffers: [SolidColorBuffer; 4] =
-        std::array::from_fn(|_| SolidColorBuffer::new((1, 1), FOCUS_BORDER_COLOR));
+        std::array::from_fn(|_| SolidColorBuffer::new((1, 1), ACTIVE_BORDER.rgba));
 
     let keyboard = state
         .seat
@@ -1091,8 +1087,11 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                 // The same accent outline now works for tiled, snapped and
                 // floating windows. Maximized windows have no focus border.
                 if let Some(rect) = state.windows.focused_window_rect(focused.as_ref()) {
-                    if let Some(edges) = focus_border_outside_tile(rect, FOCUS_BORDER_THICKNESS, 0)
-                    {
+                    if let Some(edges) = focus_border_outside_tile(
+                        rect,
+                        ACTIVE_BORDER.thickness,
+                        ACTIVE_BORDER.clearance,
+                    ) {
                         for (buffer, edge) in focus_border_buffers.iter_mut().zip(edges) {
                             // Update the buffer only when its size changes.
                             buffer.resize((edge.width, edge.height));
