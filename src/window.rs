@@ -56,27 +56,25 @@ pub struct ManagedWindow {
 }
 
 impl ManagedWindow {
-    pub fn tiled_rect_for_render(&self) -> Option<SnapRect> {
+    // A placement clip is used for both tiled and snapped windows.
+    // Floating windows have no placement clip.
+    pub fn placed_rect_for_render(&self) -> Option<SnapRect> {
         if self.maximized {
             return None;
         }
 
-        let tile = self.tiled?;
+        let tile = self.tiled.or_else(|| self.snapped.map(|(_, rect)| rect))?;
         // A client may still be between its initial configure and first
         // committed buffer. Keep tile cropping active in that case.
         let Some(geometry) = window_geometry(self) else {
             return Some(tile);
         };
 
-        // The XDG geometry describes the committed window, excluding
-        // client-drawn shadow margins when the client reports them.
+        // Translate the committed XDG geometry into output coordinates.
+        let absolute = absolute_window_rect((self.x, self.y), geometry)?;
         let visible = Rectangle::<i32, Logical>::new(
-            (
-                self.x.checked_add(geometry.loc.x)?,
-                self.y.checked_add(geometry.loc.y)?,
-            )
-                .into(),
-            geometry.size,
+            (absolute.x, absolute.y).into(),
+            (absolute.width, absolute.height).into(),
         );
 
         let slot = Rectangle::<i32, Logical>::new(
@@ -99,6 +97,24 @@ impl ManagedWindow {
             width: clipped.size.w,
             height: clipped.size.h,
         })
+    }
+
+    pub fn focus_rect(&self) -> Option<SnapRect> {
+        // Keep the existing no-border policy for maximized windows.
+        if self.maximized || self.minimized {
+            return None;
+        }
+
+        // Tiled/snapped focus borders must match the clip used to render
+        // their client surfaces, even during configure/commit transitions.
+        if self.tiled.is_some() || self.snapped.is_some() {
+            return self.placed_rect_for_render();
+        }
+
+        // Floating windows are not clipped to a tiling slot. Their outline
+        // follows the actual XDG window geometry as they move or resize.
+        let geometry = window_geometry(self)?;
+        absolute_window_rect((self.x, self.y), geometry)
     }
 }
 
@@ -194,6 +210,21 @@ fn window_can_fit_tile(window: &ManagedWindow, tile: SnapRect) -> bool {
         )
     });
     tile_fits_size_constraints(tile, minimum, maximum)
+}
+
+// Convert surface-local XDG geometry into compositor output coordinates.
+// Pure geometry helper: no Wayland state is needed to unit-test it.
+fn absolute_window_rect(origin: (i32, i32), geometry: Rectangle<i32, Logical>) -> Option<SnapRect> {
+    if geometry.size.w <= 0 || geometry.size.h <= 0 {
+        return None;
+    }
+
+    Some(SnapRect {
+        x: origin.0.checked_add(geometry.loc.x)?,
+        y: origin.1.checked_add(geometry.loc.y)?,
+        width: geometry.size.w,
+        height: geometry.size.h,
+    })
 }
 
 fn window_geometry(window: &ManagedWindow) -> Option<Rectangle<i32, Logical>> {
@@ -882,23 +913,13 @@ impl WindowManager {
         Some(tiles[next_index].clone())
     }
 
-    pub fn focused_tiled_rect(&self, focused: Option<&WlSurface>) -> Option<SnapRect> {
-        if self.current_layout_mode() != LayoutMode::Tiled {
-            return None;
-        }
-
+    pub fn focused_window_rect(&self, focused: Option<&WlSurface>) -> Option<SnapRect> {
         let focused = focused?;
 
-        // Reuse the exact same committed-and-clipped rectangle that the
-        // renderer uses; no client-specific bottom/side offsets.
         self.windows
             .iter()
-            .find(|window| {
-                window.surface.wl_surface() == focused
-                    && self.is_window_visible(window)
-                    && !window.maximized
-            })
-            .and_then(|window| window.tiled_rect_for_render())
+            .find(|window| window.surface.wl_surface() == focused && self.is_window_visible(window))
+            .and_then(|window| window.focus_rect())
     }
 
     pub fn swap_focused_tile(
@@ -1945,6 +1966,36 @@ mod tile_constraint_tests {
         assert!(!tile_fits_size_constraints(tile, (100, 121), (0, 0)));
         assert!(!tile_fits_size_constraints(tile, (0, 0), (199, 0)));
         assert!(tile_fits_size_constraints(tile, (100, 90), (400, 180)));
+    }
+}
+
+#[cfg(test)]
+mod focus_rect_tests {
+    use super::{SnapRect, absolute_window_rect};
+    use smithay::utils::{Logical, Rectangle};
+
+    #[test]
+    fn floating_rect_includes_window_and_xdg_offsets() {
+        let geometry = Rectangle::<i32, Logical>::new((5, -3).into(), (180, 110).into());
+
+        assert_eq!(
+            absolute_window_rect((90, 60), geometry),
+            Some(SnapRect {
+                x: 95,
+                y: 57,
+                width: 180,
+                height: 110,
+            })
+        );
+    }
+
+    #[test]
+    fn floating_rect_rejects_invalid_dimensions_and_overflow() {
+        let empty = Rectangle::<i32, Logical>::new((0, 0).into(), (0, 100).into());
+        assert_eq!(absolute_window_rect((0, 0), empty), None);
+
+        let overflowing = Rectangle::<i32, Logical>::new((5, 0).into(), (100, 100).into());
+        assert_eq!(absolute_window_rect((i32::MAX, 0), overflowing), None);
     }
 }
 

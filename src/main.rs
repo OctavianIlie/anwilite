@@ -1057,11 +1057,10 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                     .iter()
                     .filter(|window| state.windows.is_window_visible(window))
                     .flat_map(|window| {
-                        // A client can commit a buffer larger than its configured
-                        // tile. Crop its render elements so it cannot cover a
-                        // neighboring tiled window. Floating/maximized windows
-                        // continue to render without cropping.
-                        let clip = window.tiled_rect_for_render().map(|tile| {
+                        // Crop tiled and snapped clients to their committed geometry
+                        // intersected with the assigned placement rectangle.
+                        // Floating and maximized windows remain uncropped.
+                        let clip = window.placed_rect_for_render().map(|tile| {
                             Rectangle::<i32, Physical>::new(
                                 (tile.x, tile.y).into(),
                                 (tile.width, tile.height).into(),
@@ -1089,8 +1088,9 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                 // Get the window with keyboard focus.
                 let focused = keyboard.current_focus();
 
-                // Render the focus outline in the tile gap, outside client decorations.
-                if let Some(rect) = state.windows.focused_tiled_rect(focused.as_ref()) {
+                // The same accent outline now works for tiled, snapped and
+                // floating windows. Maximized windows have no focus border.
+                if let Some(rect) = state.windows.focused_window_rect(focused.as_ref()) {
                     if let Some(edges) = focus_border_outside_tile(rect, FOCUS_BORDER_THICKNESS, 0)
                     {
                         for (buffer, edge) in focus_border_buffers.iter_mut().zip(edges) {
