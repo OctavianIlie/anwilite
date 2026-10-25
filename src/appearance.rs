@@ -29,6 +29,20 @@ pub const ACTIVE_BORDER: BorderStyle = BorderStyle {
     rgba: [0.18, 0.85, 0.68, 1.0],
 };
 
+pub const INACTIVE_BORDER: Option<BorderStyle> = Some(BorderStyle {
+    thickness: 1,
+    clearance: 0,
+    rgba: [0.30, 0.34, 0.40, 1.0],
+});
+
+pub fn border_style(is_focused: bool) -> Option<BorderStyle> {
+    if is_focused {
+        Some(ACTIVE_BORDER)
+    } else {
+        INACTIVE_BORDER
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,5 +73,19 @@ mod tests {
             ..ACTIVE_BORDER
         };
         assert!(!invalid_color.is_valid());
+    }
+
+    #[test]
+    fn focused_window_uses_active_border() {
+        assert_eq!(border_style(true), Some(ACTIVE_BORDER));
+    }
+
+    #[test]
+    fn inactive_border_is_optional_and_valid() {
+        assert_eq!(border_style(false), INACTIVE_BORDER);
+
+        if let Some(style) = INACTIVE_BORDER {
+            assert!(style.is_valid());
+        }
     }
 }

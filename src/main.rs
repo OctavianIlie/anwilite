@@ -3,7 +3,7 @@ mod layout;
 mod window;
 mod workspace;
 
-use appearance::ACTIVE_BORDER;
+use appearance::{ACTIVE_BORDER, INACTIVE_BORDER, border_style};
 use calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic};
 use layout::{SnapSide, focus_border_outside_tile};
 use smithay::backend::renderer::damage::OutputDamageTracker;
@@ -53,6 +53,7 @@ use smithay::{
     },
 };
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::rc::Rc;
@@ -345,6 +346,10 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
     // Fail immediately if a developer sets an invalid compile-time border style.
     assert!(ACTIVE_BORDER.is_valid(), "Invalid focus border style");
 
+    if let Some(style) = INACTIVE_BORDER {
+        assert!(style.is_valid(), "Invalid inactive border style");
+    }
+
     let mut display: Display<App> = Display::new()?;
     let dh = display.handle();
 
@@ -421,8 +426,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
     let mut damage_area: u128 = 0;
     let mut presented_area: u128 = 0;
 
-    let mut focus_border_buffers: [SolidColorBuffer; 4] =
-        std::array::from_fn(|_| SolidColorBuffer::new((1, 1), ACTIVE_BORDER.rgba));
+    let mut border_buffers: HashMap<WlSurface, [SolidColorBuffer; 4]> = HashMap::new();
 
     let keyboard = state
         .seat
@@ -982,6 +986,13 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
         let previous_count = state.windows.windows.len();
 
         state.windows.retain_live();
+        border_buffers.retain(|surface, _| {
+            state
+                .windows
+                .windows
+                .iter()
+                .any(|window| window.surface.wl_surface() == surface)
+        });
 
         if state.windows.windows.len() != previous_count {
             println!(
@@ -1081,32 +1092,82 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                     })
                     .collect::<Vec<AnwiliteRenderElement>>();
 
-                // Get the window with keyboard focus.
+                /// Keyboard focus determines each window's border style.
                 let focused = keyboard.current_focus();
+                let focused_rect = state.windows.focused_window_rect(focused.as_ref());
 
-                // The same accent outline now works for tiled, snapped and
-                // floating windows. Maximized windows have no focus border.
-                if let Some(rect) = state.windows.focused_window_rect(focused.as_ref()) {
-                    if let Some(edges) = focus_border_outside_tile(
-                        rect,
-                        ACTIVE_BORDER.thickness,
-                        ACTIVE_BORDER.clearance,
-                    ) {
-                        for (buffer, edge) in focus_border_buffers.iter_mut().zip(edges) {
-                            // Update the buffer only when its size changes.
-                            buffer.resize((edge.width, edge.height));
+                let mut elements = Vec::<AnwiliteRenderElement>::new();
 
-                            let border = SolidColorRenderElement::from_buffer(
-                                buffer,
-                                (edge.x, edge.y),
-                                1.0,
-                                1.0,
-                                Kind::Unspecified,
-                            );
-                            // Insert the border before the application surfaces.
-                            elements.insert(0, AnwiliteRenderElement::FocusBorder(border));
+                // Window order is front-to-back.
+                for window in state
+                    .windows
+                    .windows
+                    .iter()
+                    .filter(|window| state.windows.is_window_visible(window))
+                {
+                    let is_focused = focused.as_ref() == Some(window.surface.wl_surface());
+
+                    // Use the same trusted geometry path as Lesson 29C.
+                    let rect = if is_focused {
+                        focused_rect
+                    } else {
+                        window.focus_rect()
+                    };
+
+                    // Draw this window's border, if enabled.
+                    if let (Some(style), Some(rect)) = (border_style(is_focused), rect) {
+                        if let Some(edges) =
+                            focus_border_outside_tile(rect, style.thickness, style.clearance)
+                        {
+                            let buffers = border_buffers
+                                .entry(window.surface.wl_surface().clone())
+                                .or_insert_with(|| {
+                                    std::array::from_fn(|_| {
+                                        SolidColorBuffer::new((1, 1), style.rgba)
+                                    })
+                                });
+
+                            for (buffer, edge) in buffers.iter_mut().zip(edges) {
+                                buffer.update((edge.width, edge.height), style.rgba);
+
+                                let border = SolidColorRenderElement::from_buffer(
+                                    buffer,
+                                    (edge.x, edge.y),
+                                    1.0,
+                                    1.0,
+                                    Kind::Unspecified,
+                                );
+
+                                elements.push(AnwiliteRenderElement::FocusBorder(border));
+                            }
                         }
                     }
+
+                    // Preserve the existing tiled/snapped client clipping.
+                    let clip = window.placed_rect_for_render().map(|tile| {
+                        Rectangle::<i32, Physical>::new(
+                            (tile.x, tile.y).into(),
+                            (tile.width, tile.height).into(),
+                        )
+                    });
+
+                    // Draw the application's surfaces after its border.
+                    elements.extend(
+                        render_elements_from_surface_tree(
+                            renderer,
+                            window.surface.wl_surface(),
+                            (window.x, window.y),
+                            1.0,
+                            1.0,
+                            Kind::Unspecified,
+                        )
+                        .into_iter()
+                        .filter_map(move |element| match clip {
+                            Some(rect) => CropRenderElement::from_element(element, 1.0, rect)
+                                .map(AnwiliteRenderElement::ClippedSurface),
+                            None => Some(AnwiliteRenderElement::Surface(element)),
+                        }),
+                    );
                 }
 
                 let result = damage_tracker.render_output(
