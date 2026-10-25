@@ -83,12 +83,81 @@ pub fn snap_rect_with_gaps(
     })
 }
 
+fn split_columns(
+    output_size: (i32, i32),
+    gaps: SnapGaps,
+    master_percent: u8,
+) -> Option<(SnapRect, SnapRect)> {
+    let (output_width, output_height) = output_size;
+
+    if output_width < 2
+        || output_height < 1
+        || gaps.outer < 0
+        || gaps.inner < 0
+        || !(20..=80).contains(&master_percent)
+    {
+        return None;
+    }
+
+    // Use i64 for intermediate multiplication.
+    let split =
+        i32::try_from(i64::from(output_width).checked_mul(i64::from(master_percent))? / 100)
+            .ok()?;
+
+    // Match our existing gap convention.
+    let inner_left = gaps.inner / 2;
+    let inner_right = gaps.inner - inner_left;
+
+    let height = output_height.checked_sub(gaps.outer.checked_mul(2)?)?;
+
+    let master_width = split.checked_sub(gaps.outer)?.checked_sub(inner_right)?;
+
+    let stack_width = output_width
+        .checked_sub(split)?
+        .checked_sub(inner_left)?
+        .checked_sub(gaps.outer)?;
+
+    if master_width <= 0 || stack_width <= 0 || height <= 0 {
+        return None;
+    }
+
+    let stack_x = split.checked_add(inner_left)?;
+
+    let master = SnapRect {
+        x: gaps.outer,
+        y: gaps.outer,
+        width: master_width,
+        height,
+    };
+
+    let stack = SnapRect {
+        x: stack_x,
+        y: gaps.outer,
+        width: stack_width,
+        height,
+    };
+
+    Some((master, stack))
+}
+
 pub fn tile_rects(
     output_size: (i32, i32),
     window_count: usize,
     gaps: SnapGaps,
 ) -> Option<Vec<SnapRect>> {
+    tile_rects_with_ratio(output_size, window_count, gaps, 50)
+}
+
+pub fn tile_rects_with_ratio(
+    output_size: (i32, i32),
+    window_count: usize,
+    gaps: SnapGaps,
+    master_percent: u8,
+) -> Option<Vec<SnapRect>> {
     if gaps.outer < 0 || gaps.inner < 0 {
+        return None;
+    }
+    if !(20..=80).contains(&master_percent) {
         return None;
     }
 
@@ -119,17 +188,13 @@ pub fn tile_rects(
 
         // Preserve the existing two-window layout.
         2 => {
-            let left = snap_rect_with_gaps(output_size, SnapSide::Left, gaps)?;
+            let (master, stack) = split_columns(output_size, gaps, master_percent)?;
 
-            let right = snap_rect_with_gaps(output_size, SnapSide::Right, gaps)?;
-
-            Some(vec![left, right])
+            Some(vec![master, stack])
         }
 
         n => {
-            let master = snap_rect_with_gaps(output_size, SnapSide::Left, gaps)?;
-
-            let stack_area = snap_rect_with_gaps(output_size, SnapSide::Right, gaps)?;
+            let (master, stack_area) = split_columns(output_size, gaps, master_percent)?;
 
             let stack_count = i32::try_from(n - 1).ok()?;
 
@@ -452,5 +517,67 @@ mod tests {
     #[test]
     fn stack_rejects_insufficient_vertical_space() {
         assert_eq!(tile_rects((1200, 25), 5, DEFAULT_SNAP_GAPS,), None);
+    }
+
+    #[test]
+    fn default_ratio_preserves_original_layouts() {
+        for count in 0..=6 {
+            let original = tile_rects((1200, 800), count, DEFAULT_SNAP_GAPS);
+
+            let explicit = tile_rects_with_ratio((1200, 800), count, DEFAULT_SNAP_GAPS, 50);
+
+            assert_eq!(original, explicit);
+        }
+    }
+
+    #[test]
+    fn sixty_percent_master_uses_correct_width() {
+        let rects = tile_rects_with_ratio((1200, 800), 3, DEFAULT_SNAP_GAPS, 60).unwrap();
+
+        assert_eq!(rects.len(), 3);
+
+        assert_eq!(rects[0].x, 6);
+        assert_eq!(rects[0].width, 711);
+
+        assert_eq!(rects[1].x, 723);
+        assert_eq!(rects[1].width, 471);
+
+        assert_eq!(rects[2].x, 723);
+        assert_eq!(rects[2].width, 471);
+
+        // Preserve the 6-pixel horizontal gap.
+        assert_eq!(rects[1].x - (rects[0].x + rects[0].width), 6,);
+    }
+
+    #[test]
+    fn seventy_percent_master_preserves_stack_gaps() {
+        let rects = tile_rects_with_ratio((1200, 800), 4, DEFAULT_SNAP_GAPS, 70).unwrap();
+
+        assert_eq!(rects.len(), 4);
+
+        assert_eq!(rects[0].width, 831);
+
+        for rect in &rects[1..] {
+            assert_eq!(rect.x, 843);
+            assert_eq!(rect.width, 351);
+        }
+
+        // Existing vertical stack spacing still works.
+        for pair in rects[1..].windows(2) {
+            assert_eq!(pair[1].y - (pair[0].y + pair[0].height), 6,);
+        }
+    }
+
+    #[test]
+    fn invalid_ratios_and_tiny_columns_fail() {
+        let gaps = DEFAULT_SNAP_GAPS;
+
+        assert_eq!(tile_rects_with_ratio((1200, 800), 3, gaps, 19), None,);
+
+        assert_eq!(tile_rects_with_ratio((1200, 800), 3, gaps, 81), None,);
+
+        // At this width, the 20% master column cannot fit
+        // the required gaps and a positive drawable width.
+        assert_eq!(tile_rects_with_ratio((24, 800), 3, gaps, 20), None,);
     }
 }
