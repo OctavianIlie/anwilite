@@ -216,27 +216,34 @@ When the socket is deliberately renamed to `anwilite-0`, update this command, th
 
 ## Milestone history
 
-This is a **summary of completed learning milestones**, not a reconstructed Git commit history. Earlier milestones were developed and tested incrementally.
+These are **completed and tested development milestones**, grouped by feature area rather than reconstructed from Git commits.
 
-|  Implemented and verified |
-| --- | --- |
-| Nested Winit/Smithay compositor, Wayland client handling, GLES rendering, pointer and keyboard input, basic floating window manager |
-|  Damage tracking, buffer-age reuse, frame callbacks, redraw-on-demand, event-driven Calloop scheduling, resize configure pacing and diagnostics |
-| Eight-direction interactive window resizing (all 8 directions passed) |
-|  XDG maximize/restore, saved position and size, output resize awareness (all 7 checks passed) |
-| Workspace state, ten-workspace switching, per-workspace visibility/hit-testing and keyboard focus |
-| Move the focused window between workspaces and follow it |
-| Per-workspace focus memory, fallback focus, window close behavior; subsequent typing/focus regressions investigated and reported working |
-|  Pure half-screen snapping geometry; 4/4 tests passed |
-| Super+arrow snapping, maximize/restore, saved floating geometry, output resize handling; 9/9 checks passed |
-|  Configurable inner/outer snapping gaps; 7/7 geometry tests and 8/8 behavior checks passed |
-| Asynchronous snap-to-floating transition and pointer anchoring while dragging; 10/10 checks passed |
-| Automatic master-and-stack tiling for one, two, and multiple visible windows, with per-workspace floating/tiling modes |
-| Automatic reflow for client creation/close, minimization/restore, workspace moves, and nested output resize |
-| Independent per-workspace master-width ratios, 20–80% in 5% increments, with reset to 50% |
-| Keyboard focus navigation among visible tiles, preserving tile order and keyboard input |
-| Adjacent tile swaps and direct promote-to-master while preserving client focus and original floating geometry |
-| Lesson 28 integration checks: promotion with navigation/swaps, ratio changes, minimize/restore, workspace isolation, floating restoration, maximize/restore, and focus all reported passing |
+### Compositor and rendering
+
+- Built a nested Rust/Smithay compositor using Winit and GLES, with XDG toplevel clients, pointer input, and keyboard input.
+- Added event-driven Calloop scheduling, damage tracking, buffer-age-aware submission, frame callbacks, redraw-on-demand, and resize diagnostics.
+
+### Floating windows and snapping
+
+- Added click-to-focus, raising, dragging, and **eight-direction interactive resizing** (all 8 directional checks passed).
+- Implemented XDG maximize/restore with saved position and size and output-resize handling (7/7 checks passed).
+- Added left/right half-screen snapping, with pure geometry tests (4/4) and keyboard/restore behavior checks (9/9).
+- Introduced independent inner and outer gaps (7/7 geometry tests and 8/8 behavior checks).
+- Implemented drag-to-unsnap with asynchronous client resizing and stable pointer anchoring (10/10 checks passed).
+
+### Workspaces and keyboard focus
+
+- Added ten workspaces, workspace-local window visibility and hit-testing, and move-and-follow shortcuts.
+- Added per-workspace focus history, fallback focus after a window closes or becomes hidden, and focus recovery.
+
+### Automatic and advanced tiling — Lesson 28
+
+- Implemented automatic **master-and-stack tiling** for one or more visible windows, with independent floating/tiled modes per workspace.
+- Added layout reflow when windows open, close, move between workspaces, minimize, or restore, and when the nested output resizes.
+- Added independent **master-width ratios per workspace** (20–80%, adjusted in 5% steps; reset to 50%).
+- Added keyboard navigation between visible tiles without changing their order.
+- Added adjacent tile swaps and **promote focused window to master**, preserving focus and original floating geometry.
+- Passed all **seven Lesson 28 integration checks**, covering promotion, swapping/navigation, ratio adjustments, minimize/restore, workspace isolation, floating restoration, maximize/restore, and keyboard focus.
 
 ## Roadmap
 
