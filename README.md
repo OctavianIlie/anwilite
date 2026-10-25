@@ -2,7 +2,7 @@
 
 **WORK IN PROGRESS: A custom Wayland compositor and hybrid window manager for [Octlitch Linux](https://octlitch.com).**
 
-> **Project status: experimental, pre-alpha.** The nested compositor and core floating/window-placement workflows are working; native DRM/KMS, a complete desktop shell, XWayland, and several essential Wayland protocols are still planned. Anwilite is not ready to replace a daily-driver desktop session.
+> **Project status: experimental, pre-alpha.** The nested compositor, floating-window workflows, and per-workspace automatic tiling are working and have been regression-tested. Native DRM/KMS, a complete desktop shell, XWayland, and several essential Wayland protocols are still planned. Anwilite is not ready to replace a daily-driver desktop session.
 
 Anwilite is a Wayland compositor written in **Rust**, built on **[Smithay](https://github.com/Smithay/smithay)** (currently developed against Smithay 0.7). Its goal is to combine:
 
@@ -19,69 +19,94 @@ Anwilite is a Wayland compositor written in **Rust**, built on **[Smithay](https
 | Area | Current state |
 | --- | --- |
 | Nested Wayland compositor on Fedora/KDE | ✅ Working |
-| Smithay XDG toplevel windows | ✅ Working |
-| Keyboard and mouse input | ✅ Working |
-| Click-to-focus, raise, window dragging | ✅ Working |
-| Eight-direction interactive resizing | ✅ Working and tested |
-| Maximize and restore with saved geometry | ✅ Working and tested |
-| Ten workspaces | ✅ Working and tested |
-| Move focused window between workspaces | ✅ Working and tested |
-| Per-workspace keyboard focus history | ✅ Implemented and tested in current workflow |
-| Windows-style half-screen snapping | ✅ Working and tested |
-| Configurable inner and outer snap gaps | ✅ Working (compile-time constants) |
-| Drag a snapped window into floating mode | ✅ Working and tested |
-| Resizing the nested output | ✅ Updates maximized and snapped windows |
-| Event-driven redraws and damage tracking | ✅ Working in nested backend |
-| Automatic multi-window tiling | 🚧 Next major feature |
+| Smithay XDG toplevel windows; keyboard and mouse input | ✅ Working |
+| Floating windows, click-to-focus/raise, drag, and eight-direction resize | ✅ Working and tested |
+| Maximize/restore and Windows-style half-screen snapping | ✅ Working and tested |
+| Ten workspaces, move-and-follow, per-workspace focus history | ✅ Working and tested |
+| Per-workspace floating/automatic-tiling modes | ✅ Working and tested |
+| Master-and-stack tiling, automatic reflow on window changes | ✅ Working and tested |
+| Per-workspace adjustable master width (20–80%, 5% steps) | ✅ Working and tested |
+| Keyboard focus navigation, tile swapping, promote-to-master | ✅ Working and tested |
+| Tiled-window minimize/restore and maximize/restore | ✅ Working and tested |
+| Original floating geometry restored after disabling tiling | ✅ Working and tested |
+| Nested output resize, event-driven redraws, damage tracking | ✅ Working and tested |
 | Native DRM/KMS + libinput session | 📋 Planned |
-| Proper fullscreen and gaming input protocols | 📋 Planned |
+| True fullscreen and gaming input protocols | 📋 Planned |
 | XWayland | 📋 Planned |
 | Layer shell, Quickshell integration, compositor IPC | 📋 Planned |
 | Multi-monitor/output management | 📋 Planned |
 
-
-
 ## Current user experience
 
-Anwilite currently runs **nested inside a host Wayland desktop** via Smithay's Winit/OpenGL ES renderer. The development environment has been **Fedora 44 in VirtualBox with KDE Plasma Wayland**. You can open Weston Terminal clients inside the Anwilite output, move and resize them, switch workspaces, and snap them with keyboard shortcuts.
+Anwilite currently runs **nested inside a host Wayland desktop** via Smithay's Winit/OpenGL ES renderer. The development environment has been **Fedora 44 in VirtualBox with KDE Plasma Wayland**. Weston Terminal clients can be opened inside the Anwilite output, floated, snapped, or automatically tiled. Each of the ten workspaces can independently use floating or tiling mode.
 
 ### Keyboard shortcuts
+
+**Workspaces**
 
 | Shortcut | Action |
 | --- | --- |
 | `Super + 1` … `Super + 9` | Switch to workspaces 1–9 |
 | `Super + 0` | Switch to workspace 10 |
-| `Super + Shift + 1` … `Super + Shift + 9` | Move the focused window to a workspace and follow it |
+| `Super + Shift + 1` … `Super + Shift + 9` | Move the focused window to workspace 1–9 and follow it |
 | `Super + Shift + 0` | Move the focused window to workspace 10 and follow it |
-| `Super + Left` | Snap the focused window to the left half |
-| `Super + Right` | Snap the focused window to the right half |
+
+**Window placement and tiling**
+
+| Shortcut | Action |
+| --- | --- |
+| `Super + Shift + T` | Toggle floating/tiling mode for the active workspace |
+| `Super + H` | Narrow the tiled master column by 5% |
+| `Super + J` | Widen the tiled master column by 5% |
+| `Super + R` | Reset the tiled master column to 50% |
+| `Super + Shift + H` | Focus the previous visible tile (wraps around) |
+| `Super + Shift + J` | Focus the next visible tile (wraps around) |
+| `Super + Shift + Left` | Swap the focused tile with the previous visible tile |
+| `Super + Shift + Right` | Swap the focused tile with the next visible tile |
+| `Super + Shift + P` | Promote the focused stack tile directly to master |
+| `Super + M` | Minimize the focused window |
+| `Super + Shift + M` | Restore the most recently minimized window on the active workspace |
+| `Super + Left` | Snap the focused floating window to the left half |
+| `Super + Right` | Snap the focused floating window to the right half |
 | `Super + Up` | Maximize the focused window |
-| `Super + Down` | Restore the focused window's original floating size and position |
-| Left-click | Raise and focus the window under the pointer |
-| Drag a window titlebar | Move a floating window; restore a snapped window to floating mode |
+| `Super + Down` | Restore the focused window from maximized/snapped placement |
+
+**Pointer interactions**
+
+| Input | Action |
+| --- | --- |
+| Left-click | Focus a window; floating windows also rise to the front, tiled windows keep their order |
+| Drag a window titlebar | Move a floating window, or restore and drag a snapped window |
 | Middle-button drag | Move a floating window, or unsnap and move a snapped window |
 | Window resize handles | Resize floating windows from all eight edges/corners |
 
-**Nested-development fallback:** KDE or the host compositor may intercept some `Super` combinations. During development, the compositor also recognizes `Ctrl + Alt` in place of `Super` for the workspace and arrow-key shortcuts; use `Ctrl + Alt + Shift + number` to move a window. These are development bindings, not a final keymap or configurable shortcut system.
+**Nested-development fallback:** KDE or the host compositor may intercept `Super` combinations before Anwilite sees them. Anwilite also accepts `Ctrl + Alt` in place of `Super` for its shortcuts (and retains `Shift` when required). In the current KDE/VirtualBox development setup, `Ctrl + Alt + Shift + Left/Right` was successfully tested for tile swapping, and `Ctrl + Alt + Shift + P` for master promotion. Some corresponding `Super` combinations are reserved by the host. In particular, **`Super + L` is not an Anwilite master-ratio shortcut** because it locks the host desktop; use `Super + J` or `Ctrl + Alt + J` to widen the master column. This is a development keymap, not a configurable final binding system.
+
+### Automatic master-and-stack tiling
+
+Tiling is **opt-in per workspace**, toggled with `Super + Shift + T`:
+
+- **One visible window:** fills the usable output, respecting outer gaps.
+- **Two visible windows:** one master column on the left and one stack window on the right.
+- **Three or more visible windows:** one left master and vertically stacked windows in the right column.
+- **Adjustable master width:** each workspace starts at **50%**; `Super + H/J` adjusts it in **5%** steps, clamped to **20–80%**. `Super + R` resets to 50%.
+- **Workspace independence:** the mode, selected ratio, and tile order are maintained separately for the current compositor session. No configuration file or persistence across compositor restarts is implemented yet.
+- **Dynamic reflow:** creating, closing, minimizing, restoring, or transferring windows recalculates the relevant tiled workspaces. Resizing the nested output also recalculates tile geometry.
+- **Navigation versus placement:** keyboard focus navigation does **not** rearrange tiles; swapping and promoting to master **do** change tile order while preserving focus on the same client.
+- **Maximized tiles:** a maximized tile stays zoomed until restored; its underlying tile position reflects layout updates. Tile swaps and promotion are blocked while a tile is maximized.
+- **Returning to floating:** disabling tiling restores windows' pre-tiling floating geometry instead of keeping tiled sizes.
+
+The compositor uses each `ManagedWindow`'s position in `WindowManager.windows` to determine master/stack assignment, while `src/layout.rs` computes the rectangles. Swapping exchanges whole window records, preserving each client's saved floating state rather than assigning that state to a different window.
+
+### Floating, snapping, and workspaces
 
 **Snapping details:** The normal floating geometry is saved before placement. A window can transition from floating → left snap → right snap → maximized → restored without losing its original geometry. Snapped windows stay aligned when the nested output is resized. Dragging a snapped titlebar requests the original floating size, waits for the client to commit it, then reanchors the cursor relative to the restored geometry to avoid a visible jump.
 
-### Ten workspaces
-
-- Each newly created managed window belongs to the currently active workspace.
-- Workspace switching changes which windows are rendered and eligible for pointer hit-testing and keyboard focus.
-- The focused window can be moved to another workspace and followed with a shortcut.
-- Window positions and sizes remain intact across switches.
-- The window manager remembers the most recently focused surface per workspace and falls back to an available visible window if needed.
+**Ten workspaces:** Newly created windows belong to the active workspace. Switching workspaces updates rendering, hit-testing and keyboard-focus eligibility; move-and-follow changes a focused window's workspace and reflows tiled source/destination workspaces as needed. The window manager remembers the most recently focused surface per workspace and falls back to another visible window when necessary.
 
 ### Window gaps
 
-The snapping layout engine supports two independent gap parameters:
-
-- **Outer gap:** spacing between the output edge and snapped windows.
-- **Inner gap:** spacing between adjacent left/right snapped windows.
-
-The current development defaults in `src/layout.rs` are `outer: 12` and `inner: 12` (logical units). They are **compile-time** settings today. Runtime configuration, themes, tiling gaps, and per-workspace preferences are future work.
+The shared snapping/tiling layout engine uses independent **outer** gaps (between windows and the output edge) and **inner** gaps (between adjacent windows). The current `DEFAULT_SNAP_GAPS` in `src/layout.rs` is **`outer: 6`, `inner: 6`** logical units. These are compile-time constants; runtime configuration remains planned. Tiling master ratios are adjustable at runtime but the gap sizes are not.
 
 ## Architecture
 
@@ -94,8 +119,8 @@ The current development defaults in `src/layout.rs` are `outer: 12` and `inner: 
               +---------------------+--------------------+
               |                     |                    |
       Smithay / Wayland        WindowManager       Layout / Workspaces
-      XDG protocol state       stacking, input,      geometry, snapping,
-      surface commits          drag, resize          groups, focus
+      XDG protocol state       placement, focus,     snapping, tiling,
+      surface commits          drag, resize, swap    workspace modes
               |                     |                    |
               +---------------------+--------------------+
                                     |
@@ -116,15 +141,15 @@ The current development defaults in `src/layout.rs` are `outer: 12` and `inner: 
 .
 ├── Cargo.toml                # Rust package and dependency declarations
 ├── Cargo.lock                # Locked binary dependencies; commit this file
-├── README.md                 # Project status, how to run, roadmap
+├── README.md                 # Project status, shortcuts, build, roadmap
 ├── .gitignore                # Build output, local backups, secrets
 └── src/
     ├── main.rs              # App state, Smithay protocol handlers,
     │                        # input, Calloop event loop, rendering
     ├── window.rs            # ManagedWindow, WindowManager, geometry,
-    │                        # interactive drag/resize, placement, focus
+    │                        # tiling/reflow, drag/resize, focus, swapping
     ├── workspace.rs         # Ten-workspace state and switching
-    └── layout.rs            # Pure snapping geometry and unit tests
+    └── layout.rs            # Pure snapping/tiling geometry and unit tests
 ```
 
 The source tree above describes the currently developed files. It may expand as we extract modules from `main.rs` and add backends, a configuration system, IPC, and protocol implementations.
@@ -145,7 +170,7 @@ Early **VirtualBox** experiments measured approximately **0% sampled idle CPU** 
 
 ### Wayland window sizing
 
-The compositor does not directly resize an application's buffer. It calculates desired geometry, sends an XDG toplevel configure, and waits for the client to acknowledge/commit a new buffer. For maximize, snap, restore, and unsnap transitions, position corrections account for client-reported window geometry and decoration offsets. This distinction is important for avoiding flicker, jumps, and incorrect anchoring.
+The compositor does not directly resize an application's buffer. It calculates desired geometry, sends an XDG toplevel configure, and waits for the client to acknowledge/commit a new buffer. For tiling, maximize, snap, restore, and unsnap transitions, position corrections account for client-reported window geometry and decoration offsets. This distinction is important for avoiding flicker, jumps, and incorrect anchoring.
 
 ## Build and run (development)
 
@@ -168,7 +193,7 @@ cargo test
 cargo run --release
 ```
 
-Running `cargo run --release` opens the nested output. In the current source, Anwilite automatically attempts to launch `weston-terminal` connected to its Wayland socket.
+Running `cargo run --release` opens the nested output. In the current source, Anwilite automatically attempts to launch `weston-terminal` connected to its Wayland socket. The Lesson 28 development session reported **32 passing unit tests** plus successful final advanced-tiling integration checks; rerun `cargo test` against your own checkout after merging.
 
 **Socket naming note:** The original development code uses `octlitch-0` as its Wayland socket name. We are renaming the compositor project to **Anwilite**, but the socket may retain that legacy name until the runtime naming cleanup. Verify `ListeningSocketSource::with_name(...)` in `src/main.rs` rather than assuming the socket name.
 
@@ -183,15 +208,15 @@ When the socket is deliberately renamed to `anwilite-0`, update this command, th
 ### Development tips
 
 - Run and test one change at a time; preserve a working Git commit before altering window-placement logic.
-- Keep **pure geometry** in `src/layout.rs`, with unit tests for odd output sizes, gaps, and edge cases.
-- Test input focus, window stacking, pointer hit-testing, resizing, and rendering together whenever changing workspaces or window lifecycle.
+- Keep **pure geometry** in `src/layout.rs`, with unit tests for odd output sizes, gaps, ratios, tile counts, and edge cases.
+- Test input focus, window ordering, pointer hit-testing, resizing, and rendering together whenever changing tiling, workspaces, or the window lifecycle.
 - Verify both keyboard shortcuts and application-requested XDG actions.
 - Before reporting a rendering regression, test a stationary window, an actively updating terminal, drag/resize, workspace switching, and output resizing.
 - Do not confuse terminal OSC warnings with Wayland protocol or compositor-rendering faults.
 
 ## Milestone history
 
-This is a **summary of completed learning milestones**, not a reconstructed Git commit history. The first Git commit captures the current working source at one point in time.
+This is a **summary of completed learning milestones**, not a reconstructed Git commit history. Earlier milestones were developed and tested incrementally.
 
 |  Implemented and verified |
 | --- | --- |
@@ -205,24 +230,34 @@ This is a **summary of completed learning milestones**, not a reconstructed Git 
 |  Pure half-screen snapping geometry; 4/4 tests passed |
 | Super+arrow snapping, maximize/restore, saved floating geometry, output resize handling; 9/9 checks passed |
 |  Configurable inner/outer snapping gaps; 7/7 geometry tests and 8/8 behavior checks passed |
-|  Asynchronous snap-to-floating transition and pointer anchoring while dragging; 10/10 checks passed |
+| Asynchronous snap-to-floating transition and pointer anchoring while dragging; 10/10 checks passed |
+| Automatic master-and-stack tiling for one, two, and multiple visible windows, with per-workspace floating/tiling modes |
+| Automatic reflow for client creation/close, minimization/restore, workspace moves, and nested output resize |
+| Independent per-workspace master-width ratios, 20–80% in 5% increments, with reset to 50% |
+| Keyboard focus navigation among visible tiles, preserving tile order and keyboard input |
+| Adjacent tile swaps and direct promote-to-master while preserving client focus and original floating geometry |
+| Lesson 28 integration checks: promotion with navigation/swaps, ratio changes, minimize/restore, workspace isolation, floating restoration, maximize/restore, and focus all reported passing |
 
 ## Roadmap
 
-The sequence below expresses **planned priorities**, not guaranteed delivery dates or implemented functionality. Lesson numbers after 26D are provisional.
+The sequence below expresses **planned priorities**, not guaranteed delivery dates or implemented functionality.
 
-### Stage 1 — Hybrid window manager (next)
+### Stage 1 — Hybrid window manager (core tiling implemented)
 
 - [x] Floating windows, moving, resizing, maximize/restore.
 - [x] Ten workspaces, workspace switching, moving windows, focus history.
 - [x] Windows-style left/right snapping and original-geometry restoration.
-- [x] Configurable snapped-window gaps.
+- [x] Compile-time-configurable snapping/tiling gaps.
 - [x] Drag to unsnap without jumping.
-- [ ] Automatic layout for two windows on a workspace, keeping floating behavior available.
-- [ ] Generalize tiling to three or more windows, layout recalculation when opening/closing/moving clients.
-- [ ] Per-workspace **floating / tiling** modes with explicit layout selection.
+- [x] Automatic tiling for one, two, and three or more windows, with reflow as clients change.
+- [x] Per-workspace **floating / tiling** modes.
+- [x] Independent adjustable master-width ratios (20–80%) for tiled workspaces.
+- [x] Keyboard cycling between tiles without reordering them.
+- [x] Adjacent tile swapping and promote-focused-tile-to-master.
+- [x] Tiled-window minimize/restore, maximize/restore, workspace transfers, and floating restoration.
+- [ ] Visible active-window focus indicator / focus border (planned next).
 - [ ] Additional Windows-style placements, including quarter snapping and sensible keyboard transitions.
-- [ ] Directional focus and window movement, Alt+Tab, close-window and launcher shortcuts.
+- [ ] Spatial directional focus, global Alt+Tab, close-window and launcher shortcuts.
 - [ ] Configuration files for gaps, layouts, bindings, appearance, and workspace rules.
 - [ ] Robust handling of size-constrained clients, popups, transient dialogs, and unsnap timing.
 
@@ -266,13 +301,13 @@ The sequence below expresses **planned priorities**, not guaranteed delivery dat
 
 Anwilite is **not a fork of Hyprland** and not a theme applied to KDE. It is its own Rust/Smithay compositor, developed incrementally to understand Wayland concepts and make considered architecture choices. Hyprland, Omarchy, and Windows provide **workflow inspiration**, not code provenance or guarantees of feature parity.
 
-The intended hybrid model lets users choose automatic tiling when useful without sacrificing straightforward floating-window control. Longer term, each workspace could select its own layout—for example, a floating communication workspace, a tiled development workspace, and a fullscreen gaming workspace.
+The current hybrid model lets users select floating or automatic master-and-stack tiling independently on each workspace. Longer term, configurable layouts could support a floating communication workspace, a tiled development workspace, and a fullscreen gaming workspace.
 
 Our engineering principles are to keep code readable; teach and document the state transitions; preserve a working checkpoint; isolate pure, testable layout math; avoid unnecessary idle rendering; and validate native hardware behavior before making performance or compatibility claims.
 
 ## Contributing
 
-This is an early-stage learning and development project. Discussions, reproducible bug reports, design feedback, and Rust/Wayland contributions are welcome once the repository is published and its contribution process is established. For bugs, include the Rust toolchain, distro/host compositor, GPU or VM backend, exact reproduction steps, and any relevant Smithay/Anwilite logs.
+This is an early-stage learning and development project. Discussions, reproducible bug reports, and design feedback are welcome; formal contribution guidelines and review processes have not been established yet. For bugs, include the Rust toolchain, distro/host compositor, GPU or VM backend, exact reproduction steps, and any relevant Smithay/Anwilite logs.
 
 ## License
 
