@@ -63,7 +63,7 @@ use wayland_server::{
         wl_surface::{self, WlSurface},
     },
 };
-use window::WindowManager;
+use window::{TileFocusDirection, WindowManager};
 
 impl BufferHandler for App {
     fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
@@ -293,6 +293,11 @@ enum WorkspaceCommand {
     Maximize,
     Restore,
     ToggleTiling,
+    AdjustMasterRatio(i8),
+    ResetMasterRatio,
+    FocusTile(TileFocusDirection),
+    SwapTile(TileFocusDirection),
+    PromoteTile,
     Minimize,
     RestoreMinimized,
 }
@@ -424,6 +429,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
         if output_dims != state.output_size {
             state.output_size = output_dims;
             state.windows.resize_placed_windows(output_dims);
+            state.windows.reflow_all_tiled_workspaces(output_dims);
             state.needs_redraw = true;
         }
         let events = std::mem::take(&mut *winit_events.borrow_mut());
@@ -431,6 +437,34 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             match event {
                 WinitEvent::Resized { .. } => {
                     state.needs_redraw = true;
+                }
+                WinitEvent::Focus(focused) => {
+                    let held_keys = keyboard.pressed_keys();
+
+                    println!(
+                        "Anwilite host focus: focused={}, held_keys={:?}, modifiers_before={:?}",
+                        focused,
+                        held_keys,
+                        keyboard.modifier_state(),
+                    );
+
+                    for keycode in held_keys {
+                        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+                        let time = start_time.elapsed().as_millis() as u32;
+
+                        keyboard.input::<(), _>(
+                            &mut state,
+                            keycode,
+                            KeyState::Released,
+                            serial,
+                            time,
+                            |_, _, _| FilterResult::Forward,
+                        );
+                    }
+                    println!(
+                        "Anwilite host focus: modifiers_after={:?}",
+                        keyboard.modifier_state(),
+                    );
                 }
                 WinitEvent::Input(event) => match event {
                     InputEvent::Keyboard { event } => {
@@ -478,8 +512,54 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                     return FilterResult::Intercept(WorkspaceCommand::ToggleTiling);
                                 }
 
+                                // Shift+H/J navigates focus; plain H/J adjusts the ratio.
+                                // Shift+H/J navigates focus.
+                                // Shift+Left/Right swaps tiles.
+                                if modifiers.shift {
+                                    let shortcut = match symbol {
+                                        Some(keysyms::KEY_h | keysyms::KEY_H) => {
+                                            Some(WorkspaceCommand::FocusTile(
+                                                TileFocusDirection::Previous,
+                                            ))
+                                        }
+
+                                        Some(keysyms::KEY_j | keysyms::KEY_J) => Some(
+                                            WorkspaceCommand::FocusTile(TileFocusDirection::Next),
+                                        ),
+
+                                        Some(keysyms::KEY_Left) => {
+                                            Some(WorkspaceCommand::SwapTile(
+                                                TileFocusDirection::Previous,
+                                            ))
+                                        }
+
+                                        Some(keysyms::KEY_Right) => Some(
+                                            WorkspaceCommand::SwapTile(TileFocusDirection::Next),
+                                        ),
+
+                                        Some(keysyms::KEY_p | keysyms::KEY_P) => {
+                                            Some(WorkspaceCommand::PromoteTile)
+                                        }
+
+                                        _ => None,
+                                    };
+
+                                    if let Some(command) = shortcut {
+                                        return FilterResult::Intercept(command);
+                                    }
+                                }
+
                                 if !modifiers.shift {
-                                    let placement = match symbol {
+                                    let shortcut = match symbol {
+                                        Some(keysyms::KEY_h | keysyms::KEY_H) => {
+                                            Some(WorkspaceCommand::AdjustMasterRatio(-5))
+                                        }
+                                        Some(keysyms::KEY_j | keysyms::KEY_J) => {
+                                            Some(WorkspaceCommand::AdjustMasterRatio(5))
+                                        }
+                                        Some(keysyms::KEY_r | keysyms::KEY_R) => {
+                                            Some(WorkspaceCommand::ResetMasterRatio)
+                                        }
                                         Some(keysyms::KEY_Left) => {
                                             Some(WorkspaceCommand::Snap(SnapSide::Left))
                                         }
@@ -491,7 +571,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                         _ => None,
                                     };
 
-                                    if let Some(command) = placement {
+                                    if let Some(command) = shortcut {
                                         return FilterResult::Intercept(command);
                                     }
                                 }
@@ -563,6 +643,55 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
                                         WorkspaceCommand::ToggleTiling => {
                                             state.windows.toggle_tiling(state.output_size)
+                                        }
+
+                                        WorkspaceCommand::AdjustMasterRatio(delta) => state
+                                            .windows
+                                            .adjust_master_ratio(delta, state.output_size),
+
+                                        WorkspaceCommand::ResetMasterRatio => {
+                                            state.windows.reset_master_ratio(state.output_size)
+                                        }
+
+                                        WorkspaceCommand::FocusTile(direction) => {
+                                            let focused = keyboard.current_focus();
+                                            if let Some(next) = state
+                                                .windows
+                                                .adjacent_tiled_surface(focused.as_ref(), direction)
+                                            {
+                                                // Focus only: do not raise or reorder any tiles.
+                                                keyboard.set_focus(
+                                                    &mut state,
+                                                    Some(next),
+                                                    smithay::utils::SERIAL_COUNTER.next_serial(),
+                                                );
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        }
+                                        WorkspaceCommand::SwapTile(direction) => {
+                                            let focused = keyboard.current_focus();
+                                            let output_size = state.output_size;
+
+                                            focused.as_ref().is_some_and(|surface| {
+                                                state.windows.swap_focused_tile(
+                                                    surface,
+                                                    direction,
+                                                    output_size,
+                                                )
+                                            })
+                                        }
+
+                                        WorkspaceCommand::PromoteTile => {
+                                            let focused = keyboard.current_focus();
+                                            let output_size = state.output_size;
+
+                                            focused.as_ref().is_some_and(|surface| {
+                                                state
+                                                    .windows
+                                                    .promote_focused_tile(surface, output_size)
+                                            })
                                         }
 
                                         WorkspaceCommand::SwitchTo(number) => {
@@ -812,7 +941,6 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                     state.needs_redraw = true;
                 }
                 WinitEvent::CloseRequested => return Ok(()),
-                _ => (),
             }
         }
 

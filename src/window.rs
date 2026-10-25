@@ -1,4 +1,6 @@
-use crate::layout::{DEFAULT_SNAP_GAPS, SnapRect, SnapSide, snap_rect_with_gaps, tile_rects};
+use crate::layout::{
+    DEFAULT_SNAP_GAPS, SnapRect, SnapSide, snap_rect_with_gaps, tile_rects_with_ratio,
+};
 use crate::workspace::{WORKSPACE_COUNT, Workspaces};
 
 use smithay::{
@@ -161,6 +163,70 @@ fn transfer_action(source: LayoutMode, destination: LayoutMode) -> TransferActio
     }
 }
 
+// Navigation follows tile order, not window stacking order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TileFocusDirection {
+    Previous,
+    Next,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TileSwapTarget {
+    Adjacent(TileFocusDirection),
+    Master,
+}
+
+fn adjacent_tile_index(
+    current_index: usize,
+    tile_count: usize,
+    direction: TileFocusDirection,
+) -> Option<usize> {
+    if tile_count < 2 || current_index >= tile_count {
+        return None;
+    }
+
+    Some(match direction {
+        TileFocusDirection::Previous => {
+            if current_index == 0 {
+                tile_count - 1
+            } else {
+                current_index - 1
+            }
+        }
+        TileFocusDirection::Next => {
+            if current_index + 1 == tile_count {
+                0
+            } else {
+                current_index + 1
+            }
+        }
+    })
+}
+
+fn adjacent_swap_pair(
+    tile_indices: &[usize],
+    focused_index: usize,
+    direction: TileFocusDirection,
+) -> Option<(usize, usize)> {
+    let focused_position = tile_indices
+        .iter()
+        .position(|&index| index == focused_index)?;
+
+    let neighbor_position = adjacent_tile_index(focused_position, tile_indices.len(), direction)?;
+
+    Some((focused_index, tile_indices[neighbor_position]))
+}
+
+fn master_swap_pair(tile_indices: &[usize], focused_index: usize) -> Option<(usize, usize)> {
+    let &master_index = tile_indices.first()?;
+
+    if focused_index == master_index || !tile_indices.contains(&focused_index) {
+        return None;
+    }
+
+    Some((focused_index, master_index))
+}
+
 #[derive(Default)]
 pub struct WindowManager {
     pub windows: Vec<ManagedWindow>,
@@ -173,6 +239,7 @@ pub struct WindowManager {
     settling: Option<SettlingResize>,
     layout_modes: [LayoutMode; WORKSPACE_COUNT],
     minimize_counter: u64,
+    master_ratios: [Option<u8>; WORKSPACE_COUNT],
 }
 
 impl WindowManager {
@@ -210,17 +277,94 @@ impl WindowManager {
         self.layout_modes[self.current_workspace() - 1]
     }
 
+    pub fn master_ratio_for_workspace(&self, workspace: usize) -> u8 {
+        self.master_ratios[workspace - 1].unwrap_or(50)
+    }
+
+    pub fn set_master_ratio(&mut self, percent: u8, output_size: (i32, i32)) -> bool {
+        if self.current_layout_mode() != LayoutMode::Tiled
+            || self.is_dragging()
+            || self.is_resizing()
+            || self.settling.is_some()
+        {
+            return false;
+        }
+
+        if !(20..=80).contains(&percent) {
+            return false;
+        }
+
+        let workspace = self.current_workspace();
+        let old_percent = self.master_ratio_for_workspace(workspace);
+
+        if old_percent == percent {
+            return false;
+        }
+
+        let participants: Vec<&ManagedWindow> = self
+            .windows
+            .iter()
+            .filter(|window| {
+                window.workspace == workspace && window.surface.alive() && !window.minimized
+            })
+            .collect();
+
+        if participants.iter().any(|window| {
+            window.tiled.is_none() || window.pending_unsnap.is_some() || window.restoring.is_some()
+        }) {
+            return false;
+        }
+
+        // Validate before changing the stored ratio.
+        if tile_rects_with_ratio(output_size, participants.len(), DEFAULT_SNAP_GAPS, percent)
+            .is_none()
+        {
+            return false;
+        }
+
+        self.master_ratios[workspace - 1] = Some(percent);
+
+        self.reflow_tiled_workspace(workspace, output_size);
+
+        true
+    }
+
+    pub fn adjust_master_ratio(&mut self, delta: i8, output_size: (i32, i32)) -> bool {
+        let current = self.master_ratio_for_workspace(self.current_workspace());
+
+        let next = (i16::from(current) + i16::from(delta)).clamp(20, 80) as u8;
+
+        self.set_master_ratio(next, output_size)
+    }
+
+    pub fn reset_master_ratio(&mut self, output_size: (i32, i32)) -> bool {
+        self.set_master_ratio(50, output_size)
+    }
+
     fn stop_tiling_workspace(&mut self, workspace: usize) {
         for window in self
             .windows
             .iter_mut()
             .filter(|window| window.workspace == workspace)
         {
+            // A maximized tile is only zoomed within the tiled workspace.
+            // Exiting tiling must also clear its maximized protocol state.
+            let was_maximized_tile = window.tiled.is_some() && window.maximized;
             let saved = window.pre_tile.take();
 
             window.tiled = None;
+            if was_maximized_tile {
+                window.maximized = false;
+            }
 
             let Some(normal) = saved else {
+                if was_maximized_tile {
+                    window.surface.with_pending_state(|state| {
+                        state.states.unset(xdg_toplevel::State::Maximized);
+                        state.size = None;
+                    });
+                    window.surface.send_configure();
+                }
                 continue;
             };
 
@@ -229,10 +373,14 @@ impl WindowManager {
                 window.y = normal.top - geometry.loc.y;
             }
 
-            // Reuse our existing asynchronous restore mechanism.
+            // Return directly to the pre-tiling floating geometry rather than
+            // passing through the old tiled rectangle.
             window.restoring = Some((normal, Instant::now()));
 
             window.surface.with_pending_state(|state| {
+                if was_maximized_tile {
+                    state.states.unset(xdg_toplevel::State::Maximized);
+                }
                 state.size = Some((normal.width, normal.height).into());
             });
 
@@ -274,8 +422,6 @@ impl WindowManager {
             return false;
         }
 
-        // Find all living windows that belong to this workspace.
-
         let indices: Vec<usize> = self
             .windows
             .iter()
@@ -286,25 +432,14 @@ impl WindowManager {
             .map(|(index, _)| index)
             .collect();
 
-        if indices.len() == 1 {
-            let index = indices[0];
-
-            if self.windows[index].maximized && self.windows[index].tiled.is_some() {
-                let Some(target) = tile_rects(output_size, 1, DEFAULT_SNAP_GAPS)
-                    .and_then(|rectangles| rectangles.into_iter().next())
-                else {
-                    return false;
-                };
-
-                let changed = self.windows[index].tiled != Some(target);
-                self.windows[index].tiled = Some(target);
-
-                return changed;
-            }
-        }
-
-        let maximized_surfaces: Vec<ToplevelSurface> = if indices.len() > 1 {
-            indices
+        let master_percent = self.master_ratio_for_workspace(workspace);
+        let Some(targets) = tile_rects_with_ratio(
+            output_size,
+            indices.len(),
+            DEFAULT_SNAP_GAPS,
+            master_percent,
+        ) else {
+            let maximized_surfaces: Vec<ToplevelSurface> = indices
                 .iter()
                 .filter_map(|&index| {
                     let window = &self.windows[index];
@@ -315,47 +450,51 @@ impl WindowManager {
                         None
                     }
                 })
-                .collect()
-        } else {
-            Vec::new()
-        };
+                .collect();
 
-        let both_windows_already_tiled = indices.len() == 2
-            && indices
-                .iter()
-                .all(|&index| self.windows[index].tiled.is_some());
-        if !maximized_surfaces.is_empty() && both_windows_already_tiled {
-            return false;
-        }
-
-        for surface in maximized_surfaces {
-            if !self.restore(&surface) {
-                return false;
+            for surface in maximized_surfaces {
+                if !self.restore(&surface) {
+                    return false;
+                }
             }
-        }
-
-        if indices.len() > 2 {
-            eprintln!(
-                "Anwilite: workspace {} has {} windows; \
-                returning to floating mode",
-                workspace,
-                indices.len(),
-            );
 
             self.stop_tiling_workspace(workspace);
             return true;
-        }
-
-        let Some(targets) = tile_rects(output_size, indices.len(), DEFAULT_SNAP_GAPS) else {
-            return false;
         };
+
+        let has_new_tile = indices
+            .iter()
+            .any(|&index| self.windows[index].tiled.is_none());
+
+        if has_new_tile {
+            let maximized_surfaces: Vec<ToplevelSurface> = indices
+                .iter()
+                .filter_map(|&index| {
+                    let window = &self.windows[index];
+
+                    if window.tiled.is_some() && window.maximized {
+                        Some(window.surface.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            for surface in maximized_surfaces {
+                if !self.restore(&surface) {
+                    return false;
+                }
+            }
+        }
 
         let mut planned = Vec::new();
 
         for (index, target) in indices.into_iter().zip(targets) {
             let window = &self.windows[index];
 
-            if window.maximized
+            // A floating maximized window may enter tiling only if we can
+            // restore its original geometry when tiling is switched off.
+            if (window.maximized && window.tiled.is_none() && window.saved_normal.is_none())
                 || window.pending_unsnap.is_some()
                 || window.restoring.is_some()
                 || (window.snapped.is_some() && window.saved_normal.is_none())
@@ -367,16 +506,13 @@ impl WindowManager {
                 return false;
             };
 
+            // Preserve the original floating geometry.
             let normal = if window.tiled.is_none() {
                 if let Some(saved) = window.pre_tile {
                     Some(saved)
-                } else if window.snapped.is_some() {
-                    // Snapped -> Tiled:
-                    // Keep geometry saved before snapping.
+                } else if window.maximized || window.snapped.is_some() {
                     window.saved_normal
                 } else {
-                    // Floating -> Tiled:
-                    // Capture the current floating geometry.
                     Some(NormalGeometry {
                         left: window.x + geometry.loc.x,
                         top: window.y + geometry.loc.y,
@@ -397,26 +533,39 @@ impl WindowManager {
 
         let changed = !planned.is_empty();
 
-        // Application phase: all windows passed validation.
         for (index, target, normal, offset_x, offset_y) in planned {
             let window = &mut self.windows[index];
+            let entering_from_maximized = window.maximized && window.tiled.is_none();
 
             if window.snapped.is_some() {
                 window.snapped = None;
                 window.saved_normal = None;
             }
 
-            // Only save the floating geometry on first tiling.
             if let Some(normal) = normal {
                 window.pre_tile = Some(normal);
             }
 
+            if entering_from_maximized {
+                // The original floating geometry now lives in pre_tile.
+                window.maximized = false;
+                window.saved_normal = None;
+            }
+
             window.tiled = Some(target);
+
+            // A tile that was *already* maximized stays zoomed in.
+            if window.maximized {
+                continue;
+            }
 
             window.x = target.x - offset_x;
             window.y = target.y - offset_y;
 
             window.surface.with_pending_state(|state| {
+                if entering_from_maximized {
+                    state.states.unset(xdg_toplevel::State::Maximized);
+                }
                 state.size = Some((target.width, target.height).into());
             });
 
@@ -434,15 +583,8 @@ impl WindowManager {
         let workspace = self.current_workspace();
         let slot = workspace - 1;
 
-        // TILED -> FLOATING
+        // TILED -> FLOATING (also works when a tile is maximized).
         if self.layout_modes[slot] == LayoutMode::Tiled {
-            let has_maximized_tile = self.windows.iter().any(|window| {
-                window.workspace == workspace && window.maximized && window.tiled.is_some()
-            });
-            if has_maximized_tile {
-                return false;
-            }
-
             self.stop_tiling_workspace(workspace);
             return true;
         }
@@ -451,26 +593,39 @@ impl WindowManager {
         let windows: Vec<&ManagedWindow> = self
             .windows
             .iter()
-            .filter(|window| window.workspace == workspace && window.surface.alive())
+            .filter(|window| {
+                window.workspace == workspace && window.surface.alive() && !window.minimized
+            })
             .collect();
 
         if windows.iter().any(|window| {
-            window.maximized
-                || window.restoring.is_some()
+            window.restoring.is_some()
                 || window.pending_unsnap.is_some()
                 || window.tiled.is_some()
-                || (window.snapped.is_some() && window.saved_normal.is_none())
+                || ((window.maximized || window.snapped.is_some()) && window.saved_normal.is_none())
+                || window_geometry(window).is_none()
         }) {
             return false;
         }
 
-        if tile_rects(output_size, windows.len(), DEFAULT_SNAP_GAPS).is_none() {
+        if tile_rects_with_ratio(
+            output_size,
+            windows.len(),
+            DEFAULT_SNAP_GAPS,
+            self.master_ratio_for_workspace(workspace),
+        )
+        .is_none()
+        {
             return false;
         }
 
+        let has_windows = !windows.is_empty();
         self.layout_modes[slot] = LayoutMode::Tiled;
 
-        self.reflow_tiled_workspace(workspace, output_size);
+        if !self.reflow_tiled_workspace(workspace, output_size) && has_windows {
+            self.layout_modes[slot] = LayoutMode::Floating;
+            return false;
+        }
 
         true
     }
@@ -573,6 +728,123 @@ impl WindowManager {
         }
 
         true
+    }
+
+    pub fn adjacent_tiled_surface(
+        &self,
+        focused: Option<&WlSurface>,
+        direction: TileFocusDirection,
+    ) -> Option<WlSurface> {
+        if self.current_layout_mode() != LayoutMode::Tiled {
+            return None;
+        }
+
+        // reflow_tiled_workspace() uses this same Vec order for master + stack.
+        // is_window_visible() excludes minimized and maximization-hidden tiles.
+        let tiles: Vec<WlSurface> = self
+            .windows
+            .iter()
+            .filter(|window| window.tiled.is_some() && self.is_window_visible(window))
+            .map(|window| window.surface.wl_surface().clone())
+            .collect();
+
+        let focused = focused?;
+        let current_index = tiles.iter().position(|surface| surface == focused)?;
+        let next_index = adjacent_tile_index(current_index, tiles.len(), direction)?;
+
+        Some(tiles[next_index].clone())
+    }
+
+    pub fn swap_focused_tile(
+        &mut self,
+        focused: &WlSurface,
+        direction: TileFocusDirection,
+        output_size: (i32, i32),
+    ) -> bool {
+        self.swap_tile(focused, TileSwapTarget::Adjacent(direction), output_size)
+    }
+
+    pub fn promote_focused_tile(&mut self, focused: &WlSurface, output_size: (i32, i32)) -> bool {
+        self.swap_tile(focused, TileSwapTarget::Master, output_size)
+    }
+
+    fn swap_tile(
+        &mut self,
+        focused: &WlSurface,
+        target: TileSwapTarget,
+        output_size: (i32, i32),
+    ) -> bool {
+        if self.current_layout_mode() != LayoutMode::Tiled
+            || self.is_dragging()
+            || self.is_resizing()
+            || self.settling.is_some()
+        {
+            return false;
+        }
+        let workspace = self.current_workspace();
+
+        let indices: Vec<usize> = self
+            .windows
+            .iter()
+            .enumerate()
+            .filter(|(_, window)| {
+                window.workspace == workspace && window.surface.alive() && !window.minimized
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if indices.len() < 2 {
+            return false;
+        }
+        if indices.iter().any(|&index| {
+            let window = &self.windows[index];
+
+            window.tiled.is_none()
+                || window.maximized
+                || window.pending_unsnap.is_some()
+                || window.restoring.is_some()
+                || window_geometry(window).is_none()
+        }) {
+            return false;
+        }
+
+        // Make sure the output can fit the current layout.
+        let ratio = self.master_ratio_for_workspace(workspace);
+
+        if tile_rects_with_ratio(output_size, indices.len(), DEFAULT_SNAP_GAPS, ratio).is_none() {
+            return false;
+        }
+
+        // Find the focused window in the visible tile sequence.
+        let Some(focused_index) = indices
+            .iter()
+            .copied()
+            .find(|&index| self.windows[index].surface.wl_surface() == focused)
+        else {
+            return false;
+        };
+
+        let pair = match target {
+            TileSwapTarget::Adjacent(direction) => {
+                adjacent_swap_pair(&indices, focused_index, direction)
+            }
+            TileSwapTarget::Master => master_swap_pair(&indices, focused_index),
+        };
+
+        let Some((first, second)) = pair else {
+            return false;
+        };
+
+        // Swap entire ManagedWindow entries, not their saved geometry.
+        self.windows.swap(first, second);
+
+        // Assign new rectangles according to the new tile order.
+        if self.reflow_tiled_workspace(workspace, output_size) {
+            true
+        } else {
+            // Restore the original order if reflow fails.
+            self.windows.swap(first, second);
+            false
+        }
     }
 
     pub fn focused_surface(&self) -> Option<WlSurface> {
@@ -794,6 +1066,7 @@ impl WindowManager {
             .filter(|window| {
                 window.workspace == active_workspace
                     && window.surface.alive()
+                    && !window.minimized
                     && window.tiled.is_some()
             })
             .count();
@@ -810,7 +1083,9 @@ impl WindowManager {
         let workspace_window_count = self
             .windows
             .iter()
-            .filter(|window| window.workspace == active_workspace && window.surface.alive())
+            .filter(|window| {
+                window.workspace == active_workspace && window.surface.alive() && !window.minimized
+            })
             .count();
 
         // Validate the transition before changing anything.
@@ -831,15 +1106,19 @@ impl WindowManager {
                         && window.maximized
                 });
 
+        if self.windows[index].minimized {
+            return false;
+        }
+
         if self.windows[index].tiled.is_some()
             && (self.windows[index].workspace != active_workspace
                 || tiled_count == 0
-                || tiled_count > 2
                 || tiled_count != workspace_window_count
                 || another_tile_is_maximized)
         {
             return false;
         }
+
         if self
             .settling
             .as_ref()
@@ -1014,6 +1293,25 @@ impl WindowManager {
             .iter()
             .position(|window| window.surface == surface)?;
 
+        if self.layout_modes[workspace - 1] == LayoutMode::Tiled {
+            let visible_count = self
+                .windows
+                .iter()
+                .filter(|window| {
+                    window.workspace == workspace && window.surface.alive() && !window.minimized
+                })
+                .count();
+
+            let next_count = visible_count.checked_add(1)?;
+
+            tile_rects_with_ratio(
+                output_size,
+                next_count,
+                DEFAULT_SNAP_GAPS,
+                self.master_ratio_for_workspace(workspace),
+            )?;
+        }
+
         self.windows[index].minimized = false;
 
         if self.layout_modes[workspace - 1] == LayoutMode::Tiled {
@@ -1065,11 +1363,18 @@ impl WindowManager {
                     window.workspace == workspace
                         && window.tiled.is_some()
                         && window.surface.alive()
+                        && !window.minimized
                 })
                 .map(|(index, _)| index)
                 .collect();
 
-            let Some(rectangles) = tile_rects(output_size, indices.len(), DEFAULT_SNAP_GAPS) else {
+            let master_percent = self.master_ratio_for_workspace(workspace);
+            let Some(rectangles) = tile_rects_with_ratio(
+                output_size,
+                indices.len(),
+                DEFAULT_SNAP_GAPS,
+                master_percent,
+            ) else {
                 continue;
             };
 
@@ -1465,6 +1770,44 @@ impl WindowManager {
 }
 
 #[cfg(test)]
+mod tile_focus_tests {
+    use super::{TileFocusDirection, adjacent_tile_index};
+
+    #[test]
+    fn next_tile_walks_forward_and_wraps() {
+        assert_eq!(adjacent_tile_index(0, 4, TileFocusDirection::Next), Some(1));
+        assert_eq!(adjacent_tile_index(2, 4, TileFocusDirection::Next), Some(3));
+        assert_eq!(adjacent_tile_index(3, 4, TileFocusDirection::Next), Some(0));
+    }
+
+    #[test]
+    fn previous_tile_walks_backward_and_wraps() {
+        assert_eq!(
+            adjacent_tile_index(3, 4, TileFocusDirection::Previous),
+            Some(2)
+        );
+        assert_eq!(
+            adjacent_tile_index(1, 4, TileFocusDirection::Previous),
+            Some(0)
+        );
+        assert_eq!(
+            adjacent_tile_index(0, 4, TileFocusDirection::Previous),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn navigation_rejects_missing_or_single_tile() {
+        assert_eq!(adjacent_tile_index(0, 0, TileFocusDirection::Next), None);
+        assert_eq!(
+            adjacent_tile_index(0, 1, TileFocusDirection::Previous),
+            None
+        );
+        assert_eq!(adjacent_tile_index(2, 2, TileFocusDirection::Next), None);
+    }
+}
+
+#[cfg(test)]
 mod transfer_tests {
     use super::*;
 
@@ -1498,5 +1841,75 @@ mod transfer_tests {
             transfer_action(LayoutMode::Tiled, LayoutMode::Tiled,),
             TransferAction::Retile
         );
+    }
+}
+
+#[cfg(test)]
+mod tile_swap_tests {
+    use super::{TileFocusDirection, adjacent_swap_pair};
+
+    #[test]
+    fn swap_finds_next_tile() {
+        let indices = [0, 3, 7];
+
+        assert_eq!(
+            adjacent_swap_pair(&indices, 3, TileFocusDirection::Next),
+            Some((3, 7))
+        );
+    }
+
+    #[test]
+    fn swap_wraps_around() {
+        let indices = [0, 3, 7];
+
+        assert_eq!(
+            adjacent_swap_pair(&indices, 7, TileFocusDirection::Next),
+            Some((7, 0))
+        );
+
+        assert_eq!(
+            adjacent_swap_pair(&indices, 0, TileFocusDirection::Previous),
+            Some((0, 7))
+        );
+    }
+
+    #[test]
+    fn swap_rejects_invalid_selection() {
+        assert_eq!(adjacent_swap_pair(&[], 0, TileFocusDirection::Next), None);
+
+        assert_eq!(adjacent_swap_pair(&[2], 2, TileFocusDirection::Next), None);
+
+        assert_eq!(
+            adjacent_swap_pair(&[0, 3, 7], 5, TileFocusDirection::Previous),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod master_promotion_tests {
+    use super::master_swap_pair;
+
+    #[test]
+    fn stack_tile_can_be_promoted() {
+        let indices = [0, 3, 7, 10];
+
+        assert_eq!(master_swap_pair(&indices, 7), Some((7, 0)));
+    }
+
+    #[test]
+    fn current_master_cannot_be_promoted_again() {
+        let indices = [0, 3, 7];
+
+        assert_eq!(master_swap_pair(&indices, 0), None);
+    }
+
+    #[test]
+    fn invalid_or_missing_tiles_are_rejected() {
+        assert_eq!(master_swap_pair(&[], 0), None);
+
+        assert_eq!(master_swap_pair(&[2, 5, 8], 3), None);
+
+        assert_eq!(master_swap_pair(&[2, 5, 8], 8), Some((8, 2)));
     }
 }
