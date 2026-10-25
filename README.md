@@ -236,14 +236,14 @@ These are **completed and tested development milestones**, grouped by feature ar
 - Added ten workspaces, workspace-local window visibility and hit-testing, and move-and-follow shortcuts.
 - Added per-workspace focus history, fallback focus after a window closes or becomes hidden, and focus recovery.
 
-### Automatic and advanced tiling — Lesson 28
+### Automatic and advanced tiling 
 
 - Implemented automatic **master-and-stack tiling** for one or more visible windows, with independent floating/tiled modes per workspace.
 - Added layout reflow when windows open, close, move between workspaces, minimize, or restore, and when the nested output resizes.
 - Added independent **master-width ratios per workspace** (20–80%, adjusted in 5% steps; reset to 50%).
 - Added keyboard navigation between visible tiles without changing their order.
 - Added adjacent tile swaps and **promote focused window to master**, preserving focus and original floating geometry.
-- Passed all **seven Lesson 28 integration checks**, covering promotion, swapping/navigation, ratio adjustments, minimize/restore, workspace isolation, floating restoration, maximize/restore, and keyboard focus.
+- Passed all integration tests, covering promotion, swapping/navigation, ratio adjustments, minimize/restore, workspace isolation, floating restoration, maximize/restore, and keyboard focus.
 
 ## Roadmap
 
