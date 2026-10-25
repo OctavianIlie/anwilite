@@ -35,12 +35,12 @@ pub const INACTIVE_BORDER: Option<BorderStyle> = Some(BorderStyle {
     rgba: [0.30, 0.34, 0.40, 1.0],
 });
 
-pub fn border_style(is_focused: bool) -> Option<BorderStyle> {
-    if is_focused {
-        Some(ACTIVE_BORDER)
-    } else {
-        INACTIVE_BORDER
-    }
+pub fn border_style(
+    is_focused: bool,
+    active: BorderStyle,
+    inactive: Option<BorderStyle>,
+) -> Option<BorderStyle> {
+    if is_focused { Some(active) } else { inactive }
 }
 
 #[cfg(test)]
@@ -77,12 +77,18 @@ mod tests {
 
     #[test]
     fn focused_window_uses_active_border() {
-        assert_eq!(border_style(true), Some(ACTIVE_BORDER));
+        assert_eq!(
+            border_style(true, ACTIVE_BORDER, INACTIVE_BORDER),
+            Some(ACTIVE_BORDER)
+        );
     }
 
     #[test]
     fn inactive_border_is_optional_and_valid() {
-        assert_eq!(border_style(false), INACTIVE_BORDER);
+        assert_eq!(
+            border_style(false, ACTIVE_BORDER, INACTIVE_BORDER),
+            INACTIVE_BORDER
+        );
 
         if let Some(style) = INACTIVE_BORDER {
             assert!(style.is_valid());

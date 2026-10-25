@@ -1,9 +1,10 @@
 mod appearance;
+mod config;
 mod layout;
 mod window;
 mod workspace;
 
-use appearance::{ACTIVE_BORDER, INACTIVE_BORDER, border_style};
+use appearance::border_style;
 use calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic};
 use layout::{SnapSide, focus_border_outside_tile};
 use smithay::backend::renderer::damage::OutputDamageTracker;
@@ -343,11 +344,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
-    // Fail immediately if a developer sets an invalid compile-time border style.
-    assert!(ACTIVE_BORDER.is_valid(), "Invalid focus border style");
+    let config = config::load();
 
-    if let Some(style) = INACTIVE_BORDER {
-        assert!(style.is_valid(), "Invalid inactive border style");
+    assert!(
+        config.active_border.is_valid(),
+        "Invalid active border configuration"
+    );
+
+    if let Some(style) = config.inactive_border {
+        assert!(style.is_valid(), "Invalid inactive border configuration");
     }
 
     let mut display: Display<App> = Display::new()?;
@@ -1115,7 +1120,10 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                     };
 
                     // Draw this window's border, if enabled.
-                    if let (Some(style), Some(rect)) = (border_style(is_focused), rect) {
+                    if let (Some(style), Some(rect)) = (
+                        border_style(is_focused, config.active_border, config.inactive_border),
+                        rect,
+                    ) {
                         if let Some(edges) =
                             focus_border_outside_tile(rect, style.thickness, style.clearance)
                         {
