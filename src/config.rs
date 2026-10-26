@@ -17,6 +17,21 @@ impl Default for AnwiliteConfig {
     }
 }
 
+impl AnwiliteConfig {
+    pub fn apply_reload(&mut self, candidate: Result<Self, String>) -> Result<bool, String> {
+        let next = candidate?;
+
+        if self.active_border == next.active_border && self.inactive_border == next.inactive_border
+        {
+            return Ok(false);
+        }
+
+        *self = next;
+
+        Ok(true)
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct FileConfig {
@@ -49,14 +64,14 @@ fn parse_hex_color(raw: &str) -> Result<[f32; 4], String> {
 
     let mut rgba = [1.0; 4];
 
-    for i in 0..(hex.len() / 2) {
+    for (i, channel) in rgba.iter_mut().enumerate().take(hex.len() / 2) {
         let start = i * 2;
         let component = &hex[start..start + 2];
 
         let value =
             u8::from_str_radix(component, 16).map_err(|_| format!("invalid color '{raw}'"))?;
 
-        rgba[i] = f32::from(value) / 255.0;
+        *channel = f32::from(value) / 255.0;
     }
 
     Ok(rgba)
@@ -127,6 +142,76 @@ fn config_path() -> Option<PathBuf> {
     }
 
     env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/anwilite/config.toml"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigFileSnapshot {
+    Missing,
+    Contents(Vec<u8>),
+    ReadError(io::ErrorKind),
+}
+
+pub fn snapshot() -> ConfigFileSnapshot {
+    let Some(path) = config_path() else {
+        return ConfigFileSnapshot::Missing;
+    };
+
+    match fs::read(path) {
+        Ok(contents) => ConfigFileSnapshot::Contents(contents),
+
+        Err(error) if error.kind() == io::ErrorKind::NotFound => ConfigFileSnapshot::Missing,
+
+        Err(error) => ConfigFileSnapshot::ReadError(error.kind()),
+    }
+}
+
+pub fn snapshot_changed(previous: &mut ConfigFileSnapshot, current: ConfigFileSnapshot) -> bool {
+    if *previous == current {
+        return false;
+    }
+
+    *previous = current;
+    true
+}
+
+pub fn try_load() -> Result<AnwiliteConfig, String> {
+    let Some(path) = config_path() else {
+        return Ok(AnwiliteConfig::default());
+    };
+
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(AnwiliteConfig::default());
+        }
+
+        Err(error) => {
+            return Err(format!("cannot read {}: {error}", path.display()));
+        }
+    };
+
+    parse_config(&contents)
+        .map_err(|error| format!("invalid configuration at {}: {error}", path.display()))
+}
+
+pub fn reload(current: &mut AnwiliteConfig) -> bool {
+    match current.apply_reload(try_load()) {
+        Ok(true) => {
+            println!("Anwilite: configuration reloaded");
+            true
+        }
+
+        Ok(false) => {
+            println!("Anwilite: configuration unchanged");
+            false
+        }
+
+        Err(error) => {
+            eprintln!("Anwilite: reload failed: {error}; keeping previous settings");
+            false
+        }
+    }
 }
 
 pub fn load() -> AnwiliteConfig {
@@ -214,5 +299,54 @@ mod tests {
             parse_hex_color("#FF000080").unwrap(),
             [1.0, 0.0, 0.0, 128.0 / 255.0]
         );
+    }
+
+    #[test]
+    fn reload_only_applies_changed_settings() {
+        let mut config = AnwiliteConfig::default();
+
+        // Identical settings should not count as a change.
+        assert!(!config.apply_reload(Ok(config)).unwrap());
+
+        let updated = parse_config("[borders]\nactive_thickness = 4\n").unwrap();
+
+        assert!(config.apply_reload(Ok(updated)).unwrap());
+        assert_eq!(config.active_border.thickness, 4);
+
+        // Reloading the same settings should do nothing.
+        assert!(!config.apply_reload(Ok(updated)).unwrap());
+    }
+
+    #[test]
+    fn invalid_reload_preserves_current_settings() {
+        let mut config = parse_config("[borders]\nactive_thickness = 4\n").unwrap();
+
+        let previous = config;
+
+        let invalid = parse_config("[borders]\nactive_color = \"invalid\"\n");
+
+        assert!(config.apply_reload(invalid).is_err());
+
+        assert_eq!(config.active_border, previous.active_border);
+        assert_eq!(config.inactive_border, previous.inactive_border);
+    }
+
+    #[test]
+    fn snapshot_detects_edits_and_deletion() {
+        let original = ConfigFileSnapshot::Contents(b"color=teal".to_vec());
+
+        let mut previous = original.clone();
+
+        // Identical contents should not trigger a reload.
+        assert!(!snapshot_changed(&mut previous, original));
+
+        // Changed contents should trigger once.
+        let edited = ConfigFileSnapshot::Contents(b"color=purple".to_vec());
+
+        assert!(snapshot_changed(&mut previous, edited.clone()));
+        assert!(!snapshot_changed(&mut previous, edited));
+
+        // Deleting the configuration is also a change.
+        assert!(snapshot_changed(&mut previous, ConfigFileSnapshot::Missing,));
     }
 }

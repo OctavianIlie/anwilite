@@ -5,6 +5,7 @@ mod window;
 mod workspace;
 
 use appearance::border_style;
+use calloop::timer::{TimeoutAction, Timer};
 use calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic};
 use layout::{SnapSide, focus_border_outside_tile};
 use smithay::backend::renderer::damage::OutputDamageTracker;
@@ -53,7 +54,7 @@ use smithay::{
         shm::{ShmHandler, ShmState},
     },
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
@@ -314,6 +315,7 @@ enum WorkspaceCommand {
     PromoteTile,
     Minimize,
     RestoreMinimized,
+    ReloadConfig,
 }
 
 struct App {
@@ -344,7 +346,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
-    let config = config::load();
+    let mut config = config::load();
+    let mut last_config_snapshot = config::snapshot();
 
     assert!(
         config.active_border.is_valid(),
@@ -382,6 +385,19 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let mut event_loop = EventLoop::<Vec<UnixStream>>::try_new()?;
+    const CONFIG_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+
+    let reload_due = Rc::new(Cell::new(false));
+    let reload_signal = Rc::clone(&reload_due);
+
+    event_loop.handle().insert_source(
+        Timer::from_duration(CONFIG_CHECK_INTERVAL),
+        move |_, _, _| {
+            reload_signal.set(true);
+
+            TimeoutAction::ToDuration(CONFIG_CHECK_INTERVAL)
+        },
+    )?;
 
     // Register the Octlitch Wayland socket with Calloop.
     let socket = ListeningSocketSource::with_name("octlitch-0")?;
@@ -450,6 +466,13 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             state.windows.pending_resize_wait()
         };
         event_loop.dispatch(wait, &mut pending_clients)?;
+
+        if reload_due.replace(false)
+            && config::snapshot_changed(&mut last_config_snapshot, config::snapshot())
+            && config::reload(&mut config)
+        {
+            state.needs_redraw = true;
+        }
 
         let output_size = backend.window_size();
         let output_dims = (output_size.w, output_size.h);
@@ -538,7 +561,13 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                 {
                                     return FilterResult::Intercept(WorkspaceCommand::ToggleTiling);
                                 }
-
+                                // Super+Shift+C reloads Anwilite's configuration.
+                                // Ctrl+Alt+Shift+C is available for nested KDE testing.
+                                if modifiers.shift
+                                    && matches!(symbol, Some(keysyms::KEY_c | keysyms::KEY_C))
+                                {
+                                    return FilterResult::Intercept(WorkspaceCommand::ReloadConfig);
+                                }
                                 // Shift+H/J navigates focus; plain H/J adjusts the ratio.
                                 // Shift+H/J navigates focus.
                                 // Shift+Left/Right swaps tiles.
@@ -629,204 +658,201 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
                         // Switch on key press, not on key release.
 
-                        if event.state() == KeyState::Pressed {
-                            if let Some(command) = requested_command {
-                                // Avoid switching while a mouse press is active.
-                                if state.move_press.is_none() {
-                                    let changed = match command {
-                                        WorkspaceCommand::Minimize => {
-                                            let focused = keyboard.current_focus();
+                        if event.state() == KeyState::Pressed
+                            && let Some(command) = requested_command
+                        {
+                            // Avoid switching while a mouse press is active.
+                            if state.move_press.is_none() {
+                                let changed = match command {
+                                    WorkspaceCommand::Minimize => {
+                                        let focused = keyboard.current_focus();
 
-                                            focused
-                                                .as_ref()
-                                                .and_then(|surface| {
-                                                    state.windows.toplevel_for_surface(surface)
-                                                })
-                                                .is_some_and(|surface| {
-                                                    state.windows.minimize_window(
-                                                        &surface,
-                                                        state.output_size,
-                                                    )
-                                                })
-                                        }
-
-                                        WorkspaceCommand::RestoreMinimized => {
-                                            if let Some(surface) = state
-                                                .windows
-                                                .restore_last_minimized(state.output_size)
-                                            {
-                                                // Immediately focus the restored window.
-                                                keyboard.set_focus(
-                                                    &mut state,
-                                                    Some(surface),
-                                                    smithay::utils::SERIAL_COUNTER.next_serial(),
-                                                );
-
-                                                true
-                                            } else {
-                                                false
-                                            }
-                                        }
-
-                                        WorkspaceCommand::ToggleTiling => {
-                                            state.windows.toggle_tiling(state.output_size)
-                                        }
-
-                                        WorkspaceCommand::AdjustMasterRatio(delta) => state
-                                            .windows
-                                            .adjust_master_ratio(delta, state.output_size),
-
-                                        WorkspaceCommand::ResetMasterRatio => {
-                                            state.windows.reset_master_ratio(state.output_size)
-                                        }
-
-                                        WorkspaceCommand::FocusTile(direction) => {
-                                            let focused = keyboard.current_focus();
-                                            if let Some(next) = state
-                                                .windows
-                                                .adjacent_tiled_surface(focused.as_ref(), direction)
-                                            {
-                                                // Focus only: do not raise or reorder any tiles.
-                                                keyboard.set_focus(
-                                                    &mut state,
-                                                    Some(next),
-                                                    smithay::utils::SERIAL_COUNTER.next_serial(),
-                                                );
-                                                true
-                                            } else {
-                                                false
-                                            }
-                                        }
-                                        WorkspaceCommand::SwapTile(direction) => {
-                                            let focused = keyboard.current_focus();
-                                            let output_size = state.output_size;
-
-                                            focused.as_ref().is_some_and(|surface| {
-                                                state.windows.swap_focused_tile(
-                                                    surface,
-                                                    direction,
-                                                    output_size,
-                                                )
+                                        focused
+                                            .as_ref()
+                                            .and_then(|surface| {
+                                                state.windows.toplevel_for_surface(surface)
                                             })
-                                        }
-
-                                        WorkspaceCommand::PromoteTile => {
-                                            let focused = keyboard.current_focus();
-                                            let output_size = state.output_size;
-
-                                            focused.as_ref().is_some_and(|surface| {
+                                            .is_some_and(|surface| {
                                                 state
                                                     .windows
-                                                    .promote_focused_tile(surface, output_size)
+                                                    .minimize_window(&surface, state.output_size)
                                             })
-                                        }
+                                    }
 
-                                        WorkspaceCommand::SwitchTo(number) => {
-                                            state.windows.switch_to_workspace(number)
-                                        }
-
-                                        WorkspaceCommand::MoveAndFollow(number) => {
-                                            let focused = keyboard.current_focus();
-                                            let output_size = state.output_size;
-
-                                            focused.as_ref().is_some_and(|surface| {
-                                                state.windows.move_focused_to_workspace(
-                                                    surface,
-                                                    number,
-                                                    output_size,
-                                                )
-                                            })
-                                        }
-
-                                        WorkspaceCommand::Snap(side) => {
-                                            let focused = keyboard.current_focus();
-
-                                            focused.as_ref().is_some_and(|surface| {
-                                                state.windows.snap(surface, side, state.output_size)
-                                            })
-                                        }
-
-                                        WorkspaceCommand::Maximize => {
-                                            let focused = keyboard.current_focus();
-
-                                            focused
-                                                .as_ref()
-                                                .and_then(|surface| {
-                                                    state.windows.toplevel_for_surface(surface)
-                                                })
-                                                .is_some_and(|surface| {
-                                                    state
-                                                        .windows
-                                                        .maximize(&surface, state.output_size)
-                                                })
-                                        }
-
-                                        WorkspaceCommand::Restore => {
-                                            let focused = keyboard.current_focus();
-
-                                            focused
-                                                .as_ref()
-                                                .and_then(|surface| {
-                                                    state.windows.toplevel_for_surface(surface)
-                                                })
-                                                .is_some_and(|surface| {
-                                                    state.windows.restore(&surface)
-                                                })
-                                        }
-                                    };
-
-                                    if changed {
-                                        if matches!(
-                                            command,
-                                            WorkspaceCommand::SwitchTo(_)
-                                                | WorkspaceCommand::MoveAndFollow(_)
-                                                | WorkspaceCommand::ToggleTiling
-                                                | WorkspaceCommand::Minimize
-                                        ) {
-                                            let focus = state.windows.focused_surface();
-
+                                    WorkspaceCommand::RestoreMinimized => {
+                                        if let Some(surface) =
+                                            state.windows.restore_last_minimized(state.output_size)
+                                        {
+                                            // Immediately focus the restored window.
                                             keyboard.set_focus(
                                                 &mut state,
-                                                focus.clone(),
+                                                Some(surface),
                                                 smithay::utils::SERIAL_COUNTER.next_serial(),
                                             );
 
-                                            let actual_focus = keyboard.current_focus();
-
-                                            println!(
-                                                "Octlitch focus: workspace={} requested={} actual={} matched={}",
-                                                state.windows.current_workspace(),
-                                                focus.is_some(),
-                                                actual_focus.is_some(),
-                                                actual_focus == focus
-                                            );
-
-                                            // Recalculate pointer focus for visible windows.
-                                            let (x, y) = state.pointer_position;
-                                            let pointer_focus = state.windows.surface_at(x, y);
-
-                                            pointer.motion(
-                                                &mut state,
-                                                pointer_focus,
-                                                &MotionEvent {
-                                                    location: (x, y).into(),
-                                                    serial: smithay::utils::SERIAL_COUNTER
-                                                        .next_serial(),
-                                                    time,
-                                                },
-                                            );
-
-                                            pointer.frame(&mut state);
+                                            true
+                                        } else {
+                                            false
                                         }
-                                        // Force the output to update.
-                                        state.needs_redraw = true;
+                                    }
+
+                                    WorkspaceCommand::ToggleTiling => {
+                                        state.windows.toggle_tiling(state.output_size)
+                                    }
+
+                                    WorkspaceCommand::AdjustMasterRatio(delta) => {
+                                        state.windows.adjust_master_ratio(delta, state.output_size)
+                                    }
+
+                                    WorkspaceCommand::ResetMasterRatio => {
+                                        state.windows.reset_master_ratio(state.output_size)
+                                    }
+
+                                    WorkspaceCommand::FocusTile(direction) => {
+                                        let focused = keyboard.current_focus();
+                                        if let Some(next) = state
+                                            .windows
+                                            .adjacent_tiled_surface(focused.as_ref(), direction)
+                                        {
+                                            // Focus only: do not raise or reorder any tiles.
+                                            keyboard.set_focus(
+                                                &mut state,
+                                                Some(next),
+                                                smithay::utils::SERIAL_COUNTER.next_serial(),
+                                            );
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    }
+                                    WorkspaceCommand::SwapTile(direction) => {
+                                        let focused = keyboard.current_focus();
+                                        let output_size = state.output_size;
+
+                                        focused.as_ref().is_some_and(|surface| {
+                                            state.windows.swap_focused_tile(
+                                                surface,
+                                                direction,
+                                                output_size,
+                                            )
+                                        })
+                                    }
+
+                                    WorkspaceCommand::PromoteTile => {
+                                        let focused = keyboard.current_focus();
+                                        let output_size = state.output_size;
+
+                                        focused.as_ref().is_some_and(|surface| {
+                                            state.windows.promote_focused_tile(surface, output_size)
+                                        })
+                                    }
+
+                                    WorkspaceCommand::SwitchTo(number) => {
+                                        state.windows.switch_to_workspace(number)
+                                    }
+
+                                    WorkspaceCommand::MoveAndFollow(number) => {
+                                        let focused = keyboard.current_focus();
+                                        let output_size = state.output_size;
+
+                                        focused.as_ref().is_some_and(|surface| {
+                                            state.windows.move_focused_to_workspace(
+                                                surface,
+                                                number,
+                                                output_size,
+                                            )
+                                        })
+                                    }
+
+                                    WorkspaceCommand::Snap(side) => {
+                                        let focused = keyboard.current_focus();
+
+                                        focused.as_ref().is_some_and(|surface| {
+                                            state.windows.snap(surface, side, state.output_size)
+                                        })
+                                    }
+
+                                    WorkspaceCommand::Maximize => {
+                                        let focused = keyboard.current_focus();
+
+                                        focused
+                                            .as_ref()
+                                            .and_then(|surface| {
+                                                state.windows.toplevel_for_surface(surface)
+                                            })
+                                            .is_some_and(|surface| {
+                                                state.windows.maximize(&surface, state.output_size)
+                                            })
+                                    }
+
+                                    WorkspaceCommand::Restore => {
+                                        let focused = keyboard.current_focus();
+
+                                        focused
+                                            .as_ref()
+                                            .and_then(|surface| {
+                                                state.windows.toplevel_for_surface(surface)
+                                            })
+                                            .is_some_and(|surface| state.windows.restore(&surface))
+                                    }
+
+                                    WorkspaceCommand::ReloadConfig => {
+                                        last_config_snapshot = config::snapshot();
+                                        config::reload(&mut config)
+                                    }
+                                };
+
+                                if changed {
+                                    if matches!(
+                                        command,
+                                        WorkspaceCommand::SwitchTo(_)
+                                            | WorkspaceCommand::MoveAndFollow(_)
+                                            | WorkspaceCommand::ToggleTiling
+                                            | WorkspaceCommand::Minimize
+                                    ) {
+                                        let focus = state.windows.focused_surface();
+
+                                        keyboard.set_focus(
+                                            &mut state,
+                                            focus.clone(),
+                                            smithay::utils::SERIAL_COUNTER.next_serial(),
+                                        );
+
+                                        let actual_focus = keyboard.current_focus();
 
                                         println!(
-                                            "Octlitch: {:?}, active workspace {}",
-                                            command,
-                                            state.windows.current_workspace()
+                                            "Octlitch focus: workspace={} requested={} actual={} matched={}",
+                                            state.windows.current_workspace(),
+                                            focus.is_some(),
+                                            actual_focus.is_some(),
+                                            actual_focus == focus
                                         );
+
+                                        // Recalculate pointer focus for visible windows.
+                                        let (x, y) = state.pointer_position;
+                                        let pointer_focus = state.windows.surface_at(x, y);
+
+                                        pointer.motion(
+                                            &mut state,
+                                            pointer_focus,
+                                            &MotionEvent {
+                                                location: (x, y).into(),
+                                                serial: smithay::utils::SERIAL_COUNTER
+                                                    .next_serial(),
+                                                time,
+                                            },
+                                        );
+
+                                        pointer.frame(&mut state);
                                     }
+                                    // Force the output to update.
+                                    state.needs_redraw = true;
+
+                                    println!(
+                                        "Octlitch: {:?}, active workspace {}",
+                                        command,
+                                        state.windows.current_workspace()
+                                    );
                                 }
                             }
                         }
@@ -1063,41 +1089,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             let submit_damage = {
                 let (renderer, mut framebuffer) = backend.bind().unwrap();
 
-                let mut elements = state
-                    .windows
-                    .windows
-                    .iter()
-                    .filter(|window| state.windows.is_window_visible(window))
-                    .flat_map(|window| {
-                        // Crop tiled and snapped clients to their committed geometry
-                        // intersected with the assigned placement rectangle.
-                        // Floating and maximized windows remain uncropped.
-                        let clip = window.placed_rect_for_render().map(|tile| {
-                            Rectangle::<i32, Physical>::new(
-                                (tile.x, tile.y).into(),
-                                (tile.width, tile.height).into(),
-                            )
-                        });
-
-                        render_elements_from_surface_tree(
-                            renderer,
-                            window.surface.wl_surface(),
-                            (window.x, window.y),
-                            1.0,
-                            1.0,
-                            Kind::Unspecified,
-                        )
-                        .into_iter()
-                        .filter_map(move |element| match clip {
-                            Some(rect) => CropRenderElement::from_element(element, 1.0, rect)
-                                .map(AnwiliteRenderElement::ClippedSurface),
-                            None => Some(AnwiliteRenderElement::Surface(element)),
-                        })
-                        .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<AnwiliteRenderElement>>();
-
-                /// Keyboard focus determines each window's border style.
+                // Keyboard focus determines each window's border style.
                 let focused = keyboard.current_focus();
                 let focused_rect = state.windows.focused_window_rect(focused.as_ref());
 
@@ -1123,31 +1115,27 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                     if let (Some(style), Some(rect)) = (
                         border_style(is_focused, config.active_border, config.inactive_border),
                         rect,
-                    ) {
-                        if let Some(edges) =
-                            focus_border_outside_tile(rect, style.thickness, style.clearance)
-                        {
-                            let buffers = border_buffers
-                                .entry(window.surface.wl_surface().clone())
-                                .or_insert_with(|| {
-                                    std::array::from_fn(|_| {
-                                        SolidColorBuffer::new((1, 1), style.rgba)
-                                    })
-                                });
+                    ) && let Some(edges) =
+                        focus_border_outside_tile(rect, style.thickness, style.clearance)
+                    {
+                        let buffers = border_buffers
+                            .entry(window.surface.wl_surface().clone())
+                            .or_insert_with(|| {
+                                std::array::from_fn(|_| SolidColorBuffer::new((1, 1), style.rgba))
+                            });
 
-                            for (buffer, edge) in buffers.iter_mut().zip(edges) {
-                                buffer.update((edge.width, edge.height), style.rgba);
+                        for (buffer, edge) in buffers.iter_mut().zip(edges) {
+                            buffer.update((edge.width, edge.height), style.rgba);
 
-                                let border = SolidColorRenderElement::from_buffer(
-                                    buffer,
-                                    (edge.x, edge.y),
-                                    1.0,
-                                    1.0,
-                                    Kind::Unspecified,
-                                );
+                            let border = SolidColorRenderElement::from_buffer(
+                                buffer,
+                                (edge.x, edge.y),
+                                1.0,
+                                1.0,
+                                Kind::Unspecified,
+                            );
 
-                                elements.push(AnwiliteRenderElement::FocusBorder(border));
-                            }
+                            elements.push(AnwiliteRenderElement::FocusBorder(border));
                         }
                     }
 
