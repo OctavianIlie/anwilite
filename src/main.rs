@@ -12,11 +12,14 @@ use keybindings::WorkspaceCommand;
 use layout::focus_border_outside_tile;
 
 use smithay::backend::renderer::damage::OutputDamageTracker;
-use smithay::desktop::{LayerSurface as DesktopLayerSurface, layer_map_for_output};
+use smithay::desktop::{
+    LayerSurface as DesktopLayerSurface, WindowSurfaceType, layer_map_for_output,
+};
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
 use smithay::wayland::shell::wlr_layer::{
-    Layer, LayerSurface, WlrLayerShellHandler, WlrLayerShellState,
+    KeyboardInteractivity, Layer, LayerSurface, LayerSurfaceCachedState, WlrLayerShellHandler,
+    WlrLayerShellState,
 };
 use smithay::wayland::socket::ListeningSocketSource;
 use smithay::{
@@ -44,12 +47,12 @@ use smithay::{
         pointer::{ButtonEvent, MotionEvent},
     },
     reexports::wayland_server::{Display, protocol::wl_seat},
-    utils::{Physical, Rectangle, Serial, Transform},
+    utils::{Logical, Physical, Point, Rectangle, Serial, Transform},
     wayland::{
         buffer::BufferHandler,
         compositor::{
             CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes,
-            TraversalAction, with_surface_tree_downward,
+            TraversalAction, with_states, with_surface_tree_downward,
         },
         selection::{
             SelectionHandler,
@@ -84,6 +87,22 @@ use wayland_server::{
 use window::WindowManager;
 
 const ANWILITE_SOCKET_NAME: &str = "octlitch-0";
+
+/// Only top/overlay layer clients should automatically take desktop focus.
+/// OnDemand is allowed here for application launchers opened by a shortcut;
+/// None is never eligible. Background/Bottom may still receive pointer input.
+fn layer_can_auto_focus(kind: Layer, mode: KeyboardInteractivity) -> bool {
+    matches!(kind, Layer::Top | Layer::Overlay)
+        && matches!(
+            mode,
+            KeyboardInteractivity::Exclusive | KeyboardInteractivity::OnDemand
+        )
+}
+
+struct LayerHit {
+    root: WlSurface,
+    pointer_target: (WlSurface, Point<f64, Logical>),
+}
 
 render_elements! {
     AnwiliteRenderElement<=GlesRenderer>;
@@ -120,12 +139,13 @@ impl XdgShellHandler for App {
             self.needs_redraw = true;
         }
 
-        // Give the new window actual keyboard focus.
-        if let Some(keyboard) = self.seat.get_keyboard() {
-            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-
-            keyboard.set_focus(self, Some(surface.wl_surface().clone()), serial);
-        }
+        // Do not steal keyboard focus from a visible layer-shell launcher.
+        if self.active_layer_keyboard.is_none() 
+            && let Some(keyboard) = self.seat.get_keyboard() {
+                let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+                keyboard.set_focus(self, Some(surface.wl_surface().clone()), serial);
+            }
+        
     }
 
     fn maximize_request(&mut self, surface: ToplevelSurface) {
@@ -292,6 +312,14 @@ impl WlrLayerShellHandler for App {
             layer_map_for_output(&self.output).unmap_layer(&layer);
         }
 
+        if self.active_layer_keyboard.as_ref() == Some(surface.wl_surface()) {
+            if let Some(next) = self.preferred_keyboard_layer() {
+                // Keep the original XDG focus saved across multiple layers.
+                self.focus_layer(next);
+            } else {
+                self.restore_xdg_keyboard_focus();
+            }
+        }
         self.needs_redraw = true;
     }
 }
@@ -325,20 +353,28 @@ impl CompositorHandler for App {
 
         // Layer-shell clients first commit without a buffer.
         // Only then do we send their initial configure.
+        let mut committed_interactive_layer = false;
         if let Some(layer) = self
             .layer_surfaces
             .iter()
             .find(|layer| layer.wl_surface() == surface)
         {
-            // Recalculate anchors, margins and layer sizes.
             layer_map_for_output(&self.output).arrange();
 
-            // Send the initial configure only after the first commit.
             if self.initial_layer_configures.insert(surface.clone()) {
+                // First bufferless commit: configure, but don't steal focus yet.
                 let serial = layer.layer_surface().send_configure();
-
                 println!("Anwilite: initial layer configure: {serial:?}");
+            } else {
+                // A subsequent commit can present the configured layer.
+                committed_interactive_layer =
+                    layer_can_auto_focus(layer.layer(), Self::layer_keyboard_mode(layer));
             }
+        }
+
+        if committed_interactive_layer && self.preferred_keyboard_layer().as_ref() == Some(surface)
+        {
+            self.focus_layer(surface.clone());
         }
 
         // Preserve all existing XDG window behavior.
@@ -399,6 +435,152 @@ struct App {
     layer_shell_state: WlrLayerShellState,
     layer_surfaces: Vec<DesktopLayerSurface>,
     initial_layer_configures: HashSet<WlSurface>,
+    active_layer_keyboard: Option<WlSurface>,
+    saved_xdg_keyboard_focus: Option<WlSurface>,
+}
+
+impl App {
+    fn layer_keyboard_mode(layer: &DesktopLayerSurface) -> KeyboardInteractivity {
+        with_states(layer.wl_surface(), |states| {
+            states
+                .cached_state
+                .get::<LayerSurfaceCachedState>()
+                .current()
+                .keyboard_interactivity
+        })
+    }
+
+    fn preferred_keyboard_layer(&self) -> Option<WlSurface> {
+        let map = layer_map_for_output(&self.output);
+        for kind in [Layer::Overlay, Layer::Top] {
+            for layer in map.layers_on(kind).rev() {
+                if layer.layer_surface().alive()
+                    && layer_can_auto_focus(layer.layer(), Self::layer_keyboard_mode(layer))
+                {
+                    return Some(layer.wl_surface().clone());
+                }
+            }
+        }
+        None
+    }
+
+    fn interactive_layer_alive(&self, surface: &WlSurface) -> bool {
+        self.layer_surfaces.iter().any(|layer| {
+            layer.wl_surface() == surface
+                && layer.layer_surface().alive()
+                && layer.can_receive_keyboard_focus()
+        })
+    }
+
+    fn focused_layer_is_exclusive(&self) -> bool {
+        self.active_layer_keyboard.as_ref().is_some_and(|surface| {
+            self.layer_surfaces.iter().any(|layer| {
+                layer.wl_surface() == surface
+                    && Self::layer_keyboard_mode(layer) == KeyboardInteractivity::Exclusive
+            })
+        })
+    }
+
+    fn focus_layer(&mut self, surface: WlSurface) {
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
+        if self.active_layer_keyboard.as_ref() == Some(&surface)
+            && keyboard.current_focus().as_ref() == Some(&surface)
+        {
+            return;
+        }
+        // An exclusive foreground layer must not lose focus to an unrelated
+        // on-demand layer when its surface commits.
+        if self.active_layer_keyboard.as_ref() != Some(&surface)
+            && self.focused_layer_is_exclusive()
+            && self.preferred_keyboard_layer().as_ref() != Some(&surface)
+        {
+            return;
+        }
+        if self.active_layer_keyboard.is_none() {
+            self.saved_xdg_keyboard_focus = keyboard
+                .current_focus()
+                .filter(|focused| self.windows.focus_is_valid(focused))
+                .or_else(|| self.windows.focused_surface());
+        }
+        self.active_layer_keyboard = Some(surface.clone());
+        keyboard.set_focus(
+            self,
+            Some(surface),
+            smithay::utils::SERIAL_COUNTER.next_serial(),
+        );
+        self.needs_redraw = true;
+    }
+
+    fn restore_xdg_keyboard_focus(&mut self) {
+        self.active_layer_keyboard = None;
+        let replacement = self
+            .saved_xdg_keyboard_focus
+            .take()
+            .filter(|surface| self.windows.focus_is_valid(surface))
+            .or_else(|| self.windows.focused_surface());
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            keyboard.set_focus(
+                self,
+                replacement,
+                smithay::utils::SERIAL_COUNTER.next_serial(),
+            );
+        }
+        self.needs_redraw = true;
+    }
+
+    fn focus_xdg_from_click(&mut self, surface: WlSurface, serial: Serial) {
+        if self.focused_layer_is_exclusive() {
+            return;
+        }
+        self.active_layer_keyboard = None;
+        self.saved_xdg_keyboard_focus = None;
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            keyboard.set_focus(self, Some(surface), serial);
+        }
+    }
+
+    /// Hit-test the rendered layer surface tree using output-local coordinates.
+    /// `surface_under` honors Wayland input regions and subsurface offsets.
+    fn layer_hit_at(&self, kind: Layer, x: f64, y: f64) -> Option<LayerHit> {
+        let map = layer_map_for_output(&self.output);
+        let layer = map.layer_under(kind, (x, y))?;
+        let geometry = map.layer_geometry(layer)?;
+        let relative = (x - f64::from(geometry.loc.x), y - f64::from(geometry.loc.y));
+        let (surface, offset) = layer.surface_under(
+            relative,
+            WindowSurfaceType::TOPLEVEL | WindowSurfaceType::SUBSURFACE,
+        )?;
+        let absolute = (
+            f64::from(geometry.loc.x + offset.x),
+            f64::from(geometry.loc.y + offset.y),
+        );
+        Some(LayerHit {
+            root: layer.wl_surface().clone(),
+            pointer_target: (surface, absolute.into()),
+        })
+    }
+
+    fn foreground_layer_hit_at(&self, x: f64, y: f64) -> Option<LayerHit> {
+        self.layer_hit_at(Layer::Overlay, x, y)
+            .or_else(|| self.layer_hit_at(Layer::Top, x, y))
+    }
+
+    fn background_layer_hit_at(&self, x: f64, y: f64) -> Option<LayerHit> {
+        self.layer_hit_at(Layer::Bottom, x, y)
+            .or_else(|| self.layer_hit_at(Layer::Background, x, y))
+    }
+
+    fn pointer_surface_at(&self, x: f64, y: f64) -> Option<(WlSurface, Point<f64, Logical>)> {
+        if let Some(hit) = self.foreground_layer_hit_at(x, y) {
+            return Some(hit.pointer_target);
+        }
+        self.windows.surface_at(x, y).or_else(|| {
+            self.background_layer_hit_at(x, y)
+                .map(|hit| hit.pointer_target)
+        })
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -498,9 +680,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let _output_global = output.create_global::<App>(&dh);
-
-    // Advertise zxdg_output_manager_v1.
-    // Waybar requires this to discover logical output information.
+    // Waybar needs XDG logical-output information in addition to wl_output.
     let _output_manager_state = OutputManagerState::new_with_xdg_output::<App>(&dh);
 
     let layer_shell_state = WlrLayerShellState::new::<App>(&dh);
@@ -529,6 +709,8 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             layer_shell_state,
             layer_surfaces: Vec::new(),
             initial_layer_configures: HashSet::new(),
+            active_layer_keyboard: None,
+            saved_xdg_keyboard_focus: None,
         }
     };
     state.windows.configure_startup(config.tiling);
@@ -679,16 +861,35 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
             // wl_output cannot retract modes from already-connected clients,
             // but newly connected clients should not see resize history.
-            if let Some(previous) = previous_mode
-                && previous != new_mode
-            {
-                state.output.delete_mode(previous);
-            }
+            if let Some(previous) = previous_mode 
+                && previous != new_mode {
+                    state.output.delete_mode(previous);
+                }
+            
 
             state.output_size = output_dims;
             state.windows.resize_placed_windows(output_dims);
             state.windows.reflow_all_tiled_workspaces(output_dims);
-            layer_map_for_output(&state.output).arrange();
+
+            // Refresh layer geometry against the new virtual output size.
+            // LayerMap normally sends a pending configure when dimensions change.
+            // Explicitly resend it here as a nested-output resize compatibility
+            // safeguard for existing Waybar/Swaybg layer surfaces.
+            let layer_layout_changed = layer_map_for_output(&state.output).arrange();
+            let mut configured_layers = 0;
+            for layer in &state.layer_surfaces {
+                let shell = layer.layer_surface();
+                if shell.alive()
+                    && state.initial_layer_configures.contains(layer.wl_surface())
+                {
+                    shell.send_configure();
+                    configured_layers += 1;
+                }
+            }
+            println!(
+                "Anwilite: output resized to {}x{}; layer layout changed={}; layers reconfigured={}",
+                output_dims.0, output_dims.1, layer_layout_changed, configured_layers
+            );
             state.needs_redraw = true;
         }
         let events = std::mem::take(&mut *winit_events.borrow_mut());
@@ -742,6 +943,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                 keyboard.modifier_state(),
                             );
                         }
+                        let layer_has_keyboard = state.active_layer_keyboard.is_some();
                         let requested_command = keyboard.input::<WorkspaceCommand, _>(
                             &mut state,
                             event.key_code(),
@@ -754,7 +956,14 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                     return FilterResult::Forward;
                                 };
 
-                                match config.keybindings.match_event(modifiers, symbol) {
+                                let action = config.keybindings.match_event(modifiers, symbol);
+                                // Let Fuzzel type, navigate, and handle Escape. Keep
+                                // the reserved recovery reload key available.
+                                match action {
+                                    Some(WorkspaceCommand::ReloadConfig) => {
+                                        FilterResult::Intercept(WorkspaceCommand::ReloadConfig)
+                                    }
+                                    _ if layer_has_keyboard => FilterResult::Forward,
                                     Some(command) => FilterResult::Intercept(command),
                                     None => FilterResult::Forward,
                                 }
@@ -971,7 +1180,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
                                         // Recalculate pointer focus for visible windows.
                                         let (x, y) = state.pointer_position;
-                                        let pointer_focus = state.windows.surface_at(x, y);
+                                        let pointer_focus = state.pointer_surface_at(x, y);
 
                                         pointer.motion(
                                             &mut state,
@@ -1012,8 +1221,8 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                             state.windows.update_drag(x, y);
                             state.needs_redraw = true;
                         } else {
-                            // Find the Wayland surface under the pointer.
-                            let focus = state.windows.surface_at(x, y);
+                            // Match the actual rendered stacking order, including layers.
+                            let focus = state.pointer_surface_at(x, y);
 
                             pointer.motion(
                                 &mut state,
@@ -1036,13 +1245,29 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
                         let time = start_time.elapsed().as_millis() as u32;
 
+                        let foreground_hit = state.foreground_layer_hit_at(x, y);
+                        let ordinary_window_hit = if foreground_hit.is_none() {
+                            state.windows.surface_at(x, y).is_some()
+                        } else {
+                            false
+                        };
+                        let background_hit = if foreground_hit.is_none() && !ordinary_window_hit {
+                            state.background_layer_hit_at(x, y)
+                        } else {
+                            None
+                        };
+
                         if event.button() == Some(MouseButton::Left)
                             && event.state() == ButtonState::Pressed
                         {
-                            state.move_press = state
-                                .windows
-                                .toplevel_at(x, y)
-                                .map(|surface| (serial, surface));
+                            state.move_press = if foreground_hit.is_none() {
+                                state
+                                    .windows
+                                    .toplevel_at(x, y)
+                                    .map(|surface| (serial, surface))
+                            } else {
+                                None
+                            };
                         }
 
                         if event.button() == Some(MouseButton::Left)
@@ -1060,22 +1285,23 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         if event.state() == ButtonState::Pressed {
-                            let clicked_window = state.windows.raise_at(x, y);
-
-                            if let Some(surface) = clicked_window {
-                                keyboard.set_focus(&mut state, Some(surface.clone()), serial);
-                                println!(
-                                    "Anwilite focus: clicked window, focus_matched={}",
-                                    keyboard.current_focus().as_ref() == Some(&surface),
-                                );
-                            } else {
-                                println!("Anwilite focus: background click, preserving focus");
-                            }
+                            if let Some(hit) = foreground_hit.as_ref().or(background_hit.as_ref()) {
+                                if state.interactive_layer_alive(&hit.root) {
+                                    state.focus_layer(hit.root.clone());
+                                }
+                            } else if ordinary_window_hit 
+                                && let Some(surface) = state.windows.raise_at(x, y) {
+                                    state.focus_xdg_from_click(surface, serial);
+                                }
+                            
                             state.needs_redraw = true;
                         }
 
                         // Octlitch's window-dragging behavior.
-                        if event.button() == Some(MouseButton::Middle) {
+                        if event.button() == Some(MouseButton::Middle)
+                            && foreground_hit.is_none()
+                            && ordinary_window_hit
+                        {
                             match event.state() {
                                 ButtonState::Pressed => {
                                     state.windows.start_drag(x, y);
@@ -1084,7 +1310,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                 ButtonState::Released => {
                                     state.windows.end_drag();
 
-                                    let focus = state.windows.surface_at(x, y);
+                                    let focus = state.pointer_surface_at(x, y);
 
                                     pointer.motion(
                                         &mut state,
@@ -1100,7 +1326,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                         } else {
-                            let focus = state.windows.surface_at(x, y);
+                            let focus = state.pointer_surface_at(x, y);
 
                             pointer.motion(
                                 &mut state,
@@ -1179,13 +1405,28 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             state.needs_redraw = true;
         }
 
-        let current_focus = keyboard.current_focus();
-
-        let focus_valid = current_focus
+        // The old XDG-only recovery loop would steal focus from Fuzzel on
+        // every iteration. Accept a live interactive layer as valid focus.
+        if state
+            .active_layer_keyboard
             .as_ref()
-            .is_some_and(|surface| state.windows.focus_is_valid(surface));
+            .is_some_and(|surface| !state.interactive_layer_alive(surface))
+        {
+            state.restore_xdg_keyboard_focus();
+        }
+
+        let current_focus = keyboard.current_focus();
+        let focus_valid = current_focus.as_ref().is_some_and(|surface| {
+            state.windows.focus_is_valid(surface)
+                || (state.active_layer_keyboard.as_ref() == Some(surface)
+                    && state.interactive_layer_alive(surface))
+        });
         if !focus_valid {
-            let replacement = state.windows.focused_surface();
+            let replacement = state
+                .active_layer_keyboard
+                .clone()
+                .filter(|surface| state.interactive_layer_alive(surface))
+                .or_else(|| state.windows.focused_surface());
 
             if current_focus != replacement {
                 println!(
@@ -1498,3 +1739,30 @@ delegate_seat!(App);
 delegate_data_device!(App);
 delegate_output!(App);
 delegate_layer_shell!(App);
+
+#[cfg(test)]
+mod layer_input_policy_tests {
+    use super::*;
+
+    #[test]
+    fn foreground_layers_honor_keyboard_interactivity() {
+        for kind in [Layer::Overlay, Layer::Top] {
+            assert!(layer_can_auto_focus(kind, KeyboardInteractivity::Exclusive));
+            assert!(layer_can_auto_focus(kind, KeyboardInteractivity::OnDemand));
+            assert!(!layer_can_auto_focus(kind, KeyboardInteractivity::None));
+        }
+    }
+
+    #[test]
+    fn background_layers_never_auto_steal_focus() {
+        for kind in [Layer::Background, Layer::Bottom] {
+            for mode in [
+                KeyboardInteractivity::None,
+                KeyboardInteractivity::OnDemand,
+                KeyboardInteractivity::Exclusive,
+            ] {
+                assert!(!layer_can_auto_focus(kind, mode));
+            }
+        }
+    }
+}
