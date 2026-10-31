@@ -10,7 +10,14 @@ use calloop::timer::{TimeoutAction, Timer};
 use calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic};
 use keybindings::WorkspaceCommand;
 use layout::focus_border_outside_tile;
+
 use smithay::backend::renderer::damage::OutputDamageTracker;
+use smithay::desktop::{LayerSurface as DesktopLayerSurface, layer_map_for_output};
+use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel};
+use smithay::wayland::output::{OutputHandler, OutputManagerState};
+use smithay::wayland::shell::wlr_layer::{
+    Layer, LayerSurface, WlrLayerShellHandler, WlrLayerShellState,
+};
 use smithay::wayland::socket::ListeningSocketSource;
 use smithay::{
     backend::{
@@ -56,14 +63,16 @@ use smithay::{
         shm::{ShmHandler, ShmState},
     },
 };
+use smithay::{delegate_layer_shell, delegate_output};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::rc::Rc;
 use std::time::Duration;
 use std::{os::unix::io::OwnedFd, sync::Arc};
 use wayland_protocols::xdg::shell::server::xdg_toplevel;
+use wayland_server::protocol::wl_output::WlOutput;
 use wayland_server::{
     Client,
     backend::{ClientData, ClientId, DisconnectReason},
@@ -241,6 +250,52 @@ impl XdgShellHandler for App {
     }
 }
 
+impl OutputHandler for App {}
+
+impl WlrLayerShellHandler for App {
+    fn shell_state(&mut self) -> &mut WlrLayerShellState {
+        &mut self.layer_shell_state
+    }
+
+    fn new_layer_surface(
+        &mut self,
+        surface: LayerSurface,
+        _output: Option<WlOutput>,
+        layer: Layer,
+        namespace: String,
+    ) {
+        println!("Anwilite: new layer: {namespace}, type={layer:?}");
+
+        let desktop_layer = DesktopLayerSurface::new(surface, namespace);
+
+        let result = layer_map_for_output(&self.output).map_layer(&desktop_layer);
+
+        if let Err(error) = result {
+            eprintln!("Anwilite: cannot map layer: {error}");
+            return;
+        }
+
+        self.layer_surfaces.push(desktop_layer);
+        self.needs_redraw = true;
+    }
+
+    fn layer_destroyed(&mut self, surface: LayerSurface) {
+        self.initial_layer_configures.remove(surface.wl_surface());
+
+        if let Some(index) = self
+            .layer_surfaces
+            .iter()
+            .position(|layer| layer.layer_surface() == &surface)
+        {
+            let layer = self.layer_surfaces.remove(index);
+
+            layer_map_for_output(&self.output).unmap_layer(&layer);
+        }
+
+        self.needs_redraw = true;
+    }
+}
+
 impl SelectionHandler for App {
     type SelectionUserData = ();
 }
@@ -267,6 +322,26 @@ impl CompositorHandler for App {
 
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
+
+        // Layer-shell clients first commit without a buffer.
+        // Only then do we send their initial configure.
+        if let Some(layer) = self
+            .layer_surfaces
+            .iter()
+            .find(|layer| layer.wl_surface() == surface)
+        {
+            // Recalculate anchors, margins and layer sizes.
+            layer_map_for_output(&self.output).arrange();
+
+            // Send the initial configure only after the first commit.
+            if self.initial_layer_configures.insert(surface.clone()) {
+                let serial = layer.layer_surface().send_configure();
+
+                println!("Anwilite: initial layer configure: {serial:?}");
+            }
+        }
+
+        // Preserve all existing XDG window behavior.
         self.windows.sync_resize_position(surface);
         self.windows.sync_mode_position(surface);
 
@@ -319,6 +394,11 @@ struct App {
     needs_redraw: bool,
     output_size: (i32, i32),
     surface_commit_count: u64,
+
+    output: Output,
+    layer_shell_state: WlrLayerShellState,
+    layer_surfaces: Vec<DesktopLayerSurface>,
+    initial_layer_configures: HashSet<WlSurface>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -407,6 +487,23 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut display: Display<App> = Display::new()?;
     let dh = display.handle();
+    let output = Output::new(
+        "ANWILITE-1".into(),
+        PhysicalProperties {
+            size: (300, 200).into(),
+            subpixel: Subpixel::Unknown,
+            make: "Octlitch".into(),
+            model: "Anwilite Nested Output".into(),
+        },
+    );
+
+    let _output_global = output.create_global::<App>(&dh);
+
+    // Advertise zxdg_output_manager_v1.
+    // Waybar requires this to discover logical output information.
+    let _output_manager_state = OutputManagerState::new_with_xdg_output::<App>(&dh);
+
+    let layer_shell_state = WlrLayerShellState::new::<App>(&dh);
 
     let compositor_state = CompositorState::new::<App>(&dh);
     let shm_state = ShmState::new::<App>(&dh, vec![]);
@@ -428,6 +525,10 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             needs_redraw: true,
             output_size: (1, 1), // Updated immediately after Winit initializes.
             surface_commit_count: 0,
+            output,
+            layer_shell_state,
+            layer_surfaces: Vec::new(),
+            initial_layer_configures: HashSet::new(),
         }
     };
     state.windows.configure_startup(config.tiling);
@@ -469,6 +570,26 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
     let (mut backend, winit) = winit::init::<GlesRenderer>()?;
     let initial_size = backend.window_size();
     state.output_size = (initial_size.w, initial_size.h);
+
+    let mode = OutputMode {
+        size: initial_size,
+        refresh: 60_000,
+    };
+
+    state.output.change_current_state(
+        Some(mode),
+        Some(Transform::Normal),
+        Some(Scale::Integer(1)),
+        Some((0, 0).into()),
+    );
+
+    state.output.set_preferred(mode);
+
+    println!(
+        "Anwilite: registered virtual output ANWILITE-1 ({}x{})",
+        initial_size.w, initial_size.h
+    );
+
     let mut tracked_size = backend.window_size();
     let mut damage_tracker = OutputDamageTracker::new(tracked_size, 1.0, Transform::Flipped180);
     let winit_events = Rc::new(RefCell::new(Vec::new()));
@@ -542,10 +663,32 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
         let output_size = backend.window_size();
         let output_dims = (output_size.w, output_size.h);
-        if output_dims != state.output_size {
+        if output_dims != state.output_size && output_dims.0 > 0 && output_dims.1 > 0 {
+            // The nested host window acts as Anwilite's single virtual output.
+            // Only update advertised modes when its dimensions actually change.
+            let previous_mode = state.output.current_mode();
+            let new_mode = OutputMode {
+                size: output_size,
+                refresh: 60_000,
+            };
+
+            state
+                .output
+                .change_current_state(Some(new_mode), None, None, None);
+            state.output.set_preferred(new_mode);
+
+            // wl_output cannot retract modes from already-connected clients,
+            // but newly connected clients should not see resize history.
+            if let Some(previous) = previous_mode
+                && previous != new_mode
+            {
+                state.output.delete_mode(previous);
+            }
+
             state.output_size = output_dims;
             state.windows.resize_placed_windows(output_dims);
             state.windows.reflow_all_tiled_workspaces(output_dims);
+            layer_map_for_output(&state.output).arrange();
             state.needs_redraw = true;
         }
         let events = std::mem::take(&mut *winit_events.borrow_mut());
@@ -1093,6 +1236,32 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
                 let mut elements = Vec::<AnwiliteRenderElement>::new();
 
+                // Foreground layer-shell surfaces are in front of normal windows.
+                // The render-elements list uses front-to-back stacking order.
+                {
+                    let layer_map = layer_map_for_output(&state.output);
+                    for kind in [Layer::Overlay, Layer::Top] {
+                        for layer in layer_map.layers_on(kind).rev() {
+                            let Some(geometry) = layer_map.layer_geometry(layer) else {
+                                continue;
+                            };
+
+                            elements.extend(
+                                render_elements_from_surface_tree(
+                                    renderer,
+                                    layer.wl_surface(),
+                                    (geometry.loc.x, geometry.loc.y),
+                                    1.0,
+                                    1.0,
+                                    Kind::Unspecified,
+                                )
+                                .into_iter()
+                                .map(AnwiliteRenderElement::Surface),
+                            );
+                        }
+                    }
+                }
+
                 // Window order is front-to-back.
                 for window in state
                     .windows
@@ -1164,6 +1333,31 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
 
+                // Bottom/background surfaces are behind ordinary windows.
+                {
+                    let layer_map = layer_map_for_output(&state.output);
+                    for kind in [Layer::Bottom, Layer::Background] {
+                        for layer in layer_map.layers_on(kind).rev() {
+                            let Some(geometry) = layer_map.layer_geometry(layer) else {
+                                continue;
+                            };
+
+                            elements.extend(
+                                render_elements_from_surface_tree(
+                                    renderer,
+                                    layer.wl_surface(),
+                                    (geometry.loc.x, geometry.loc.y),
+                                    1.0,
+                                    1.0,
+                                    Kind::Unspecified,
+                                )
+                                .into_iter()
+                                .map(AnwiliteRenderElement::Surface),
+                            );
+                        }
+                    }
+                }
+
                 let result = damage_tracker.render_output(
                     renderer,
                     &mut framebuffer,
@@ -1201,6 +1395,14 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             {
                 send_frames_surface_tree(
                     window.surface.wl_surface(),
+                    start_time.elapsed().as_millis() as u32,
+                );
+            }
+
+            // Layer-shell clients need frame callbacks to advance rendering.
+            for layer in &state.layer_surfaces {
+                send_frames_surface_tree(
+                    layer.wl_surface(),
                     start_time.elapsed().as_millis() as u32,
                 );
             }
@@ -1294,3 +1496,5 @@ delegate_compositor!(App);
 delegate_shm!(App);
 delegate_seat!(App);
 delegate_data_device!(App);
+delegate_output!(App);
+delegate_layer_shell!(App);
