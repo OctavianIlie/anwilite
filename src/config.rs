@@ -1,11 +1,35 @@
 use crate::appearance::{ACTIVE_BORDER, BorderStyle, INACTIVE_BORDER};
+use crate::layout::TilingSettings;
+use crate::workspace::WORKSPACE_COUNT;
+use crate::keybindings::{BindingSpec, KeyBindings};
 use serde::Deserialize;
 use std::{env, fs, io, path::PathBuf};
 
-#[derive(Debug, Clone, Copy)]
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppCommands {
+    pub terminal: Vec<String>,
+    pub file_manager: Vec<String>,
+    pub autostart_terminal: bool,
+}
+
+impl Default for AppCommands {
+    fn default() -> Self {
+        Self {
+            terminal: vec!["weston-terminal".to_string()],
+            file_manager: Vec::new(),
+            autostart_terminal: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct AnwiliteConfig {
     pub active_border: BorderStyle,
     pub inactive_border: Option<BorderStyle>,
+    pub tiling: TilingSettings,
+    pub apps: AppCommands,
+    pub keybindings: KeyBindings,
 }
 
 impl Default for AnwiliteConfig {
@@ -13,6 +37,9 @@ impl Default for AnwiliteConfig {
         Self {
             active_border: ACTIVE_BORDER,
             inactive_border: INACTIVE_BORDER,
+            tiling: TilingSettings::default(),
+            apps: AppCommands::default(),
+            keybindings: KeyBindings::default(),
         }
     }
 }
@@ -21,7 +48,10 @@ impl AnwiliteConfig {
     pub fn apply_reload(&mut self, candidate: Result<Self, String>) -> Result<bool, String> {
         let next = candidate?;
 
-        if self.active_border == next.active_border && self.inactive_border == next.inactive_border
+        if self.active_border == next.active_border
+            && self.inactive_border == next.inactive_border
+            && self.tiling == next.tiling
+            && self.apps == next.apps
         {
             return Ok(false);
         }
@@ -36,6 +66,9 @@ impl AnwiliteConfig {
 #[serde(default, deny_unknown_fields)]
 struct FileConfig {
     borders: BorderOptions,
+    tiling: TilingOptions,
+    apps: AppOptions,
+    keybindings: Vec<BindingSpec>
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -51,6 +84,24 @@ struct BorderOptions {
     inactive_clearance: Option<i32>,
 
     inactive_enabled: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct TilingOptions {
+    outer_gap: Option<i32>,
+    inner_gap: Option<i32>,
+    default_master_ratio: Option<u8>,
+    start_tiled: Option<bool>,
+    tiled_workspaces: Option<Vec<usize>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct AppOptions {
+    terminal: Option<Vec<String>>,
+    file_manager: Option<Vec<String>>,
+    autostart_terminal: Option<bool>,
 }
 
 fn parse_hex_color(raw: &str) -> Result<[f32; 4], String> {
@@ -129,6 +180,86 @@ fn parse_config(contents: &str) -> Result<AnwiliteConfig, String> {
 
     config.inactive_border = if enabled { Some(inactive) } else { None };
 
+    let options = file.tiling;
+    let mut tiling = TilingSettings::default();
+
+    if let Some(value) = options.outer_gap {
+        tiling.gaps.outer = value;
+    }
+
+    if let Some(value) = options.inner_gap {
+        tiling.gaps.inner = value;
+    }
+
+    if let Some(value) = options.default_master_ratio {
+        tiling.default_master_ratio = value;
+    }
+
+    if let Some(value) = options.start_tiled {
+        tiling.start_tiled = value;
+    }
+    if let Some(workspaces) = options.tiled_workspaces {
+        let mut mask = [false; WORKSPACE_COUNT];
+
+        for workspace in workspaces {
+            if !(1..=WORKSPACE_COUNT).contains(&workspace) {
+                return Err(format!(
+                    "invalid workspace {workspace}; expected 1..={WORKSPACE_COUNT}"
+                ));
+            }
+
+            let index = workspace - 1;
+
+            if mask[index] {
+                return Err(format!("workspace {workspace} appears more than once"));
+            }
+
+            mask[index] = true;
+        }
+
+        tiling.tiled_workspaces = Some(mask);
+    }
+
+    if !tiling.is_valid() {
+        return Err("invalid tiling settings: gaps must be 0..=64 \
+            and master ratio must be 20..=80"
+            .into());
+    }
+
+    config.tiling = tiling;
+    let options = file.apps;
+    let mut apps = AppCommands::default();
+
+    if let Some(command) = options.terminal {
+        apps.terminal = command;
+    }
+
+    if let Some(command) = options.file_manager {
+        apps.file_manager = command;
+    }
+
+    if let Some(enabled) = options.autostart_terminal {
+        apps.autostart_terminal = enabled;
+    }
+
+    // An empty vector disables a command.
+    // A nonempty vector must specify a real program name.
+    for (name, command) in [
+        ("terminal", &apps.terminal),
+        ("file_manager", &apps.file_manager),
+    ] {
+        if command
+            .first()
+            .is_some_and(|program| program.trim().is_empty())
+        {
+            return Err(format!(
+                "apps.{name} must begin with a nonempty executable name"
+            ));
+        }
+    }
+
+    config.apps = apps;
+
     Ok(config)
 }
 
@@ -193,25 +324,6 @@ pub fn try_load() -> Result<AnwiliteConfig, String> {
 
     parse_config(&contents)
         .map_err(|error| format!("invalid configuration at {}: {error}", path.display()))
-}
-
-pub fn reload(current: &mut AnwiliteConfig) -> bool {
-    match current.apply_reload(try_load()) {
-        Ok(true) => {
-            println!("Anwilite: configuration reloaded");
-            true
-        }
-
-        Ok(false) => {
-            println!("Anwilite: configuration unchanged");
-            false
-        }
-
-        Err(error) => {
-            eprintln!("Anwilite: reload failed: {error}; keeping previous settings");
-            false
-        }
-    }
 }
 
 pub fn load() -> AnwiliteConfig {
@@ -306,11 +418,12 @@ mod tests {
         let mut config = AnwiliteConfig::default();
 
         // Identical settings should not count as a change.
-        assert!(!config.apply_reload(Ok(config)).unwrap());
+        assert!(!config.apply_reload(Ok(config.clone())).unwrap());
 
         let updated = parse_config("[borders]\nactive_thickness = 4\n").unwrap();
 
-        assert!(config.apply_reload(Ok(updated)).unwrap());
+        assert!(config.apply_reload(Ok(updated.clone())).unwrap());
+
         assert_eq!(config.active_border.thickness, 4);
 
         // Reloading the same settings should do nothing.
@@ -321,7 +434,7 @@ mod tests {
     fn invalid_reload_preserves_current_settings() {
         let mut config = parse_config("[borders]\nactive_thickness = 4\n").unwrap();
 
-        let previous = config;
+        let previous = config.clone();
 
         let invalid = parse_config("[borders]\nactive_color = \"invalid\"\n");
 
@@ -348,5 +461,130 @@ mod tests {
 
         // Deleting the configuration is also a change.
         assert!(snapshot_changed(&mut previous, ConfigFileSnapshot::Missing,));
+    }
+
+    #[test]
+    fn tiling_settings_are_parsed() {
+        let config = parse_config(
+            "[tiling]\n\
+            outer_gap = 12\n\
+            inner_gap = 8\n\
+            default_master_ratio = 60\n\
+            start_tiled = true\n",
+        )
+        .unwrap();
+
+        assert_eq!(config.tiling.gaps.outer, 12);
+        assert_eq!(config.tiling.gaps.inner, 8);
+        assert_eq!(config.tiling.default_master_ratio, 60);
+        assert!(config.tiling.start_tiled);
+    }
+
+    #[test]
+    fn invalid_tiling_settings_are_rejected() {
+        assert!(parse_config("[tiling]\nouter_gap = -5\n").is_err());
+
+        assert!(parse_config("[tiling]\ndefault_master_ratio = 95\n").is_err());
+    }
+
+    #[test]
+    fn tiling_changes_are_detected_during_reload() {
+        let mut config = AnwiliteConfig::default();
+
+        let updated = parse_config("[tiling]\nouter_gap = 12\ninner_gap = 8\n").unwrap();
+
+        assert!(config.apply_reload(Ok(updated.clone())).unwrap());
+
+        assert_eq!(config.tiling.gaps.outer, 12);
+        assert_eq!(config.tiling.gaps.inner, 8);
+
+        // Applying the same settings again must do nothing.
+        assert!(!config.apply_reload(Ok(updated)).unwrap());
+    }
+
+    #[test]
+    fn explicit_tiled_workspaces_are_parsed() {
+        let config = parse_config(
+            "[tiling]\n\
+            start_tiled = true\n\
+            tiled_workspaces = [1, 3, 10]\n",
+        )
+        .unwrap();
+
+        let tiled = config.tiling.tiled_workspaces.unwrap();
+
+        assert!(tiled[0]);
+        assert!(!tiled[1]);
+        assert!(tiled[2]);
+        assert!(tiled[9]);
+    }
+
+    #[test]
+    fn invalid_tiled_workspace_lists_are_rejected() {
+        assert!(parse_config("[tiling]\ntiled_workspaces = [0]\n").is_err());
+
+        assert!(parse_config("[tiling]\ntiled_workspaces = [11]\n").is_err());
+
+        assert!(parse_config("[tiling]\ntiled_workspaces = [2, 2]\n").is_err());
+    }
+
+    #[test]
+    fn app_defaults_keep_the_development_terminal() {
+        let config = parse_config("").unwrap();
+
+        assert_eq!(config.apps.terminal, vec!["weston-terminal"]);
+
+        assert!(config.apps.autostart_terminal);
+        assert!(config.apps.file_manager.is_empty());
+    }
+
+    #[test]
+    fn application_commands_are_parsed() {
+        let config = parse_config(
+            "[apps]\n\
+            terminal = [\"foot\", \"--title\", \"Anwilite\"]\n\
+            file_manager = [\"thunar\"]\n\
+            autostart_terminal = false\n",
+        )
+        .unwrap();
+
+        assert_eq!(config.apps.terminal, vec!["foot", "--title", "Anwilite"]);
+
+        assert_eq!(config.apps.file_manager, vec!["thunar"]);
+
+        assert!(!config.apps.autostart_terminal);
+    }
+
+    #[test]
+    fn application_commands_can_be_disabled() {
+        let config = parse_config(
+            "[apps]\n\
+            terminal = []\n\
+            file_manager = []\n\
+            autostart_terminal = false\n",
+        )
+        .unwrap();
+
+        assert!(config.apps.terminal.is_empty());
+        assert!(config.apps.file_manager.is_empty());
+    }
+
+    #[test]
+    fn empty_executable_names_are_rejected() {
+        assert!(parse_config("[apps]\nterminal = [\"\"]\n").is_err());
+
+        assert!(parse_config("[apps]\nfile_manager = [\"   \"]\n").is_err());
+    }
+
+    #[test]
+    fn application_changes_are_detected_on_reload() {
+        let mut config = AnwiliteConfig::default();
+
+        let next = parse_config("[apps]\nterminal = [\"foot\"]\n").unwrap();
+
+        assert!(config.apply_reload(Ok(next.clone())).unwrap());
+        assert_eq!(config.apps.terminal, vec!["foot"]);
+
+        assert!(!config.apply_reload(Ok(next)).unwrap());
     }
 }

@@ -1,3 +1,5 @@
+use crate::workspace::WORKSPACE_COUNT;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapSide {
     Left,
@@ -46,6 +48,33 @@ pub struct SnapGaps {
 }
 
 pub const DEFAULT_SNAP_GAPS: SnapGaps = SnapGaps { outer: 6, inner: 6 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TilingSettings {
+    pub gaps: SnapGaps,
+    pub default_master_ratio: u8,
+    pub start_tiled: bool,
+    pub tiled_workspaces: Option<[bool; WORKSPACE_COUNT]>,
+}
+
+impl Default for TilingSettings {
+    fn default() -> Self {
+        Self {
+            gaps: DEFAULT_SNAP_GAPS,
+            default_master_ratio: 50,
+            start_tiled: false,
+            tiled_workspaces: None,
+        }
+    }
+}
+
+impl TilingSettings {
+    pub fn is_valid(&self) -> bool {
+        (0..=64).contains(&self.gaps.outer)
+            && (0..=64).contains(&self.gaps.inner)
+            && (20..=80).contains(&self.default_master_ratio)
+    }
+}
 
 pub fn snap_rect_with_gaps(
     output_size: (i32, i32),
@@ -140,6 +169,7 @@ fn split_columns(
     Some((master, stack))
 }
 
+#[cfg(test)]
 pub fn tile_rects(
     output_size: (i32, i32),
     window_count: usize,
@@ -766,5 +796,35 @@ mod tests {
         assert_eq!(focus_border_rects(rect, 0), None);
         assert_eq!(focus_border_rects(rect, -1), None);
         assert_eq!(focus_border_rects(rect, 50), None);
+    }
+
+    #[test]
+    fn default_tiling_settings_preserve_old_behavior() {
+        let settings = TilingSettings::default();
+
+        assert_eq!(settings.gaps, DEFAULT_SNAP_GAPS);
+        assert_eq!(settings.default_master_ratio, 50);
+        assert!(!settings.start_tiled);
+        assert!(settings.is_valid());
+    }
+
+    #[test]
+    fn invalid_tiling_settings_are_rejected() {
+        let settings = TilingSettings {
+            gaps: SnapGaps {
+                outer: -1,
+                inner: 6,
+            },
+            ..TilingSettings::default()
+        };
+
+        assert!(!settings.is_valid());
+
+        let settings = TilingSettings {
+            default_master_ratio: 90,
+            ..TilingSettings::default()
+        };
+
+        assert!(!settings.is_valid());
     }
 }

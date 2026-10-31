@@ -1,5 +1,5 @@
 use crate::layout::{
-    DEFAULT_SNAP_GAPS, SnapRect, SnapSide, snap_rect_with_gaps, tile_rects_with_ratio,
+    SnapRect, SnapSide, TilingSettings, snap_rect_with_gaps, tile_rects_with_ratio,
 };
 use crate::workspace::{WORKSPACE_COUNT, Workspaces};
 
@@ -362,9 +362,166 @@ pub struct WindowManager {
     layout_modes: [LayoutMode; WORKSPACE_COUNT],
     minimize_counter: u64,
     master_ratios: [Option<u8>; WORKSPACE_COUNT],
+    tiling_settings: TilingSettings,
 }
 
 impl WindowManager {
+    pub fn configure_startup(&mut self, settings: TilingSettings) {
+        assert!(settings.is_valid());
+
+        self.tiling_settings = settings;
+
+        // Original behavior: every workspace starts in the global mode.
+        let default_mode = if settings.start_tiled {
+            LayoutMode::Tiled
+        } else {
+            LayoutMode::Floating
+        };
+
+        self.layout_modes = [default_mode; WORKSPACE_COUNT];
+
+        // An explicit workspace list overrides the global startup mode.
+        if let Some(tiled_workspaces) = settings.tiled_workspaces {
+            for (mode, tiled) in self.layout_modes.iter_mut().zip(tiled_workspaces) {
+                *mode = if tiled {
+                    LayoutMode::Tiled
+                } else {
+                    LayoutMode::Floating
+                };
+            }
+        }
+    }
+
+    pub fn apply_tiling_settings(
+        &mut self,
+        next: TilingSettings,
+        output_size: (i32, i32),
+    ) -> Result<bool, String> {
+        if !next.is_valid() {
+            return Err("invalid tiling settings".into());
+        }
+
+        if self.tiling_settings == next {
+            return Ok(false);
+        }
+
+        let gaps_changed = self.tiling_settings.gaps != next.gaps;
+        let geometry_changed =
+            gaps_changed || self.tiling_settings.default_master_ratio != next.default_master_ratio;
+
+        // Don't change window geometry during an interactive operation.
+        if geometry_changed && (self.is_dragging() || self.is_resizing() || self.settling.is_some())
+        {
+            return Err("window operation in progress; reload again afterward".into());
+        }
+
+        if geometry_changed {
+            // Validate every tiled workspace before changing any settings.
+            for workspace in 1..=WORKSPACE_COUNT {
+                if self.layout_modes[workspace - 1] != LayoutMode::Tiled {
+                    continue;
+                }
+
+                let participants: Vec<&ManagedWindow> = self
+                    .windows
+                    .iter()
+                    .filter(|window| {
+                        window.workspace == workspace && window.surface.alive() && !window.minimized
+                    })
+                    .collect();
+
+                // Avoid applying settings during incomplete window transitions.
+                if participants.iter().any(|window| {
+                    window.tiled.is_none()
+                        || window.pending_unsnap.is_some()
+                        || window.restoring.is_some()
+                        || window_geometry(window).is_none()
+                }) {
+                    return Err(format!(
+                        "workspace {workspace} has windows still configuring"
+                    ));
+                }
+
+                // Preserve per-workspace master-ratio overrides.
+                let ratio = self.master_ratios[workspace - 1].unwrap_or(next.default_master_ratio);
+
+                let targets =
+                    tile_rects_with_ratio(output_size, participants.len(), next.gaps, ratio)
+                        .ok_or_else(|| {
+                            format!("workspace {workspace} cannot fit the new layout")
+                        })?;
+
+                if participants
+                    .iter()
+                    .zip(targets.iter())
+                    .any(|(window, &target)| !window_can_fit_tile(window, target))
+                {
+                    return Err(format!(
+                        "workspace {workspace}: a window cannot fit its proposed tile"
+                    ));
+                }
+            }
+
+            // Snapped windows must also fit the new gaps.
+            if gaps_changed {
+                for window in self.windows.iter().filter(|window| window.surface.alive()) {
+                    let Some((side, _)) = window.snapped else {
+                        continue;
+                    };
+
+                    let target = snap_rect_with_gaps(output_size, side, next.gaps)
+                        .ok_or("new snapping geometry is invalid")?;
+
+                    if !window_can_fit_tile(window, target) || window_geometry(window).is_none() {
+                        return Err("a snapped window cannot fit the new gaps".into());
+                    }
+                }
+            }
+        }
+
+        // Validation succeeded. Now we can commit the new settings.
+        self.tiling_settings = next;
+
+        if gaps_changed {
+            for window in &mut self.windows {
+                if !window.surface.alive() {
+                    continue;
+                }
+
+                let Some((side, old_rect)) = window.snapped else {
+                    continue;
+                };
+
+                let Some(target) = snap_rect_with_gaps(output_size, side, next.gaps) else {
+                    continue;
+                };
+
+                if target == old_rect {
+                    continue;
+                }
+
+                window.snapped = Some((side, target));
+
+                if let Some(geometry) = window_geometry(window) {
+                    window.x = target.x - geometry.loc.x;
+                    window.y = target.y - geometry.loc.y;
+                }
+
+                window.surface.with_pending_state(|state| {
+                    state.size = Some((target.width, target.height).into());
+                });
+
+                window.surface.send_pending_configure();
+            }
+        }
+
+        if geometry_changed {
+            self.reflow_all_tiled_workspaces(output_size);
+        }
+
+        Ok(true)
+    }
+
     pub fn add(&mut self, surface: ToplevelSurface) {
         let offset = (self.windows.len() % 8) as i32 * 48;
 
@@ -400,7 +557,7 @@ impl WindowManager {
     }
 
     pub fn master_ratio_for_workspace(&self, workspace: usize) -> u8 {
-        self.master_ratios[workspace - 1].unwrap_or(50)
+        self.master_ratios[workspace - 1].unwrap_or(self.tiling_settings.default_master_ratio)
     }
 
     pub fn set_master_ratio(&mut self, percent: u8, output_size: (i32, i32)) -> bool {
@@ -438,8 +595,21 @@ impl WindowManager {
         }
 
         // Validate before changing the stored ratio.
-        if tile_rects_with_ratio(output_size, participants.len(), DEFAULT_SNAP_GAPS, percent)
-            .is_none()
+        // Calculate the proposed layout before changing the ratio.
+        let Some(targets) = tile_rects_with_ratio(
+            output_size,
+            participants.len(),
+            self.tiling_settings.gaps,
+            percent,
+        ) else {
+            return false;
+        };
+
+        // Every client must fit its proposed rectangle.
+        if participants
+            .iter()
+            .zip(targets.iter())
+            .any(|(window, &target)| !window_can_fit_tile(window, target))
         {
             return false;
         }
@@ -460,7 +630,31 @@ impl WindowManager {
     }
 
     pub fn reset_master_ratio(&mut self, output_size: (i32, i32)) -> bool {
-        self.set_master_ratio(50, output_size)
+        if self.current_layout_mode() != LayoutMode::Tiled
+            || self.is_dragging()
+            || self.is_resizing()
+            || self.settling.is_some()
+        {
+            return false;
+        }
+
+        let workspace = self.current_workspace();
+        let index = workspace - 1;
+
+        let Some(previous_override) = self.master_ratios[index] else {
+            return false;
+        };
+
+        let default_ratio = self.tiling_settings.default_master_ratio;
+
+        if previous_override != default_ratio && !self.set_master_ratio(default_ratio, output_size)
+        {
+            return false;
+        }
+
+        self.master_ratios[index] = None;
+
+        true
     }
 
     fn stop_tiling_workspace(&mut self, workspace: usize) {
@@ -564,7 +758,7 @@ impl WindowManager {
         let Some(targets) = tile_rects_with_ratio(
             output_size,
             indices.len(),
-            DEFAULT_SNAP_GAPS,
+            self.tiling_settings.gaps,
             master_percent,
         ) else {
             let maximized_surfaces: Vec<ToplevelSurface> = indices
@@ -758,7 +952,7 @@ impl WindowManager {
         let Some(targets) = tile_rects_with_ratio(
             output_size,
             windows.len(),
-            DEFAULT_SNAP_GAPS,
+            self.tiling_settings.gaps,
             self.master_ratio_for_workspace(workspace),
         ) else {
             return false;
@@ -852,22 +1046,22 @@ impl WindowManager {
         // Return the window to its original floating geometry.
         if action == TransferAction::RestoreFloating {
             set_tiled_edges(&window.surface, false);
-            if window.tiled.take().is_some() {
-                if let Some(normal) = window.pre_tile.take() {
-                    if let Some(geometry) = window_geometry(&window) {
-                        window.x = normal.left - geometry.loc.x;
-                        window.y = normal.top - geometry.loc.y;
-                    }
-
-                    // The client still needs time to resize.
-                    window.restoring = Some((normal, Instant::now()));
-
-                    window.surface.with_pending_state(|state| {
-                        state.size = Some((normal.width, normal.height).into());
-                    });
-
-                    window.surface.send_configure();
+            if window.tiled.take().is_some()
+                && let Some(normal) = window.pre_tile.take()
+            {
+                if let Some(geometry) = window_geometry(&window) {
+                    window.x = normal.left - geometry.loc.x;
+                    window.y = normal.top - geometry.loc.y;
                 }
+
+                // The client still needs time to resize.
+                window.restoring = Some((normal, Instant::now()));
+
+                window.surface.with_pending_state(|state| {
+                    state.size = Some((normal.width, normal.height).into());
+                });
+
+                window.surface.send_configure();
             }
         }
 
@@ -977,9 +1171,12 @@ impl WindowManager {
         // Make sure the output can fit the current layout.
         let ratio = self.master_ratio_for_workspace(workspace);
 
-        if tile_rects_with_ratio(output_size, indices.len(), DEFAULT_SNAP_GAPS, ratio).is_none() {
+        // Calculate the target rectangles using the configured gaps and ratio.
+        let Some(targets) =
+            tile_rects_with_ratio(output_size, indices.len(), self.tiling_settings.gaps, ratio)
+        else {
             return false;
-        }
+        };
 
         // Find the focused window in the visible tile sequence.
         let Some(focused_index) = indices
@@ -1000,6 +1197,21 @@ impl WindowManager {
         let Some((first, second)) = pair else {
             return false;
         };
+
+        // Check whether every window can fit its destination AFTER swapping.
+        if indices.iter().copied().zip(targets).any(|(index, rect)| {
+            let destination_window = if index == first {
+                second
+            } else if index == second {
+                first
+            } else {
+                index
+            };
+
+            !window_can_fit_tile(&self.windows[destination_window], rect)
+        }) {
+            return false;
+        }
 
         // Swap entire ManagedWindow entries, not their saved geometry.
         self.windows.swap(first, second);
@@ -1167,7 +1379,7 @@ impl WindowManager {
             return false;
         }
 
-        let Some(target) = snap_rect_with_gaps(output_size, side, DEFAULT_SNAP_GAPS) else {
+        let Some(target) = snap_rect_with_gaps(output_size, side, self.tiling_settings.gaps) else {
             return false;
         };
 
@@ -1355,24 +1567,25 @@ impl WindowManager {
         let Some(window) = self.windows.iter_mut().find(|w| &w.surface == surface) else {
             return false;
         };
-        if window.maximized {
-            if let Some(target) = window.tiled {
-                set_tiled_edges(&window.surface, true);
-                window.maximized = false;
+        if window.maximized
+            && let Some(target) = window.tiled
+        {
+            set_tiled_edges(&window.surface, true);
+            window.maximized = false;
 
-                if let Some(geometry) = window_geometry(window) {
-                    window.x = target.x - geometry.loc.x;
-                    window.y = target.y - geometry.loc.y;
-                }
-
-                window.surface.with_pending_state(|state| {
-                    state.states.unset(xdg_toplevel::State::Maximized);
-                    state.size = Some((target.width, target.height).into());
-                });
-                window.surface.send_configure();
-                return true;
+            if let Some(geometry) = window_geometry(window) {
+                window.x = target.x - geometry.loc.x;
+                window.y = target.y - geometry.loc.y;
             }
+
+            window.surface.with_pending_state(|state| {
+                state.states.unset(xdg_toplevel::State::Maximized);
+                state.size = Some((target.width, target.height).into());
+            });
+            window.surface.send_configure();
+            return true;
         }
+
         if !window.maximized && window.snapped.is_none() {
             return false;
         }
@@ -1477,7 +1690,7 @@ impl WindowManager {
             tile_rects_with_ratio(
                 output_size,
                 next_count,
-                DEFAULT_SNAP_GAPS,
+                self.tiling_settings.gaps,
                 self.master_ratio_for_workspace(workspace),
             )?;
         }
@@ -1500,7 +1713,9 @@ impl WindowManager {
 
                 window.surface.send_pending_configure();
             } else if let Some((side, _)) = window.snapped {
-                let Some(target) = snap_rect_with_gaps(output_size, side, DEFAULT_SNAP_GAPS) else {
+                let Some(target) =
+                    snap_rect_with_gaps(output_size, side, self.tiling_settings.gaps)
+                else {
                     continue;
                 };
 
@@ -1542,7 +1757,7 @@ impl WindowManager {
             let Some(rectangles) = tile_rects_with_ratio(
                 output_size,
                 indices.len(),
-                DEFAULT_SNAP_GAPS,
+                self.tiling_settings.gaps,
                 master_percent,
             ) else {
                 continue;
@@ -1596,20 +1811,20 @@ impl WindowManager {
             window.y = top.round() as i32 - geometry.loc.y;
             window.pending_unsnap = None;
 
-            if let Some(drag) = self.dragging.as_mut() {
-                if drag.surface == window.surface {
-                    drag.offset_x = pending.pointer_x - window.x as f64;
-                    drag.offset_y = pending.pointer_y - window.y as f64;
-                }
+            if let Some(drag) = self.dragging.as_mut()
+                && drag.surface == window.surface
+            {
+                drag.offset_x = pending.pointer_x - window.x as f64;
+                drag.offset_y = pending.pointer_y - window.y as f64;
             }
             return;
         }
-        if !window.maximized {
-            if let Some(target) = window.tiled {
-                window.x = target.x - geometry.loc.x;
-                window.y = target.y - geometry.loc.y;
-                return;
-            }
+        if !window.maximized
+            && let Some(target) = window.tiled
+        {
+            window.x = target.x - geometry.loc.x;
+            window.y = target.y - geometry.loc.y;
+            return;
         }
 
         if window.maximized {
@@ -2141,5 +2356,135 @@ mod master_promotion_tests {
         assert_eq!(master_swap_pair(&[2, 5, 8], 3), None);
 
         assert_eq!(master_swap_pair(&[2, 5, 8], 8), Some((8, 2)));
+    }
+}
+
+#[cfg(test)]
+mod tiling_reload_tests {
+    use super::*;
+
+    #[test]
+    fn empty_window_manager_accepts_valid_tiling_settings() {
+        let mut manager = WindowManager::default();
+
+        let settings = TilingSettings {
+            gaps: crate::layout::SnapGaps {
+                outer: 12,
+                inner: 8,
+            },
+            default_master_ratio: 60,
+            start_tiled: false,
+            ..TilingSettings::default()
+        };
+
+        assert!(
+            manager
+                .apply_tiling_settings(settings, (1200, 800))
+                .unwrap()
+        );
+
+        assert_eq!(manager.tiling_settings, settings);
+
+        assert!(
+            !manager
+                .apply_tiling_settings(settings, (1200, 800))
+                .unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
+mod workspace_preference_tests {
+    use super::*;
+
+    #[test]
+    fn reset_override_follows_future_config_changes() {
+        let mut manager = WindowManager::default();
+
+        let settings = TilingSettings {
+            default_master_ratio: 60,
+            start_tiled: true,
+            ..TilingSettings::default()
+        };
+
+        manager.configure_startup(settings);
+
+        assert!(manager.set_master_ratio(70, (1200, 800)));
+        assert_eq!(manager.master_ratios[0], Some(70));
+
+        assert!(manager.reset_master_ratio((1200, 800)));
+        assert_eq!(manager.master_ratios[0], None);
+
+        let updated = TilingSettings {
+            default_master_ratio: 65,
+            ..settings
+        };
+
+        assert!(manager.apply_tiling_settings(updated, (1200, 800)).unwrap());
+
+        assert_eq!(manager.master_ratio_for_workspace(1), 65);
+    }
+
+    #[test]
+    fn workspaces_keep_independent_ratio_overrides() {
+        let mut manager = WindowManager::default();
+
+        manager.configure_startup(TilingSettings {
+            start_tiled: true,
+            ..TilingSettings::default()
+        });
+
+        assert!(manager.set_master_ratio(70, (1200, 800)));
+
+        assert!(manager.switch_to_workspace(2));
+        assert!(manager.set_master_ratio(75, (1200, 800)));
+
+        assert_eq!(manager.master_ratio_for_workspace(1), 70);
+        assert_eq!(manager.master_ratio_for_workspace(2), 75);
+
+        assert!(manager.reset_master_ratio((1200, 800)));
+
+        assert_eq!(manager.master_ratio_for_workspace(1), 70);
+        assert_eq!(manager.master_ratio_for_workspace(2), 50);
+        assert_eq!(manager.master_ratios[1], None);
+    }
+
+    #[test]
+    fn reset_clears_override_even_if_ratio_matches_default() {
+        let mut manager = WindowManager::default();
+
+        manager.configure_startup(TilingSettings {
+            default_master_ratio: 60,
+            start_tiled: true,
+            ..TilingSettings::default()
+        });
+
+        manager.master_ratios[0] = Some(60);
+
+        assert!(manager.reset_master_ratio((1200, 800)));
+        assert_eq!(manager.master_ratios[0], None);
+    }
+
+    #[test]
+    fn startup_modes_follow_explicit_workspace_list() {
+        let mut manager = WindowManager::default();
+
+        let mut tiled = [false; WORKSPACE_COUNT];
+        tiled[0] = true;
+        tiled[2] = true;
+
+        manager.configure_startup(TilingSettings {
+            start_tiled: true,
+            tiled_workspaces: Some(tiled),
+            ..TilingSettings::default()
+        });
+
+        assert_eq!(manager.current_layout_mode(), LayoutMode::Tiled);
+
+        assert!(manager.switch_to_workspace(2));
+        assert_eq!(manager.current_layout_mode(), LayoutMode::Floating);
+
+        assert!(manager.switch_to_workspace(3));
+        assert_eq!(manager.current_layout_mode(), LayoutMode::Tiled);
     }
 }

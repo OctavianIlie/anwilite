@@ -72,6 +72,8 @@ use wayland_server::{
 };
 use window::{TileFocusDirection, WindowManager};
 
+const ANWILITE_SOCKET_NAME: &str = "octlitch-0";
+
 render_elements! {
     AnwiliteRenderElement<=GlesRenderer>;
     Surface=WaylandSurfaceRenderElement<GlesRenderer>,
@@ -316,6 +318,8 @@ enum WorkspaceCommand {
     Minimize,
     RestoreMinimized,
     ReloadConfig,
+    LaunchTerminal,
+    LaunchFileManager,
 }
 
 struct App {
@@ -343,6 +347,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     run_winit()
+}
+
+fn reload_configuration(
+    current: &mut config::AnwiliteConfig,
+    windows: &mut WindowManager,
+    output_size: (i32, i32),
+) -> bool {
+    let next = match config::try_load() {
+        Ok(next) => next,
+        Err(error) => {
+            eprintln!("Anwilite: reload failed: {error}");
+            return false;
+        }
+    };
+
+    // Apply tiling only after the window manager validates it.
+    if next.tiling != current.tiling
+        && let Err(error) = windows.apply_tiling_settings(next.tiling, output_size)
+    {
+        eprintln!("Anwilite: reload rejected: {error}; keeping previous settings");
+        return false;
+    }
+
+    match current.apply_reload(Ok(next)) {
+        Ok(true) => {
+            println!("Anwilite: configuration reloaded");
+            true
+        }
+        Ok(false) => {
+            println!("Anwilite: configuration unchanged");
+            false
+        }
+        Err(error) => {
+            eprintln!("Anwilite: reload failed: {error}");
+            false
+        }
+    }
+}
+
+fn launch_configured_app(label: &str, argv: &[String], children: &mut Vec<std::process::Child>) {
+    let Some((program, args)) = argv.split_first() else {
+        eprintln!("Anwilite: no {label} command configured");
+        return;
+    };
+
+    let result = std::process::Command::new(program)
+        .args(args)
+        .env("WAYLAND_DISPLAY", ANWILITE_SOCKET_NAME)
+        .spawn();
+
+    match result {
+        Ok(child) => {
+            println!("Anwilite: launched {label}: {program} (PID {})", child.id());
+
+            children.push(child);
+        }
+
+        Err(error) => {
+            eprintln!("Anwilite: could not launch {label} ({program}): {error}");
+        }
+    }
 }
 
 pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
@@ -383,7 +448,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             surface_commit_count: 0,
         }
     };
-
+    state.windows.configure_startup(config.tiling);
     let mut event_loop = EventLoop::<Vec<UnixStream>>::try_new()?;
     const CONFIG_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -399,8 +464,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
-    // Register the Octlitch Wayland socket with Calloop.
-    let socket = ListeningSocketSource::with_name("octlitch-0")?;
+    let socket = ListeningSocketSource::with_name(ANWILITE_SOCKET_NAME)?;
 
     event_loop
         .handle()
@@ -454,10 +518,11 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
         .add_keyboard(Default::default(), 200, 200)
         .unwrap();
     let pointer = state.seat.add_pointer();
-    std::process::Command::new("weston-terminal")
-        .env("WAYLAND_DISPLAY", "octlitch-0")
-        .spawn()
-        .ok();
+    let mut launched_children = Vec::<std::process::Child>::new();
+
+    if config.apps.autostart_terminal {
+        launch_configured_app("terminal", &config.apps.terminal, &mut launched_children);
+    }
 
     loop {
         let wait = if state.needs_redraw {
@@ -466,12 +531,31 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             state.windows.pending_resize_wait()
         };
         event_loop.dispatch(wait, &mut pending_clients)?;
+        // Check whether applications launched by Anwilite have exited.
+        launched_children.retain_mut(|child| match child.try_wait() {
+            Ok(None) => true,
+
+            Ok(Some(status)) => {
+                println!("Anwilite: process {} exited with {status}", child.id());
+
+                false
+            }
+
+            Err(error) => {
+                eprintln!("Anwilite: cannot check process {}: {error}", child.id());
+
+                false
+            }
+        });
 
         if reload_due.replace(false)
             && config::snapshot_changed(&mut last_config_snapshot, config::snapshot())
-            && config::reload(&mut config)
         {
-            state.needs_redraw = true;
+            let output_size = state.output_size;
+
+            if reload_configuration(&mut config, &mut state.windows, output_size) {
+                state.needs_redraw = true;
+            }
         }
 
         let output_size = backend.window_size();
@@ -624,6 +708,13 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                         }
                                         Some(keysyms::KEY_Up) => Some(WorkspaceCommand::Maximize),
                                         Some(keysyms::KEY_Down) => Some(WorkspaceCommand::Restore),
+                                        Some(keysyms::KEY_Return | keysyms::KEY_KP_Enter) => {
+                                            Some(WorkspaceCommand::LaunchTerminal)
+                                        }
+
+                                        Some(keysyms::KEY_e | keysyms::KEY_E) => {
+                                            Some(WorkspaceCommand::LaunchFileManager)
+                                        }
                                         _ => None,
                                     };
 
@@ -798,7 +889,31 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
                                     WorkspaceCommand::ReloadConfig => {
                                         last_config_snapshot = config::snapshot();
-                                        config::reload(&mut config)
+                                        reload_configuration(
+                                            &mut config,
+                                            &mut state.windows,
+                                            state.output_size,
+                                        )
+                                    }
+
+                                    WorkspaceCommand::LaunchTerminal => {
+                                        launch_configured_app(
+                                            "terminal",
+                                            &config.apps.terminal,
+                                            &mut launched_children,
+                                        );
+
+                                        false
+                                    }
+
+                                    WorkspaceCommand::LaunchFileManager => {
+                                        launch_configured_app(
+                                            "file manager",
+                                            &config.apps.file_manager,
+                                            &mut launched_children,
+                                        );
+
+                                        false
                                     }
                                 };
 
