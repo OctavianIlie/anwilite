@@ -363,6 +363,7 @@ pub struct WindowManager {
     minimize_counter: u64,
     master_ratios: [Option<u8>; WORKSPACE_COUNT],
     tiling_settings: TilingSettings,
+    show_desktop: [bool; WORKSPACE_COUNT],
 }
 
 impl WindowManager {
@@ -527,6 +528,7 @@ impl WindowManager {
 
         // Remember which workspace is active.
         let workspace = self.workspaces.current_number();
+        self.show_desktop[workspace - 1] = false;
 
         self.windows.insert(
             0,
@@ -550,6 +552,20 @@ impl WindowManager {
 
     pub fn current_workspace(&self) -> usize {
         self.workspaces.current_number()
+    }
+
+    pub fn toggle_show_desktop(&mut self) -> bool {
+        let index = self.current_workspace() - 1;
+
+        self.show_desktop[index] = !self.show_desktop[index];
+
+        println!(
+            "Anwilite: workspace {} show desktop: {}",
+            index + 1,
+            self.show_desktop[index]
+        );
+
+        true
     }
 
     pub fn current_layout_mode(&self) -> LayoutMode {
@@ -1247,6 +1263,10 @@ impl WindowManager {
 
     pub fn is_window_visible(&self, window: &ManagedWindow) -> bool {
         let current = self.current_workspace();
+
+        if self.show_desktop[current - 1] {
+            return false;
+        }
 
         if window.workspace != current || !window.surface.alive() || window.minimized {
             return false;
@@ -2486,5 +2506,35 @@ mod workspace_preference_tests {
 
         assert!(manager.switch_to_workspace(3));
         assert_eq!(manager.current_layout_mode(), LayoutMode::Tiled);
+    }
+}
+
+#[cfg(test)]
+mod show_desktop_tests {
+    use super::*;
+
+    #[test]
+    fn show_desktop_toggles_independently_per_workspace() {
+        let mut manager = WindowManager::default();
+
+        assert!(!manager.show_desktop[0]);
+
+        assert!(manager.toggle_show_desktop());
+        assert!(manager.show_desktop[0]);
+
+        assert!(manager.switch_to_workspace(2));
+        assert!(!manager.show_desktop[1]);
+
+        assert!(manager.toggle_show_desktop());
+        assert!(manager.show_desktop[1]);
+
+        assert!(manager.switch_to_workspace(1));
+        assert!(manager.show_desktop[0]);
+
+        assert!(manager.toggle_show_desktop());
+        assert!(!manager.show_desktop[0]);
+
+        // Workspace 2 keeps its own Show Desktop state.
+        assert!(manager.show_desktop[1]);
     }
 }

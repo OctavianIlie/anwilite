@@ -1,5 +1,6 @@
 mod appearance;
 mod config;
+mod keybindings;
 mod layout;
 mod window;
 mod workspace;
@@ -7,7 +8,8 @@ mod workspace;
 use appearance::border_style;
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic};
-use layout::{SnapSide, focus_border_outside_tile};
+use keybindings::WorkspaceCommand;
+use layout::focus_border_outside_tile;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::wayland::socket::ListeningSocketSource;
 use smithay::{
@@ -31,7 +33,7 @@ use smithay::{
     delegate_compositor, delegate_data_device, delegate_seat, delegate_shm, delegate_xdg_shell,
     input::{
         Seat, SeatHandler, SeatState,
-        keyboard::{FilterResult, keysyms},
+        keyboard::FilterResult,
         pointer::{ButtonEvent, MotionEvent},
     },
     reexports::wayland_server::{Display, protocol::wl_seat},
@@ -70,7 +72,7 @@ use wayland_server::{
         wl_surface::{self, WlSurface},
     },
 };
-use window::{TileFocusDirection, WindowManager};
+use window::WindowManager;
 
 const ANWILITE_SOCKET_NAME: &str = "octlitch-0";
 
@@ -300,26 +302,6 @@ impl SeatHandler for App {
         _image: smithay::input::pointer::CursorImageStatus,
     ) {
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum WorkspaceCommand {
-    SwitchTo(usize),
-    MoveAndFollow(usize),
-    Snap(SnapSide),
-    Maximize,
-    Restore,
-    ToggleTiling,
-    AdjustMasterRatio(i8),
-    ResetMasterRatio,
-    FocusTile(TileFocusDirection),
-    SwapTile(TileFocusDirection),
-    PromoteTile,
-    Minimize,
-    RestoreMinimized,
-    ReloadConfig,
-    LaunchTerminal,
-    LaunchFileManager,
 }
 
 struct App {
@@ -624,124 +606,13 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                             serial,
                             time,
                             |_, modifiers, handle| {
-                                // Super+number is our normal shortcut.
-                                // Ctrl+Alt+number is a nested-VM testing fallback.
-                                if !modifiers.logo && !(modifiers.ctrl && modifiers.alt) {
+                                let Some(symbol) = handle.raw_syms().first().map(|sym| sym.raw())
+                                else {
                                     return FilterResult::Forward;
-                                }
-
-                                // Get the unmodified keyboard symbol.
-                                let symbol = handle.raw_syms().first().map(|sym| sym.raw());
-                                if matches!(symbol, Some(keysyms::KEY_m | keysyms::KEY_M)) {
-                                    return FilterResult::Intercept(if modifiers.shift {
-                                        WorkspaceCommand::RestoreMinimized
-                                    } else {
-                                        WorkspaceCommand::Minimize
-                                    });
-                                }
-
-                                if modifiers.shift
-                                    && matches!(symbol, Some(keysyms::KEY_t | keysyms::KEY_T))
-                                {
-                                    return FilterResult::Intercept(WorkspaceCommand::ToggleTiling);
-                                }
-                                // Super+Shift+C reloads Anwilite's configuration.
-                                // Ctrl+Alt+Shift+C is available for nested KDE testing.
-                                if modifiers.shift
-                                    && matches!(symbol, Some(keysyms::KEY_c | keysyms::KEY_C))
-                                {
-                                    return FilterResult::Intercept(WorkspaceCommand::ReloadConfig);
-                                }
-                                // Shift+H/J navigates focus; plain H/J adjusts the ratio.
-                                // Shift+H/J navigates focus.
-                                // Shift+Left/Right swaps tiles.
-                                if modifiers.shift {
-                                    let shortcut = match symbol {
-                                        Some(keysyms::KEY_h | keysyms::KEY_H) => {
-                                            Some(WorkspaceCommand::FocusTile(
-                                                TileFocusDirection::Previous,
-                                            ))
-                                        }
-
-                                        Some(keysyms::KEY_j | keysyms::KEY_J) => Some(
-                                            WorkspaceCommand::FocusTile(TileFocusDirection::Next),
-                                        ),
-
-                                        Some(keysyms::KEY_Left) => {
-                                            Some(WorkspaceCommand::SwapTile(
-                                                TileFocusDirection::Previous,
-                                            ))
-                                        }
-
-                                        Some(keysyms::KEY_Right) => Some(
-                                            WorkspaceCommand::SwapTile(TileFocusDirection::Next),
-                                        ),
-
-                                        Some(keysyms::KEY_p | keysyms::KEY_P) => {
-                                            Some(WorkspaceCommand::PromoteTile)
-                                        }
-
-                                        _ => None,
-                                    };
-
-                                    if let Some(command) = shortcut {
-                                        return FilterResult::Intercept(command);
-                                    }
-                                }
-
-                                if !modifiers.shift {
-                                    let shortcut = match symbol {
-                                        Some(keysyms::KEY_h | keysyms::KEY_H) => {
-                                            Some(WorkspaceCommand::AdjustMasterRatio(-5))
-                                        }
-                                        Some(keysyms::KEY_j | keysyms::KEY_J) => {
-                                            Some(WorkspaceCommand::AdjustMasterRatio(5))
-                                        }
-                                        Some(keysyms::KEY_r | keysyms::KEY_R) => {
-                                            Some(WorkspaceCommand::ResetMasterRatio)
-                                        }
-                                        Some(keysyms::KEY_Left) => {
-                                            Some(WorkspaceCommand::Snap(SnapSide::Left))
-                                        }
-                                        Some(keysyms::KEY_Right) => {
-                                            Some(WorkspaceCommand::Snap(SnapSide::Right))
-                                        }
-                                        Some(keysyms::KEY_Up) => Some(WorkspaceCommand::Maximize),
-                                        Some(keysyms::KEY_Down) => Some(WorkspaceCommand::Restore),
-                                        Some(keysyms::KEY_Return | keysyms::KEY_KP_Enter) => {
-                                            Some(WorkspaceCommand::LaunchTerminal)
-                                        }
-
-                                        Some(keysyms::KEY_e | keysyms::KEY_E) => {
-                                            Some(WorkspaceCommand::LaunchFileManager)
-                                        }
-                                        _ => None,
-                                    };
-
-                                    if let Some(command) = shortcut {
-                                        return FilterResult::Intercept(command);
-                                    }
-                                }
-
-                                let workspace = match symbol {
-                                    Some(sym)
-                                        if (keysyms::KEY_1..=keysyms::KEY_9).contains(&sym) =>
-                                    {
-                                        Some((sym - keysyms::KEY_1 + 1) as usize)
-                                    }
-                                    Some(keysyms::KEY_0) => Some(10),
-                                    _ => None,
                                 };
 
-                                match workspace {
-                                    Some(number) if modifiers.shift => FilterResult::Intercept(
-                                        WorkspaceCommand::MoveAndFollow(number),
-                                    ),
-
-                                    Some(number) => {
-                                        FilterResult::Intercept(WorkspaceCommand::SwitchTo(number))
-                                    }
-
+                                match config.keybindings.match_event(modifiers, symbol) {
+                                    Some(command) => FilterResult::Intercept(command),
                                     None => FilterResult::Forward,
                                 }
                             },
@@ -902,7 +773,6 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                             &config.apps.terminal,
                                             &mut launched_children,
                                         );
-
                                         false
                                     }
 
@@ -912,8 +782,20 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                             &config.apps.file_manager,
                                             &mut launched_children,
                                         );
+                                        false
+                                    }
+                                    WorkspaceCommand::LaunchMenu => {
+                                        launch_configured_app(
+                                            "application menu",
+                                            &config.apps.menu,
+                                            &mut launched_children,
+                                        );
 
                                         false
+                                    }
+
+                                    WorkspaceCommand::ToggleShowDesktop => {
+                                        state.windows.toggle_show_desktop()
                                     }
                                 };
 
@@ -924,6 +806,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                             | WorkspaceCommand::MoveAndFollow(_)
                                             | WorkspaceCommand::ToggleTiling
                                             | WorkspaceCommand::Minimize
+                                            | WorkspaceCommand::ToggleShowDesktop
                                     ) {
                                         let focus = state.windows.focused_surface();
 

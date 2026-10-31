@@ -1,16 +1,16 @@
 use crate::appearance::{ACTIVE_BORDER, BorderStyle, INACTIVE_BORDER};
+use crate::keybindings::{BindingSpec, KeyBindings};
 use crate::layout::TilingSettings;
 use crate::workspace::WORKSPACE_COUNT;
-use crate::keybindings::{BindingSpec, KeyBindings};
 use serde::Deserialize;
 use std::{env, fs, io, path::PathBuf};
-
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppCommands {
     pub terminal: Vec<String>,
     pub file_manager: Vec<String>,
     pub autostart_terminal: bool,
+    pub menu: Vec<String>,
 }
 
 impl Default for AppCommands {
@@ -19,6 +19,7 @@ impl Default for AppCommands {
             terminal: vec!["weston-terminal".to_string()],
             file_manager: Vec::new(),
             autostart_terminal: true,
+            menu: Vec::new(),
         }
     }
 }
@@ -52,6 +53,7 @@ impl AnwiliteConfig {
             && self.inactive_border == next.inactive_border
             && self.tiling == next.tiling
             && self.apps == next.apps
+            && self.keybindings == next.keybindings
         {
             return Ok(false);
         }
@@ -68,7 +70,7 @@ struct FileConfig {
     borders: BorderOptions,
     tiling: TilingOptions,
     apps: AppOptions,
-    keybindings: Vec<BindingSpec>
+    keybindings: Option<Vec<BindingSpec>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -102,6 +104,7 @@ struct AppOptions {
     terminal: Option<Vec<String>>,
     file_manager: Option<Vec<String>>,
     autostart_terminal: Option<bool>,
+    menu: Option<Vec<String>>,
 }
 
 fn parse_hex_color(raw: &str) -> Result<[f32; 4], String> {
@@ -238,6 +241,10 @@ fn parse_config(contents: &str) -> Result<AnwiliteConfig, String> {
         apps.file_manager = command;
     }
 
+    if let Some(command) = options.menu {
+        apps.menu = command;
+    }
+
     if let Some(enabled) = options.autostart_terminal {
         apps.autostart_terminal = enabled;
     }
@@ -247,6 +254,7 @@ fn parse_config(contents: &str) -> Result<AnwiliteConfig, String> {
     for (name, command) in [
         ("terminal", &apps.terminal),
         ("file_manager", &apps.file_manager),
+        ("menu", &apps.menu),
     ] {
         if command
             .first()
@@ -259,6 +267,10 @@ fn parse_config(contents: &str) -> Result<AnwiliteConfig, String> {
     }
 
     config.apps = apps;
+    config.keybindings = match file.keybindings {
+        Some(specs) => KeyBindings::from_explicit(&specs)?,
+        None => KeyBindings::default(),
+    };
 
     Ok(config)
 }
@@ -586,5 +598,37 @@ mod tests {
         assert_eq!(config.apps.terminal, vec!["foot"]);
 
         assert!(!config.apply_reload(Ok(next)).unwrap());
+    }
+    #[test]
+    fn custom_keybindings_are_parsed() {
+        let config = parse_config(
+            "[[keybindings]]\n\
+            key = \"Super+Y\"\n\
+            action = \"launch_terminal\"\n",
+        )
+        .unwrap();
+
+        assert_ne!(config.keybindings, KeyBindings::default());
+    }
+
+    #[test]
+    fn invalid_keybinding_reload_keeps_previous_config() {
+        let mut config = AnwiliteConfig::default();
+
+        let invalid = parse_config(
+            "[[keybindings]]\n\
+            key = \"Super+Shift+C\"\n\
+            action = \"launch_terminal\"\n",
+        );
+
+        assert!(config.apply_reload(invalid).is_err());
+        assert_eq!(config.keybindings, KeyBindings::default());
+    }
+
+    #[test]
+    fn application_menu_command_is_parsed() {
+        let config = parse_config("[apps]\nmenu = [\"weston-terminal\"]\n").unwrap();
+
+        assert_eq!(config.apps.menu, vec!["weston-terminal"]);
     }
 }
