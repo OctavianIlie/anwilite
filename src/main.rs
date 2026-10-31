@@ -140,12 +140,12 @@ impl XdgShellHandler for App {
         }
 
         // Do not steal keyboard focus from a visible layer-shell launcher.
-        if self.active_layer_keyboard.is_none() 
-            && let Some(keyboard) = self.seat.get_keyboard() {
-                let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-                keyboard.set_focus(self, Some(surface.wl_surface().clone()), serial);
-            }
-        
+        if self.active_layer_keyboard.is_none()
+            && let Some(keyboard) = self.seat.get_keyboard()
+        {
+            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+            keyboard.set_focus(self, Some(surface.wl_surface().clone()), serial);
+        }
     }
 
     fn maximize_request(&mut self, surface: ToplevelSurface) {
@@ -861,11 +861,11 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
             // wl_output cannot retract modes from already-connected clients,
             // but newly connected clients should not see resize history.
-            if let Some(previous) = previous_mode 
-                && previous != new_mode {
-                    state.output.delete_mode(previous);
-                }
-            
+            if let Some(previous) = previous_mode
+                && previous != new_mode
+            {
+                state.output.delete_mode(previous);
+            }
 
             state.output_size = output_dims;
             state.windows.resize_placed_windows(output_dims);
@@ -879,9 +879,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             let mut configured_layers = 0;
             for layer in &state.layer_surfaces {
                 let shell = layer.layer_surface();
-                if shell.alive()
-                    && state.initial_layer_configures.contains(layer.wl_surface())
-                {
+                if shell.alive() && state.initial_layer_configures.contains(layer.wl_surface()) {
                     shell.send_configure();
                     configured_layers += 1;
                 }
@@ -1289,11 +1287,12 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                 if state.interactive_layer_alive(&hit.root) {
                                     state.focus_layer(hit.root.clone());
                                 }
-                            } else if ordinary_window_hit 
-                                && let Some(surface) = state.windows.raise_at(x, y) {
-                                    state.focus_xdg_from_click(surface, serial);
-                                }
-                            
+                            } else if ordinary_window_hit
+                                && let Some(surface) = state.windows.raise_at(x, y)
+                            {
+                                state.focus_xdg_from_click(surface, serial);
+                            }
+
                             state.needs_redraw = true;
                         }
 
