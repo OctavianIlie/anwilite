@@ -208,38 +208,68 @@ These optimizations have been exercised in the development environment, **not** 
 
 ## Roadmap
 
-The roadmap describes intended capabilities, not committed release dates. Features may change as the standalone compositor architecture develops.
+The following stages describe planned capabilities, not guaranteed release dates. Checked items are implemented in the current nested development environment unless otherwise noted. A feature being implemented does not imply production readiness.
 
-### Desktop and application compatibility
+### Stage 1 — Hybrid window manager
 
-- [x] Floating windows, snapping, workspaces and automatic tiling.
-- [x] Configurable focus borders, gaps, master ratios, keybindings and application commands.
-- [x] Waybar, Swaybg and Fuzzel support in a nested desktop session.
-- [x] Layer-shell exclusive zones respected by placed application windows.
-- [ ] True fullscreen handling, separate from maximize, with correct focus and stacking.
-- [ ] Complete XDG popup handling, interactive grabs and transient-window behavior.
-- [ ] More complete clipboard/drag-and-drop, primary selection, input-method and text-input support.
-- [ ] Notifications, screencopy, portals and compositor IPC for external shell tools.
-- [ ] Optional window-decoration policies and additional layout modes.
+- [x] Floating windows, moving, interactive resizing, maximize and restore.
+- [x] Ten workspaces, switching, move-and-follow, and per-workspace focus history.
+- [x] Left/right half-screen snapping and original-geometry restoration.
+- [x] Configurable inner and outer gaps for snapping and tiling.
+- [x] Drag to unsnap without jumping.
+- [x] Automatic master-and-stack tiling for one, two, and three or more windows, with dynamic reflow.
+- [x] Per-workspace floating/tiling modes and adjustable master-width ratios.
+- [x] Tile focus navigation, swapping, and promotion to master.
+- [x] Minimize/restore, show desktop, and configurable application-launcher shortcuts.
+- [x] Configurable keybindings, application commands, appearance, and startup tiling preferences.
+- [x] Focus borders and exclusive work areas respected by maximized, snapped, and tiled windows.
+- [ ] Quarter-screen snapping and additional placement transitions.
+- [ ] Spatial directional focus, global Alt+Tab, and further window-management shortcuts.
+- [ ] Configurable automatic window/workspace rules and additional layout types.
+- [ ] More robust handling of size-constrained clients, transient dialogs, and uncommon window lifecycle transitions.
+- [ ] Optional decoration policies, including compositor-drawn controls where appropriate.
 
-### Gaming and display performance
+### Stage 2 — Desktop protocols and control plane
 
-- [ ] XWayland compatibility for X11 applications and Steam/Proton game workflows.
-- [ ] Relative pointer, cursor confinement/locking and reliable input capture.
-- [ ] Native DRM/KMS, udev, libinput and seat/session integration.
-- [ ] Display modes, refresh rates, scaling, multi-monitor hotplug and recovery.
-- [ ] Better frame scheduling, presentation feedback and latency measurement.
-- [ ] Variable refresh rate, explicit synchronization and direct scanout where supported.
-- [ ] Gamescope interoperability and realistic GPU/game compatibility testing.
+- [x] Layer-shell support for background, bottom, top, and overlay surfaces in the nested backend.
+- [x] Layer-shell exclusive zones, keyboard/pointer focus handling, and virtual output information.
+- [ ] Complete XDG popup placement, grabbing, repositioning, and transient-window behavior.
+- [ ] True fullscreen with correct stacking, focus, and restore semantics, separate from maximize.
+- [ ] Anwilite IPC API and events for workspaces, active windows, layouts, and configuration.
+- [ ] Clipboard and drag-and-drop hardening, primary selection, and text input/IME support.
+- [ ] Notifications, screencopy/screenshot paths, portals, and additional desktop protocols.
+- [ ] Output management beyond the current single virtual output.
 
-### Desktop experience and distribution
+### Stage 3 — Desktop shell and experience
 
-- [ ] Refined Octlitch themes, launcher, panel and coherent application styling.
-- [ ] Desktop controls for volume, power, network, Bluetooth and notifications.
-- [ ] Explore a dedicated programmable shell, including Quickshell/QML, without coupling it tightly to window-management internals.
-- [ ] Repeatable CI, packaging, documentation and supported configuration presets.
-- [ ] A standalone login-session entry and packaged integration for Octlitch Linux.
-- [ ] Reliability, security and compatibility testing before any stable release.
+- [x] Working nested-development integration with Waybar, Swaybg, and Fuzzel.
+- [ ] Develop an Anwilite-specific Quickshell/QML desktop shell and visual identity.
+- [ ] Top bar with workspace indicators and active-window information.
+- [ ] Keyboard-driven app launcher and power/session menu as part of the finished shell.
+- [ ] Notifications, notification history, system tray, and quick settings.
+- [ ] Volume, brightness, battery/power, network, and Bluetooth controls where supported.
+- [ ] Cohesive themes, backgrounds, animations, and Octlitch Linux integration.
+
+Waybar, Swaybg, and Fuzzel are the current working development components. Quickshell/QML remains a planned shell direction; it is not implemented yet.
+
+### Stage 4 — Gaming and hardware
+
+- [ ] XWayland support for X11 applications and Steam/Proton game workflows.
+- [ ] Relative pointer motion, cursor confinement/locking, and reliable game input capture.
+- [ ] Native DRM/KMS, udev, libinput, seat/session management, and GPU output.
+- [ ] Multiple monitors, refresh rates, display modes, scaling, and hotplug handling.
+- [ ] Frame scheduling, presentation feedback, synchronization, and measured input-to-display latency.
+- [ ] Variable refresh rate and direct scanout where supported, with compositing fallbacks.
+- [ ] Gamescope interoperability and practical game compatibility testing.
+- [ ] Hardware validation across GPU vendors, suspend/resume, and error recovery.
+
+### Stage 5 — Distribution and release engineering
+
+- [ ] Repeatable builds, automated tests, CI, and packaging workflows.
+- [ ] Octlitch Linux packages and a dedicated Anwilite login/session entry.
+- [ ] Default compositor and desktop-shell configurations, with a fallback desktop/session option.
+- [ ] Documentation, troubleshooting guides, bug templates, and a compatibility matrix.
+- [ ] Security review, stress testing, and reproducible release artifacts.
 
 ## Design principles
 
