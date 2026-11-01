@@ -1,332 +1,269 @@
 # Anwilite
 
-**WORK IN PROGRESS: A custom Wayland compositor and hybrid window manager for [Octlitch Linux](https://octlitch.com).**
+**A Rust Wayland compositor and hybrid window manager for [Octlitch Linux](https://octlitch.com).**
 
-> **Project status: experimental, pre-alpha.** The nested compositor, floating-window workflows, and per-workspace automatic tiling are working and have been regression-tested. Native DRM/KMS, a complete desktop shell, XWayland, and several essential Wayland protocols are still planned. Anwilite is not ready to replace a daily-driver desktop session.
+> **Status: experimental / pre-alpha.** Anwilite runs as a nested Wayland compositor with working floating and tiled window management, configurable controls, and a basic desktop environment. It is not yet a standalone login session or a replacement for a production desktop, and gaming compatibility is still under development.
 
-Anwilite is a Wayland compositor written in **Rust**, built on **[Smithay](https://github.com/Smithay/smithay)** (currently developed against Smithay 0.7). Its goal is to combine:
+Anwilite is built with [Smithay](https://github.com/Smithay/smithay) (currently Smithay 0.7), Rust, Calloop, and OpenGL ES. It aims to provide a responsive, keyboard-driven desktop with flexible window management, a cohesive Octlitch visual identity, and a solid foundation for Linux gaming.
 
-- **Hyprland-inspired flexibility:** customizable window management, gaps, keyboard-driven layouts, and eventually smooth transitions and hybrid tiling.
-- **Omarchy-inspired workflow:** thoughtful defaults, a cohesive visual identity, and fast keyboard-centric navigation.
-- **Windows-inspired productivity:** recognizable shortcuts for snapping, maximizing, restoring, and moving windows between desktops.
-- **Gaming-first priorities:** eventual XWayland/Steam/Proton compatibility, true fullscreen, relative pointer and pointer confinement/locking, responsive input, efficient frame scheduling, and native GPU output.
-- **A separate, customizable shell:** panels, widgets, launcher, and system controls implemented with **[Quickshell](https://quickshell.org/)** and QML rather than embedded into the compositor's window-management code.
+**Anwilite** is the compositor and window manager. **Octlitch Linux** is the distribution it is being developed for. The projects are related but independently maintainable.
 
-**Anwilite** is the compositor/window manager. **Octlitch Linux** is the operating-system distribution it is being developed for. These are separate projects and should remain independently maintainable.
+## Project status
 
-## At a glance
-
-| Area | Current state |
+| Feature | Status |
 | --- | --- |
-| Nested Wayland compositor on Fedora/KDE | ✅ Working |
-| Smithay XDG toplevel windows; keyboard and mouse input | ✅ Working |
-| Floating windows, click-to-focus/raise, drag, and eight-direction resize | ✅ Working and tested |
-| Maximize/restore and Windows-style half-screen snapping | ✅ Working and tested |
-| Ten workspaces, move-and-follow, per-workspace focus history | ✅ Working and tested |
-| Per-workspace floating/automatic-tiling modes | ✅ Working and tested |
-| Master-and-stack tiling, automatic reflow on window changes | ✅ Working and tested |
-| Per-workspace adjustable master width (20–80%, 5% steps) | ✅ Working and tested |
-| Keyboard focus navigation, tile swapping, promote-to-master | ✅ Working and tested |
-| Tiled-window minimize/restore and maximize/restore | ✅ Working and tested |
-| Original floating geometry restored after disabling tiling | ✅ Working and tested |
-| Nested output resize, event-driven redraws, damage tracking | ✅ Working and tested |
-| Native DRM/KMS + libinput session | 📋 Planned |
-| True fullscreen and gaming input protocols | 📋 Planned |
-| XWayland | 📋 Planned |
-| Layer shell, Quickshell integration, compositor IPC | 📋 Planned |
-| Multi-monitor/output management | 📋 Planned |
+| Nested Wayland compositor using Winit and GLES | Working |
+| XDG toplevel windows, keyboard and pointer input | Working |
+| Floating windows, dragging, interactive resizing, click-to-focus | Working |
+| Ten workspaces, move-and-follow, workspace-local focus history | Working |
+| Per-workspace floating or automatic tiling | Working |
+| Master-and-stack tiling, gaps, adjustable ratios, tile navigation and swapping | Working |
+| Snapping, maximizing, minimizing and restoring windows | Working |
+| Focus borders and configurable window appearance | Working |
+| TOML configuration, configurable application commands and keybindings | Working |
+| Show desktop and application-launcher shortcuts | Working |
+| Layer-shell surfaces, output information and layer input handling | Working in the nested backend |
+| Waybar, Swaybg and Fuzzel integration | Working in the development session |
+| Exclusive work areas for panels and docks | Implemented; manually tested with Waybar |
+| Output resizing, damage tracking and redraw-on-demand | Working in the nested backend |
+| True fullscreen distinct from maximize | Planned |
+| Relative pointer input and pointer locking/confinement | Planned |
+| XWayland, Steam and Proton workflows | Planned |
+| Native DRM/KMS, libinput and independent login session | Planned |
+| Multi-monitor management, variable refresh rate and direct scanout | Planned |
 
-## Current user experience
+These results describe the current nested development environment. They are not a claim of broad hardware compatibility or finished production-quality behavior.
 
-Anwilite currently runs **nested inside a host Wayland desktop** via Smithay's Winit/OpenGL ES renderer. The development environment has been **Fedora 44 in VirtualBox with KDE Plasma Wayland**. Weston Terminal clients can be opened inside the Anwilite output, floated, snapped, or automatically tiled. Each of the ten workspaces can independently use floating or tiling mode.
+## Features
 
-### Keyboard shortcuts
+### Floating and tiled windows
 
-**Workspaces**
+Each of the ten workspaces can independently use floating or automatic master-and-stack tiling.
+
+- **Floating:** drag, resize from window edges or corners, raise on click, snap to either half of the screen, maximize, restore, and minimize.
+- **Tiled:** one window takes the usable area, two windows form master and stack columns, and additional windows stack vertically beside the master.
+- **Configurable layout:** independent outer and inner gaps, per-workspace master-width overrides, and a configurable default master ratio. Master ratios can be adjusted between 20% and 80%.
+- **Window ordering:** navigate between tiles, swap adjacent tiles, or promote a window to the master position without losing its original floating geometry.
+- **Lifecycle handling:** recalculate placements when windows are opened, closed, minimized, restored, transferred between workspaces, or when the output changes size.
+
+Tiling also checks client-reported size constraints. When a layout cannot accommodate its windows, Anwilite preserves the windows rather than deliberately forcing them into overlapping tile slots.
+
+### Focus and window appearance
+
+Anwilite draws active-window indicators with configurable colors, thickness, and spacing. Window focus follows the compositor's visible-window and layer-shell rules. Tiled and snapped windows use placement-aware clipping and borders.
+
+Applications can draw their own window decorations. A client may choose to hide its titlebar buttons while maximized; Anwilite does not yet provide a complete compositor-drawn titlebar and button system.
+
+### Panels, wallpaper and launcher
+
+The development desktop currently uses:
+
+- **Waybar** for a panel and clock.
+- **Swaybg** for the background.
+- **Fuzzel** as a keyboard-driven application launcher.
+
+Anwilite supports `zwlr_layer_shell_v1` surfaces with the appropriate background, bottom, top and overlay stacking, as well as layer keyboard/pointer interactions. The virtual output is advertised as `ANWILITE-1` and includes XDG logical-output information for panel clients.
+
+Panels can request **exclusive zones**. For example, a 36-pixel top Waybar on a 1280 × 800 output reserves the work area `(0, 36)` with size `1280 × 764`. Maximized, snapped and tiled windows use the remaining work area. If the panel exits, its reserved space is released; when it returns, window placement is recalculated. Background layers still cover the full output.
+
+This is distinct from **true fullscreen**, which is a future feature intended to let games occupy the entire output independently of ordinary maximization.
+
+### Configuration
+
+The main configuration is located at:
+
+```text
+~/.config/anwilite/config.toml
+```
+
+It provides settings for tiling, gaps, master ratios, borders, application launch commands and keyboard bindings. Anwilite checks for configuration changes during the session and applies supported changes after validation. Some settings or active window transitions may require a restart or a later retry.
+
+Keybindings are user-editable through `[[keybindings]]` entries. A fully specified keybinding list is authoritative: removing an entry removes that binding rather than silently restoring it. Reserved recovery bindings remain available for reloading configuration.
+
+Waybar is configured separately through `~/.config/anwilite/waybar.jsonc` and `~/.config/anwilite/waybar.css`. For a panel that reserves its space, set `"exclusive": true` in the Waybar configuration.
+
+## Keyboard shortcuts
+
+The following are the familiar bindings used in the development setup. **Your `config.toml` is authoritative** if you have customized the keybinding list.
 
 | Shortcut | Action |
 | --- | --- |
 | `Super + 1` … `Super + 9` | Switch to workspaces 1–9 |
 | `Super + 0` | Switch to workspace 10 |
-| `Super + Shift + 1` … `Super + Shift + 9` | Move the focused window to workspace 1–9 and follow it |
-| `Super + Shift + 0` | Move the focused window to workspace 10 and follow it |
+| `Super + Shift + 1` … `Super + Shift + 0` | Move the focused window to a workspace and follow it |
+| `Super + Shift + T` | Toggle tiling for the current workspace |
+| `Super + H` / `Super + J` | Decrease / increase the master ratio |
+| `Super + R` | Reset the current workspace's master ratio |
+| `Super + Shift + H` / `Super + Shift + J` | Focus previous / next tile |
+| `Super + Shift + Left` / `Super + Shift + Right` | Swap with previous / next tile |
+| `Super + Shift + P` | Promote the focused tile to master |
+| `Super + Left` / `Super + Right` | Snap a floating window to either half |
+| `Super + Up` / `Super + Down` | Maximize / restore |
+| `Super + M` / `Super + Shift + M` | Minimize / restore most recently minimized window |
+| `Super + Return` | Launch the configured terminal |
+| `Super + E` | Launch the configured file manager |
+| `Super + Space` | Open the configured application launcher |
+| `Super + D` | Show / restore the desktop on the current workspace |
 
-**Window placement and tiling**
+In a nested session, the **host compositor may intercept shortcuts** before Anwilite receives them. The development keymap also supports configurable `Ctrl + Alt` alternatives for many `Super` bindings. Check the actual configured shortcuts rather than assuming the host will forward every key combination.
 
-| Shortcut | Action |
-| --- | --- |
-| `Super + Shift + T` | Toggle floating/tiling mode for the active workspace |
-| `Super + H` | Narrow the tiled master column by 5% |
-| `Super + J` | Widen the tiled master column by 5% |
-| `Super + R` | Reset the tiled master column to 50% |
-| `Super + Shift + H` | Focus the previous visible tile (wraps around) |
-| `Super + Shift + J` | Focus the next visible tile (wraps around) |
-| `Super + Shift + Left` | Swap the focused tile with the previous visible tile |
-| `Super + Shift + Right` | Swap the focused tile with the next visible tile |
-| `Super + Shift + P` | Promote the focused stack tile directly to master |
-| `Super + M` | Minimize the focused window |
-| `Super + Shift + M` | Restore the most recently minimized window on the active workspace |
-| `Super + Left` | Snap the focused floating window to the left half |
-| `Super + Right` | Snap the focused floating window to the right half |
-| `Super + Up` | Maximize the focused window |
-| `Super + Down` | Restore the focused window from maximized/snapped placement |
+## Build and run
 
-**Pointer interactions**
+### Requirements
 
-| Input | Action |
-| --- | --- |
-| Left-click | Focus a window; floating windows also rise to the front, tiled windows keep their order |
-| Drag a window titlebar | Move a floating window, or restore and drag a snapped window |
-| Middle-button drag | Move a floating window, or unsnap and move a snapped window |
-| Window resize handles | Resize floating windows from all eight edges/corners |
+- A Linux system with an existing Wayland desktop session for the Winit nested backend.
+- A Rust toolchain with Cargo, rustfmt and Clippy.
+- The system libraries required by the dependency versions and feature flags in `Cargo.toml`.
+- Optional development clients such as `weston-terminal`.
+- For the desktop-component supervisor: `waybar`, `swaybg`, `wayland-info` and the corresponding configuration files.
 
-**Nested-development fallback:** KDE or the host compositor may intercept `Super` combinations before Anwilite sees them. Anwilite also accepts `Ctrl + Alt` in place of `Super` for its shortcuts (and retains `Shift` when required). In the current KDE/VirtualBox development setup, `Ctrl + Alt + Shift + Left/Right` was successfully tested for tile swapping, and `Ctrl + Alt + Shift + P` for master promotion. Some corresponding `Super` combinations are reserved by the host. In particular, **`Super + L` is not an Anwilite master-ratio shortcut** because it locks the host desktop; use `Super + J` or `Ctrl + Alt + J` to widen the master column. This is a development keymap, not a configurable final binding system.
+The nested implementation has been developed and tested under Fedora/KDE Wayland, including a VirtualBox development environment. Dependencies and behavior may differ on other distributions or hardware.
 
-### Automatic master-and-stack tiling
+### Build and validate
 
-Tiling is **opt-in per workspace**, toggled with `Super + Shift + T`:
+```bash
+cargo fmt --check
+cargo check
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+```
 
-- **One visible window:** fills the usable output, respecting outer gaps.
-- **Two visible windows:** one master column on the left and one stack window on the right.
-- **Three or more visible windows:** one left master and vertically stacked windows in the right column.
-- **Adjustable master width:** each workspace starts at **50%**; `Super + H/J` adjusts it in **5%** steps, clamped to **20–80%**. `Super + R` resets to 50%.
-- **Workspace independence:** the mode, selected ratio, and tile order are maintained separately for the current compositor session. No configuration file or persistence across compositor restarts is implemented yet.
-- **Dynamic reflow:** creating, closing, minimizing, restoring, or transferring windows recalculates the relevant tiled workspaces. Resizing the nested output also recalculates tile geometry.
-- **Navigation versus placement:** keyboard focus navigation does **not** rearrange tiles; swapping and promoting to master **do** change tile order while preserving focus on the same client.
-- **Maximized tiles:** a maximized tile stays zoomed until restored; its underlying tile position reflects layout updates. Tile swaps and promotion are blocked while a tile is maximized.
-- **Returning to floating:** disabling tiling restores windows' pre-tiling floating geometry instead of keeping tiled sizes.
+Run the compositor nested inside your existing Wayland session:
 
-The compositor uses each `ManagedWindow`'s position in `WindowManager.windows` to determine master/stack assignment, while `src/layout.rs` computes the rectangles. Swapping exchanges whole window records, preserving each client's saved floating state rather than assigning that state to a different window.
+```bash
+cargo run --release
+```
 
-### Floating, snapping, and workspaces
+The development compositor uses the Wayland socket `octlitch-0` and output name `ANWILITE-1`. From a separate host terminal, an additional test client can be started with:
 
-**Snapping details:** The normal floating geometry is saved before placement. A window can transition from floating → left snap → right snap → maximized → restored without losing its original geometry. Snapped windows stay aligned when the nested output is resized. Dragging a snapped titlebar requests the original floating size, waits for the client to commit it, then reanchors the cursor relative to the restored geometry to avoid a visible jump.
+```bash
+env -u WAYLAND_SOCKET WAYLAND_DISPLAY=octlitch-0 weston-terminal
+```
 
-**Ten workspaces:** Newly created windows belong to the active workspace. Switching workspaces updates rendering, hit-testing and keyboard-focus eligibility; move-and-follow changes a focused window's workspace and reflows tiled source/destination workspaces as needed. The window manager remembers the most recently focused surface per workspace and falls back to another visible window when necessary.
+The socket name is currently retained for compatibility with development scripts. Do not assume it has been renamed to match the compositor project.
 
-### Window gaps
+### Desktop development session
 
-The shared snapping/tiling layout engine uses independent **outer** gaps (between windows and the output edge) and **inner** gaps (between adjacent windows). The current `DEFAULT_SNAP_GAPS` in `src/layout.rs` is **`outer: 6`, `inner: 6`** logical units. These are compile-time constants; runtime configuration remains planned. Tiling master ratios are adjustable at runtime but the gap sizes are not.
+If the nested-session and component-supervisor scripts are installed in `scripts/`, first build the release binary, then start:
+
+```bash
+cargo build --release
+./scripts/anwilite-nested-session \
+  --private-bus \
+  -- ./scripts/anwilite-session-components
+```
+
+This starts Anwilite and, once its virtual output is ready, launches Waybar and Swaybg against `octlitch-0`. To preserve the existing host session bus for development, use `--shared-bus` instead.
+
+**Important:** The private-bus option is a development aid. It does **not** create a standalone PAM/logind login session, a security sandbox, or a production-ready desktop environment. Start it from a terminal connected to the **host** Wayland display, not from a shell targeting `octlitch-0`.
+
+The supervisor writes diagnostic logs under:
+
+```text
+~/.cache/anwilite/compositor.log
+~/.cache/anwilite/waybar.log
+~/.cache/anwilite/swaybg.log
+```
+
+Desktop application activation can still interact with processes in the host session. In particular, applications that reuse an existing instance or rely on D-Bus activation may open on the host desktop. Development launch helpers can reduce some of these issues, but they do not replace a proper independent session.
 
 ## Architecture
 
 ```text
-                              Octlitch Linux
-                                    |
-                          Anwilite compositor
-                                 (Rust)
-                                    |
-              +---------------------+--------------------+
-              |                     |                    |
-      Smithay / Wayland        WindowManager       Layout / Workspaces
-      XDG protocol state       placement, focus,     snapping, tiling,
-      surface commits          drag, resize, swap    workspace modes
-              |                     |                    |
-              +---------------------+--------------------+
-                                    |
-                     Winit + GLES renderer (today)
-                    DRM/KMS + GPU backend (planned)
-                                    |
-                        Client Wayland surfaces
-                       Weston Terminal (tested)
-                       Other apps / games (goal)
-
-             Future: Quickshell/QML desktop shell
-                  <--> layer shell + Anwilite IPC
+Anwilite (Rust / Smithay)
+├── Wayland protocols
+│   ├── Compositor, XDG shell, seats, data device
+│   ├── Virtual output and XDG output information
+│   └── Layer shell (panels, overlays, backgrounds)
+├── Window management
+│   ├── Floating, snapping, maximize/minimize
+│   ├── Workspaces, focus, tiling and layout constraints
+│   └── Exclusive work areas and focus indicators
+├── Configuration and application launching
+├── Calloop event loop and Wayland socket
+└── Winit + OpenGL ES (current nested backend)
+    └── Native DRM/KMS and libinput (planned)
 ```
 
-### Source overview
+The main Rust modules include:
 
-```text
-.
-├── Cargo.toml                # Rust package and dependency declarations
-├── Cargo.lock                # Locked binary dependencies; commit this file
-├── README.md                 # Project status, shortcuts, build, roadmap
-├── .gitignore                # Build output, local backups, secrets
-└── src/
-    ├── main.rs              # App state, Smithay protocol handlers,
-    │                        # input, Calloop event loop, rendering
-    ├── window.rs            # ManagedWindow, WindowManager, geometry,
-    │                        # tiling/reflow, drag/resize, focus, swapping
-    ├── workspace.rs         # Ten-workspace state and switching
-    └── layout.rs            # Pure snapping/tiling geometry and unit tests
-```
-
-The source tree above describes the currently developed files. It may expand as we extract modules from `main.rs` and add backends, a configuration system, IPC, and protocol implementations.
+| File | Responsibility |
+| --- | --- |
+| `src/main.rs` | Compositor state, protocol handlers, input, event loop and rendering |
+| `src/window.rs` | Managed windows, placement, focus, tiling and interactive operations |
+| `src/layout.rs` | Testable snapping, tile geometry, gaps and placement calculations |
+| `src/workspace.rs` | Workspace state and switching |
+| `src/config.rs` | Configuration parsing, validation and reload |
+| `src/keybindings.rs` | Keyboard shortcuts and command mapping |
+| `src/appearance.rs` | Focus-border appearance and validation |
 
 ### Rendering and event loop
 
-Current nested-backend implementation includes:
+Anwilite uses Calloop to handle client requests, input, configuration checks and resize events. Its Winit/GLES backend uses Smithay's output damage tracking, buffer-age information, and frame callbacks to avoid unnecessary submissions when the output has not changed.
 
-1. A Wayland listening socket and client request dispatch through Smithay.
-2. A **Calloop** event loop that wakes for Wayland activity, Winit input/redraw events, and pending resize work rather than rendering continuously at idle.
-3. Smithay `OutputDamageTracker` to determine which screen regions actually need updating.
-4. Buffer-age-aware rendering and damage-region submission when there is damage; presentation is skipped when there is none.
-5. Frame callbacks to eligible surfaces on the active workspace.
-6. Reconfiguration and damage-tracker reset when the nested output is resized.
-7. A short configure interval during interactive resizing to avoid unnecessary resize churn.
+Output-resize handling updates the advertised virtual output, layer geometry, placed-window layouts and rendering damage tracking. Existing layer clients are reconfigured to follow the nested window's dimensions.
 
-Early **VirtualBox** experiments measured approximately **0% sampled idle CPU** after the event-driven scheduler, versus roughly **3.7% in an earlier polling implementation**. These are preliminary development observations, **not** a rigorous benchmark, a promise of zero CPU usage, or a measurement of native hardware performance. Frame-submit diagnostic counters similarly are not a universal FPS measurement.
-
-### Wayland window sizing
-
-The compositor does not directly resize an application's buffer. It calculates desired geometry, sends an XDG toplevel configure, and waits for the client to acknowledge/commit a new buffer. For tiling, maximize, snap, restore, and unsnap transitions, position corrections account for client-reported window geometry and decoration offsets. This distinction is important for avoiding flicker, jumps, and incorrect anchoring.
-
-## Build and run (development)
-
-### Requirements
-
-- Linux host with a working Wayland graphical session; the project currently uses the Winit nested backend.
-- A working Rust toolchain (`cargo`, `rustc`, `rustfmt`).
-- System development libraries required by the **exact versions and features in `Cargo.toml`**, including dependencies of Smithay/Winit/GLES. Package names vary by Fedora release and enabled features; consult the first missing-library error if the environment is not already set up.
-- `weston-terminal` for the current test client (usually from the distribution's Weston packages).
-
-This README describes the **existing development workflow**, not a complete one-command installation procedure. Native install packaging and dependency documentation will be added later.
-
-### Compile and test
-
-```bash
-cargo fmt --all -- --check
-cargo check
-cargo test layout::tests
-cargo test
-cargo run --release
-```
-
-Running `cargo run --release` opens the nested output. In the current source, Anwilite automatically attempts to launch `weston-terminal` connected to its Wayland socket. The Lesson 28 development session reported **32 passing unit tests** plus successful final advanced-tiling integration checks; rerun `cargo test` against your own checkout after merging.
-
-**Socket naming note:** The original development code uses `octlitch-0` as its Wayland socket name. We are renaming the compositor project to **Anwilite**, but the socket may retain that legacy name until the runtime naming cleanup. Verify `ListeningSocketSource::with_name(...)` in `src/main.rs` rather than assuming the socket name.
-
-To launch another test client from a separate host terminal, using the current legacy socket:
-
-```bash
-WAYLAND_DISPLAY=octlitch-0 weston-terminal
-```
-
-When the socket is deliberately renamed to `anwilite-0`, update this command, the client's environment variable in `src/main.rs`, and any local scripts together.
-
-### Development tips
-
-- Run and test one change at a time; preserve a working Git commit before altering window-placement logic.
-- Keep **pure geometry** in `src/layout.rs`, with unit tests for odd output sizes, gaps, ratios, tile counts, and edge cases.
-- Test input focus, window ordering, pointer hit-testing, resizing, and rendering together whenever changing tiling, workspaces, or the window lifecycle.
-- Verify both keyboard shortcuts and application-requested XDG actions.
-- Before reporting a rendering regression, test a stationary window, an actively updating terminal, drag/resize, workspace switching, and output resizing.
-- Do not confuse terminal OSC warnings with Wayland protocol or compositor-rendering faults.
-
-## Milestone history
-
-These are **completed and tested development milestones**, grouped by feature area rather than reconstructed from Git commits.
-
-### Compositor and rendering
-
-- Built a nested Rust/Smithay compositor using Winit and GLES, with XDG toplevel clients, pointer input, and keyboard input.
-- Added event-driven Calloop scheduling, damage tracking, buffer-age-aware submission, frame callbacks, redraw-on-demand, and resize diagnostics.
-
-### Floating windows and snapping
-
-- Added click-to-focus, raising, dragging, and **eight-direction interactive resizing** (all 8 directional checks passed).
-- Implemented XDG maximize/restore with saved position and size and output-resize handling (7/7 checks passed).
-- Added left/right half-screen snapping, with pure geometry tests (4/4) and keyboard/restore behavior checks (9/9).
-- Introduced independent inner and outer gaps (7/7 geometry tests and 8/8 behavior checks).
-- Implemented drag-to-unsnap with asynchronous client resizing and stable pointer anchoring (10/10 checks passed).
-
-### Workspaces and keyboard focus
-
-- Added ten workspaces, workspace-local window visibility and hit-testing, and move-and-follow shortcuts.
-- Added per-workspace focus history, fallback focus after a window closes or becomes hidden, and focus recovery.
-
-### Automatic and advanced tiling 
-
-- Implemented automatic **master-and-stack tiling** for one or more visible windows, with independent floating/tiled modes per workspace.
-- Added layout reflow when windows open, close, move between workspaces, minimize, or restore, and when the nested output resizes.
-- Added independent **master-width ratios per workspace** (20–80%, adjusted in 5% steps; reset to 50%).
-- Added keyboard navigation between visible tiles without changing their order.
-- Added adjacent tile swaps and **promote focused window to master**, preserving focus and original floating geometry.
-- Passed all integration tests, covering promotion, swapping/navigation, ratio adjustments, minimize/restore, workspace isolation, floating restoration, maximize/restore, and keyboard focus.
+These optimizations have been exercised in the development environment, **not** benchmarked as evidence of gaming performance on native hardware. Frame-submit counters are diagnostic and do not by themselves measure end-to-end latency or monitor presentation rate.
 
 ## Roadmap
 
-The sequence below expresses **planned priorities**, not guaranteed delivery dates or implemented functionality.
+The roadmap describes intended capabilities, not committed release dates. Features may change as the standalone compositor architecture develops.
 
-### Stage 1 — Hybrid window manager (core tiling implemented)
+### Desktop and application compatibility
 
-- [x] Floating windows, moving, resizing, maximize/restore.
-- [x] Ten workspaces, workspace switching, moving windows, focus history.
-- [x] Windows-style left/right snapping and original-geometry restoration.
-- [x] Compile-time-configurable snapping/tiling gaps.
-- [x] Drag to unsnap without jumping.
-- [x] Automatic tiling for one, two, and three or more windows, with reflow as clients change.
-- [x] Per-workspace **floating / tiling** modes.
-- [x] Independent adjustable master-width ratios (20–80%) for tiled workspaces.
-- [x] Keyboard cycling between tiles without reordering them.
-- [x] Adjacent tile swapping and promote-focused-tile-to-master.
-- [x] Tiled-window minimize/restore, maximize/restore, workspace transfers, and floating restoration.
-- [ ] Visible active-window focus indicator / focus border (planned next).
-- [ ] Additional Windows-style placements, including quarter snapping and sensible keyboard transitions.
-- [ ] Spatial directional focus, global Alt+Tab, close-window and launcher shortcuts.
-- [ ] Configuration files for gaps, layouts, bindings, appearance, and workspace rules.
-- [ ] Robust handling of size-constrained clients, popups, transient dialogs, and unsnap timing.
+- [x] Floating windows, snapping, workspaces and automatic tiling.
+- [x] Configurable focus borders, gaps, master ratios, keybindings and application commands.
+- [x] Waybar, Swaybg and Fuzzel support in a nested desktop session.
+- [x] Layer-shell exclusive zones respected by placed application windows.
+- [ ] True fullscreen handling, separate from maximize, with correct focus and stacking.
+- [ ] Complete XDG popup handling, interactive grabs and transient-window behavior.
+- [ ] More complete clipboard/drag-and-drop, primary selection, input-method and text-input support.
+- [ ] Notifications, screencopy, portals and compositor IPC for external shell tools.
+- [ ] Optional window-decoration policies and additional layout modes.
 
-### Stage 2 — Desktop protocols and control plane
+### Gaming and display performance
 
-- [ ] Real XDG popup placement, grabbing, repositioning, and focus behavior (current popup hooks are placeholders).
-- [ ] Fullscreen protocol and proper fullscreen stacking/focus semantics, separate from maximize.
-- [ ] Layer-shell support for desktop panels, overlays, and widgets.
-- [ ] Anwilite IPC API/events for workspaces, active window, layouts, focus, and configuration.
-- [ ] Clipboard/data-device hardening, primary selection, drag and drop, and text input/IME where needed.
-- [ ] Notifications, output information/management, screencopy/screenshot paths, and other shell protocols.
+- [ ] XWayland compatibility for X11 applications and Steam/Proton game workflows.
+- [ ] Relative pointer, cursor confinement/locking and reliable input capture.
+- [ ] Native DRM/KMS, udev, libinput and seat/session integration.
+- [ ] Display modes, refresh rates, scaling, multi-monitor hotplug and recovery.
+- [ ] Better frame scheduling, presentation feedback and latency measurement.
+- [ ] Variable refresh rate, explicit synchronization and direct scanout where supported.
+- [ ] Gamescope interoperability and realistic GPU/game compatibility testing.
 
-### Stage 3 — Quickshell desktop
+### Desktop experience and distribution
 
-- [ ] Anwilite's own **Quickshell/QML** configuration and visual identity.
-- [ ] Top bar with the ten-workspace indicator and active-window information.
-- [ ] Keyboard-driven app launcher and power/session menu.
-- [ ] Notifications, notification history, system tray and quick settings.
-- [ ] Volume, brightness, battery/power, network, and Bluetooth widgets where supported.
-- [ ] Theming, animation, backgrounds, and cohesive Octlitch Linux integration.
+- [ ] Refined Octlitch themes, launcher, panel and coherent application styling.
+- [ ] Desktop controls for volume, power, network, Bluetooth and notifications.
+- [ ] Explore a dedicated programmable shell, including Quickshell/QML, without coupling it tightly to window-management internals.
+- [ ] Repeatable CI, packaging, documentation and supported configuration presets.
+- [ ] A standalone login-session entry and packaged integration for Octlitch Linux.
+- [ ] Reliability, security and compatibility testing before any stable release.
 
-### Stage 4 — Gaming and hardware
+## Design principles
 
-- [ ] XWayland for X11 applications and games, including Steam/Proton workflows.
-- [ ] Relative pointer and pointer constraints/locking for games.
-- [ ] Native **DRM/KMS**, udev, libinput, seat/session management, and GPU output.
-- [ ] Multiple monitors, refresh rates, modes, scaling, and hotplug.
-- [ ] Frame scheduling/presentation feedback, VSync behavior, latency measurements.
-- [ ] Evaluate direct scanout when possible; preserve fallbacks when compositing is necessary.
-- [ ] Hardware testing across GPU vendors, suspend/resume, and failure/recovery cases.
+Anwilite is its own Rust/Smithay compositor, not a fork of another window manager or a theme layered over KDE. Its priorities are predictable window behavior, user-configurable workflows, responsive input, readable code and a consistent desktop identity.
 
-### Stage 5 — Distribution and release engineering
-
-- [ ] Repeatable build, test, CI, and packaging workflows.
-- [ ] Octlitch Linux packages and a dedicated login/session entry.
-- [ ] Default Anwilite and Quickshell configs, optional fallback desktop/session.
-- [ ] User documentation, troubleshooting, bug templates, compatibility matrix.
-- [ ] Security review, real-world stress testing, and reproducible release artifacts.
-
-## Philosophy and scope
-
-Anwilite is **not a fork of Hyprland** and not a theme applied to KDE. It is its own Rust/Smithay compositor, developed incrementally to understand Wayland concepts and make considered architecture choices. Hyprland, Omarchy, and Windows provide **workflow inspiration**, not code provenance or guarantees of feature parity.
-
-The current hybrid model lets users select floating or automatic master-and-stack tiling independently on each workspace. Longer term, configurable layouts could support a floating communication workspace, a tiled development workspace, and a fullscreen gaming workspace.
-
-Our engineering principles are to keep code readable; teach and document the state transitions; preserve a working checkpoint; isolate pure, testable layout math; avoid unnecessary idle rendering; and validate native hardware behavior before making performance or compatibility claims.
+The compositor should remain usable for everyday work while allowing games to request uninterrupted fullscreen presentation and appropriate input handling. Visual effects should not take priority over frame consistency, and claims about gaming compatibility or low latency will require testing on real hardware.
 
 ## Contributing
 
-This is an early-stage learning and development project. Discussions, reproducible bug reports, and design feedback are welcome; formal contribution guidelines and review processes have not been established yet. For bugs, include the Rust toolchain, distro/host compositor, GPU or VM backend, exact reproduction steps, and any relevant Smithay/Anwilite logs.
+Anwilite is under active early development. Reproducible bug reports, code review and design feedback are welcome. For technical issues, include your Rust version, Linux distribution, host compositor, GPU or virtual machine, steps to reproduce, and relevant Anwilite logs.
 
 ## License
 
-**Not selected yet.** No open-source license is implied by publishing source code. Choose and add a `LICENSE` file before inviting external reuse or contributions. Possible license families have different obligations and should be selected deliberately.
+**No license has been selected yet.** Publishing source code does not automatically grant permission to reuse or redistribute it. A `LICENSE` file should be added before inviting external code reuse or contributions under an open-source license.
 
 ## Related projects
 
-- **[Octlitch Linux](https://octlitch.com)** — the intended host Linux distribution.
-- **[Smithay](https://github.com/Smithay/smithay)** — Rust Wayland compositor building blocks.
-- **[Quickshell](https://quickshell.org/)** — planned QML desktop-shell framework.
-- **[Wayland](https://wayland.freedesktop.org/)** — compositor/client display and input protocol ecosystem.
+- [Octlitch Linux](https://octlitch.com) — the Linux distribution Anwilite is being developed for.
+- [Smithay](https://github.com/Smithay/smithay) — Rust compositor building blocks.
+- [Wayland](https://wayland.freedesktop.org/) — display and input protocol ecosystem.
+- [Waybar](https://github.com/Alexays/Waybar) — current development panel.
+- [Fuzzel](https://codeberg.org/dnkl/fuzzel) — current development launcher.
+- [Swaybg](https://github.com/swaywm/swaybg) — current development wallpaper/background tool.
 
 ---
 
-**Anwilite — a Wayland desktop built for Octlitch, one tested system at a time.**
+**Anwilite — building the Octlitch desktop from the compositor up.**
