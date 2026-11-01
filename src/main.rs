@@ -510,6 +510,7 @@ impl App {
     }
 
     fn focus_layer(&mut self, surface: WlSurface) {
+        self.windows.end_window_cycle();
         let Some(keyboard) = self.seat.get_keyboard() else {
             return;
         };
@@ -559,6 +560,7 @@ impl App {
     }
 
     fn focus_xdg_from_click(&mut self, surface: WlSurface, serial: Serial) {
+        self.windows.end_window_cycle();
         if self.focused_layer_is_exclusive() {
             return;
         }
@@ -932,6 +934,9 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                     state.needs_redraw = true;
                 }
                 WinitEvent::Focus(focused) => {
+                    if !focused {
+                        state.windows.end_window_cycle();
+                    }
                     let held_keys = keyboard.pressed_keys();
 
                     println!(
@@ -1003,6 +1008,13 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                             },
                         );
 
+                        // Releasing the initiating modifiers ends an Alt+Tab
+                        // session without changing the settled MRU history.
+                        let modifiers = keyboard.modifier_state();
+                        if !modifiers.alt && !modifiers.logo {
+                            state.windows.end_window_cycle();
+                        }
+
                         // Switch on key press, not on key release.
 
                         if event.state() == KeyState::Pressed
@@ -1010,6 +1022,9 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                         {
                             // Avoid switching while a mouse press is active.
                             if state.move_press.is_none() {
+                                if !matches!(command, WorkspaceCommand::CycleWindow(_)) {
+                                    state.windows.end_window_cycle();
+                                }
                                 let changed = match command {
                                     WorkspaceCommand::Minimize => {
                                         let focused = keyboard.current_focus();
@@ -1072,6 +1087,44 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                             false
                                         }
                                     }
+                                    WorkspaceCommand::FocusSpatial(direction) => {
+                                        let focused = keyboard.current_focus();
+                                        if let Some(next) = state
+                                            .windows
+                                            .spatial_surface(focused.as_ref(), direction)
+                                        {
+                                            state.windows.raise_focused_floating(&next);
+                                            keyboard.set_focus(
+                                                &mut state,
+                                                Some(next),
+                                                smithay::utils::SERIAL_COUNTER.next_serial(),
+                                            );
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    }
+
+                                    WorkspaceCommand::CycleWindow(direction) => {
+                                        let focused = keyboard.current_focus();
+                                        state
+                                            .windows
+                                            .cycle_global_window(focused.as_ref(), direction)
+                                            .is_some()
+                                    }
+
+                                    WorkspaceCommand::CloseWindow => {
+                                        if let Some(surface) =
+                                            keyboard.current_focus().as_ref().and_then(|focused| {
+                                                state.windows.toplevel_for_surface(focused)
+                                            })
+                                        {
+                                            // XDG close is a request, not a forced disconnect.
+                                            surface.send_close();
+                                        }
+                                        false
+                                    }
+
                                     WorkspaceCommand::SwapTile(direction) => {
                                         let focused = keyboard.current_focus();
                                         let output_size = state.output_size;
@@ -1192,6 +1245,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                             | WorkspaceCommand::ToggleTiling
                                             | WorkspaceCommand::Minimize
                                             | WorkspaceCommand::ToggleShowDesktop
+                                            | WorkspaceCommand::CycleWindow(_)
                                     ) {
                                         let focus = state.windows.focused_surface();
 

@@ -612,6 +612,36 @@ mod tests {
     }
 
     #[test]
+    fn quarter_snap_actions_load_from_toml_and_validate() {
+        let config = parse_config(
+            "[[keybindings]]\n\
+             key = \"Super+Ctrl+7\"\n\
+             action = \"snap_top_left\"\n\
+             [[keybindings]]\n\
+             key = \"Super+Ctrl+9\"\n\
+             action = \"snap_top_right\"\n",
+        )
+        .unwrap();
+
+        assert_ne!(config.keybindings, KeyBindings::default());
+        assert!(parse_config(
+            "[[keybindings]]\nkey = \"Super+Ctrl+7\"\naction = \"snap_top_left\"\nworkspace = 1\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn spatial_and_cycle_bindings_load_from_toml() {
+        let config = parse_config(
+            "[[keybindings]]\nkey = \"Super+Alt+Left\"\naction = \"focus_left\"\n\
+             [[keybindings]]\nkey = \"Alt+Tab\"\naction = \"cycle_windows\"\n\
+             [[keybindings]]\nkey = \"Super+Shift+Q\"\naction = \"close_window\"\n",
+        )
+        .unwrap();
+        assert_ne!(config.keybindings, KeyBindings::default());
+    }
+
+    #[test]
     fn invalid_keybinding_reload_keeps_previous_config() {
         let mut config = AnwiliteConfig::default();
 

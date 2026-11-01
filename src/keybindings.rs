@@ -1,5 +1,5 @@
 use crate::layout::SnapSide;
-use crate::window::TileFocusDirection;
+use crate::window::{SpatialDirection, TileFocusDirection, WindowCycleDirection};
 use crate::workspace::WORKSPACE_COUNT;
 use serde::Deserialize;
 use smithay::input::keyboard::{ModifiersState, keysyms};
@@ -16,6 +16,9 @@ pub enum WorkspaceCommand {
     AdjustMasterRatio(i8),
     ResetMasterRatio,
     FocusTile(TileFocusDirection),
+    FocusSpatial(SpatialDirection),
+    CycleWindow(WindowCycleDirection),
+    CloseWindow,
     SwapTile(TileFocusDirection),
     PromoteTile,
     Minimize,
@@ -37,7 +40,9 @@ struct Shortcut {
 }
 
 fn normalized_keysym(symbol: u32) -> u32 {
-    if (keysyms::KEY_A..=keysyms::KEY_Z).contains(&symbol) {
+    if symbol == keysyms::KEY_ISO_Left_Tab {
+        keysyms::KEY_Tab
+    } else if (keysyms::KEY_A..=keysyms::KEY_Z).contains(&symbol) {
         symbol + (keysyms::KEY_a - keysyms::KEY_A)
     } else {
         symbol
@@ -63,6 +68,7 @@ fn key_from_name(name: &str) -> Option<u32> {
         "up" => Some(keysyms::KEY_Up),
         "down" => Some(keysyms::KEY_Down),
         "space" => Some(keysyms::KEY_space),
+        "tab" => Some(keysyms::KEY_Tab),
         _ => None,
     }
 }
@@ -187,8 +193,19 @@ fn parse_action(spec: &BindingSpec) -> Result<WorkspaceCommand, String> {
         ("swap_previous_tile", None) => Ok(Command::SwapTile(TileFocusDirection::Previous)),
         ("swap_next_tile", None) => Ok(Command::SwapTile(TileFocusDirection::Next)),
         ("promote_tile", None) => Ok(Command::PromoteTile),
+        ("focus_left", None) => Ok(Command::FocusSpatial(SpatialDirection::Left)),
+        ("focus_right", None) => Ok(Command::FocusSpatial(SpatialDirection::Right)),
+        ("focus_up", None) => Ok(Command::FocusSpatial(SpatialDirection::Up)),
+        ("focus_down", None) => Ok(Command::FocusSpatial(SpatialDirection::Down)),
+        ("cycle_windows", None) => Ok(Command::CycleWindow(WindowCycleDirection::Next)),
+        ("cycle_windows_reverse", None) => Ok(Command::CycleWindow(WindowCycleDirection::Previous)),
+        ("close_window", None) => Ok(Command::CloseWindow),
         ("snap_left", None) => Ok(Command::Snap(SnapSide::Left)),
         ("snap_right", None) => Ok(Command::Snap(SnapSide::Right)),
+        ("snap_top_left", None) => Ok(Command::Snap(SnapSide::TopLeft)),
+        ("snap_top_right", None) => Ok(Command::Snap(SnapSide::TopRight)),
+        ("snap_bottom_left", None) => Ok(Command::Snap(SnapSide::BottomLeft)),
+        ("snap_bottom_right", None) => Ok(Command::Snap(SnapSide::BottomRight)),
 
         ("launch_menu", None) => Ok(Command::LaunchMenu),
         ("toggle_show_desktop", None) => Ok(Command::ToggleShowDesktop),
@@ -239,6 +256,7 @@ impl Default for KeyBindings {
             ("E", Command::LaunchFileManager),
             ("Space", Command::LaunchMenu),
             ("D", Command::ToggleShowDesktop),
+            ("Shift+Q", Command::CloseWindow),
         ];
 
         for (key, action) in defaults {
@@ -248,6 +266,40 @@ impl Default for KeyBindings {
 
                 bindings.push(Binding { shortcut, action });
             }
+        }
+
+        // Directional focus is separate from snapping and tile swapping.
+        for (key, direction, fallback) in [
+            ("Left", SpatialDirection::Left, "A"),
+            ("Right", SpatialDirection::Right, "D"),
+            ("Up", SpatialDirection::Up, "W"),
+            ("Down", SpatialDirection::Down, "S"),
+        ] {
+            for shortcut_name in [
+                format!("Super+Alt+{key}"),
+                format!("Ctrl+Alt+Shift+{fallback}"),
+            ] {
+                bindings.push(Binding {
+                    shortcut: Shortcut::parse(&shortcut_name).expect("valid spatial shortcut"),
+                    action: Command::FocusSpatial(direction),
+                });
+            }
+        }
+
+        // Alt+Tab cycles through the global focus history. Super+Tab and
+        // Ctrl+Alt+Tab are useful fallbacks in nested sessions.
+        for (key, direction) in [
+            ("Alt+Tab", WindowCycleDirection::Next),
+            ("Alt+Shift+Tab", WindowCycleDirection::Previous),
+            ("Super+Tab", WindowCycleDirection::Next),
+            ("Super+Shift+Tab", WindowCycleDirection::Previous),
+            ("Ctrl+Alt+Tab", WindowCycleDirection::Next),
+            ("Ctrl+Alt+Shift+Tab", WindowCycleDirection::Previous),
+        ] {
+            bindings.push(Binding {
+                shortcut: Shortcut::parse(key).expect("valid window cycle shortcut"),
+                action: Command::CycleWindow(direction),
+            });
         }
 
         // Workspace shortcuts 1..9 and 0 (workspace 10).
@@ -505,6 +557,113 @@ mod tests {
             bindings.action_for(Shortcut::parse("Super+Shift+C").unwrap()),
             Some(WorkspaceCommand::ReloadConfig)
         );
+    }
+
+    #[test]
+    fn quarter_snap_actions_can_be_bound_explicitly() {
+        let placements = [
+            ("Super+Ctrl+7", "snap_top_left", SnapSide::TopLeft),
+            ("Super+Ctrl+9", "snap_top_right", SnapSide::TopRight),
+            ("Super+Ctrl+1", "snap_bottom_left", SnapSide::BottomLeft),
+            ("Super+Ctrl+3", "snap_bottom_right", SnapSide::BottomRight),
+        ];
+
+        let specs: Vec<_> = placements
+            .iter()
+            .map(|(key, action, _)| spec(key, action, None))
+            .collect();
+        let bindings = KeyBindings::from_explicit(&specs).unwrap();
+
+        for (key, _, side) in placements {
+            assert_eq!(
+                bindings.action_for(Shortcut::parse(key).unwrap()),
+                Some(WorkspaceCommand::Snap(side))
+            );
+        }
+
+        // Explicit bindings must not silently enable unrelated defaults.
+        assert_eq!(
+            bindings.action_for(Shortcut::parse("Super+Left").unwrap()),
+            None
+        );
+        assert_eq!(
+            bindings.action_for(Shortcut::parse("Super+Return").unwrap()),
+            None
+        );
+
+        // No implicit quarter bindings were added to the built-in defaults.
+        assert_eq!(
+            KeyBindings::default().action_for(Shortcut::parse("Super+Ctrl+7").unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn quarter_snap_actions_reject_workspace_numbers() {
+        for action in [
+            "snap_top_left",
+            "snap_top_right",
+            "snap_bottom_left",
+            "snap_bottom_right",
+        ] {
+            assert!(KeyBindings::from_explicit(&[spec("Super+Ctrl+7", action, Some(1))]).is_err());
+        }
+    }
+
+    #[test]
+    fn navigation_commands_parse_and_match_explicit_bindings() {
+        let bindings = KeyBindings::from_explicit(&[
+            spec("Super+Alt+Left", "focus_left", None),
+            spec("Super+Alt+Right", "focus_right", None),
+            spec("Super+Alt+Up", "focus_up", None),
+            spec("Super+Alt+Down", "focus_down", None),
+            spec("Alt+Tab", "cycle_windows", None),
+            spec("Alt+Shift+Tab", "cycle_windows_reverse", None),
+            spec("Super+Shift+Q", "close_window", None),
+        ])
+        .unwrap();
+        for (key, expected) in [
+            (
+                "Super+Alt+Left",
+                WorkspaceCommand::FocusSpatial(SpatialDirection::Left),
+            ),
+            (
+                "Super+Alt+Right",
+                WorkspaceCommand::FocusSpatial(SpatialDirection::Right),
+            ),
+            (
+                "Super+Alt+Up",
+                WorkspaceCommand::FocusSpatial(SpatialDirection::Up),
+            ),
+            (
+                "Super+Alt+Down",
+                WorkspaceCommand::FocusSpatial(SpatialDirection::Down),
+            ),
+            (
+                "Alt+Tab",
+                WorkspaceCommand::CycleWindow(WindowCycleDirection::Next),
+            ),
+            (
+                "Alt+Shift+Tab",
+                WorkspaceCommand::CycleWindow(WindowCycleDirection::Previous),
+            ),
+            ("Super+Shift+Q", WorkspaceCommand::CloseWindow),
+        ] {
+            assert_eq!(
+                bindings.action_for(Shortcut::parse(key).unwrap()),
+                Some(expected)
+            );
+        }
+        // With an explicit list there are no surprise defaults.
+        assert_eq!(
+            bindings.action_for(Shortcut::parse("Super+Return").unwrap()),
+            None
+        );
+        assert_eq!(
+            normalized_keysym(keysyms::KEY_ISO_Left_Tab),
+            keysyms::KEY_Tab
+        );
+        assert!(KeyBindings::from_explicit(&[spec("Super+Y", "focus_up", Some(2))]).is_err());
     }
 
     #[test]

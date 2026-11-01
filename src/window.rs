@@ -304,6 +304,90 @@ pub enum TileFocusDirection {
     Next,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpatialDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowCycleDirection {
+    Previous,
+    Next,
+}
+
+struct WindowCycle {
+    order: Vec<WlSurface>,
+    index: usize,
+}
+
+// Use doubled centres to avoid rounding errors and negative-coordinate bugs.
+fn centre(rect: SnapRect) -> (i64, i64) {
+    (
+        i64::from(rect.x) * 2 + i64::from(rect.width),
+        i64::from(rect.y) * 2 + i64::from(rect.height),
+    )
+}
+
+fn projected_overlap(a_start: i32, a_length: i32, b_start: i32, b_length: i32) -> bool {
+    let a_end = i64::from(a_start) + i64::from(a_length);
+    let b_end = i64::from(b_start) + i64::from(b_length);
+    i64::from(a_start) < b_end && i64::from(b_start) < a_end
+}
+
+fn spatial_neighbor(
+    source: SnapRect,
+    candidates: &[(usize, SnapRect)],
+    direction: SpatialDirection,
+) -> Option<usize> {
+    let (sx, sy) = centre(source);
+    candidates
+        .iter()
+        .filter_map(|&(index, rect)| {
+            if rect.width <= 0 || rect.height <= 0 {
+                return None;
+            }
+            let (cx, cy) = centre(rect);
+            let (primary, lateral, aligned) = match direction {
+                SpatialDirection::Left => (
+                    sx - cx,
+                    (sy - cy).abs(),
+                    projected_overlap(source.y, source.height, rect.y, rect.height),
+                ),
+                SpatialDirection::Right => (
+                    cx - sx,
+                    (sy - cy).abs(),
+                    projected_overlap(source.y, source.height, rect.y, rect.height),
+                ),
+                SpatialDirection::Up => (
+                    sy - cy,
+                    (sx - cx).abs(),
+                    projected_overlap(source.x, source.width, rect.x, rect.width),
+                ),
+                SpatialDirection::Down => (
+                    cy - sy,
+                    (sx - cx).abs(),
+                    projected_overlap(source.x, source.width, rect.x, rect.width),
+                ),
+            };
+            (primary > 0).then_some(((!aligned, primary, lateral, index), index))
+        })
+        .min_by_key(|(score, _)| *score)
+        .map(|(_, index)| index)
+}
+
+fn next_cycle_index(index: usize, count: usize, direction: WindowCycleDirection) -> Option<usize> {
+    if count < 2 || index >= count {
+        return None;
+    }
+    Some(match direction {
+        WindowCycleDirection::Next => (index + 1) % count,
+        WindowCycleDirection::Previous => (index + count - 1) % count,
+    })
+}
+
 #[derive(Debug, Clone, Copy)]
 enum TileSwapTarget {
     Adjacent(TileFocusDirection),
@@ -367,6 +451,8 @@ pub struct WindowManager {
     workspaces: Workspaces,
 
     last_focused: [Option<WlSurface>; WORKSPACE_COUNT],
+    recent_focus: Vec<WlSurface>,
+    window_cycle: Option<WindowCycle>,
 
     dragging: Option<DragState>,
     resizing: Option<ResizeState>,
@@ -1066,6 +1152,7 @@ impl WindowManager {
         if self.is_dragging() || self.is_resizing() {
             return false;
         }
+        self.end_window_cycle();
         self.workspaces.switch_to(number)
     }
 
@@ -1079,6 +1166,7 @@ impl WindowManager {
             return false;
         }
 
+        self.end_window_cycle();
         let current = self.current_workspace();
 
         if !(1..=WORKSPACE_COUNT).contains(&number) || number == current {
@@ -1184,6 +1272,126 @@ impl WindowManager {
         let next_index = adjacent_tile_index(current_index, tiles.len(), direction)?;
 
         Some(tiles[next_index].clone())
+    }
+
+    pub fn spatial_surface(
+        &self,
+        focused: Option<&WlSurface>,
+        direction: SpatialDirection,
+    ) -> Option<WlSurface> {
+        let focused = focused?;
+        let source = self.windows.iter().find(|window| {
+            self.is_window_visible(window) && window.surface.wl_surface() == focused
+        })?;
+        let source_rect = source.focus_rect()?;
+        let candidates: Vec<(usize, SnapRect)> = self
+            .windows
+            .iter()
+            .enumerate()
+            .filter(|(_, window)| {
+                self.is_window_visible(window) && window.surface.wl_surface() != focused
+            })
+            .filter_map(|(index, window)| Some((index, window.focus_rect()?)))
+            .collect();
+        let index = spatial_neighbor(source_rect, &candidates, direction)?;
+        Some(self.windows[index].surface.wl_surface().clone())
+    }
+
+    /// Cycle through the most recently focused windows on every workspace.
+    /// The order remains fixed until the initiating modifier is released.
+    pub fn cycle_global_window(
+        &mut self,
+        focused: Option<&WlSurface>,
+        direction: WindowCycleDirection,
+    ) -> Option<WlSurface> {
+        if self.is_dragging() || self.is_resizing() || self.settling.is_some() {
+            return None;
+        }
+        if self.window_cycle.is_none() {
+            let mut order = Vec::new();
+            for surface in &self.recent_focus {
+                if self.globally_switchable(surface) && !order.contains(surface) {
+                    order.push(surface.clone());
+                }
+            }
+            for window in &self.windows {
+                let surface = window.surface.wl_surface();
+                if self.globally_switchable(surface) && !order.contains(surface) {
+                    order.push(surface.clone());
+                }
+            }
+            if order.len() < 2 {
+                return None;
+            }
+            let index = focused.and_then(|surface| order.iter().position(|s| s == surface));
+            // If there is no valid current focus, start at the first candidate.
+            let index = match index {
+                Some(index) => next_cycle_index(index, order.len(), direction)?,
+                None => 0,
+            };
+            self.window_cycle = Some(WindowCycle { order, index });
+        } else {
+            let cycle = self.window_cycle.as_mut()?;
+            cycle.index = next_cycle_index(cycle.index, cycle.order.len(), direction)?;
+        }
+
+        let cycle = self.window_cycle.as_ref()?;
+        let surface = cycle.order[cycle.index].clone();
+        let workspace = self
+            .windows
+            .iter()
+            .find(|window| {
+                window.surface.wl_surface() == &surface
+                    && window.surface.alive()
+                    && !window.minimized
+            })?
+            .workspace;
+        if workspace != self.current_workspace() 
+            && !self.workspaces.switch_to(workspace) {
+                self.end_window_cycle();
+                return None;
+            }
+        
+        self.show_desktop[workspace - 1] = false;
+        self.last_focused[workspace - 1] = Some(surface.clone());
+        self.raise_focused_floating(&surface);
+        Some(surface)
+    }
+
+    /// Make keyboard-focused floating windows visible without changing tile order.
+    pub fn raise_focused_floating(&mut self, surface: &WlSurface) {
+        if self.current_layout_mode() != LayoutMode::Floating {
+            return;
+        }
+        if let Some(index) = self.windows.iter().position(|window| {
+            self.is_window_visible(window) && window.surface.wl_surface() == surface
+        }) 
+            && index != 0 {
+                let window = self.windows.remove(index);
+                self.windows.insert(0, window);
+            }
+        
+    }
+
+    fn globally_switchable(&self, surface: &WlSurface) -> bool {
+        let Some(window) = self.windows.iter().find(|window| {
+            window.surface.wl_surface() == surface && window.surface.alive() && !window.minimized
+        }) else {
+            return false;
+        };
+        // Don't focus a tile covered by a maximized tile in its workspace.
+        !self.windows.iter().any(|other| {
+            other.workspace == window.workspace
+                && other.surface.alive()
+                && !other.minimized
+                && other.tiled.is_some()
+                && other.maximized
+                && other.surface.wl_surface() != surface
+        })
+    }
+
+    pub fn end_window_cycle(&mut self) {
+        self.window_cycle = None;
     }
 
     pub fn focused_window_rect(&self, focused: Option<&WlSurface>) -> Option<SnapRect> {
@@ -1372,10 +1580,22 @@ impl WindowManager {
         let workspace_index = window.workspace - 1;
 
         self.last_focused[workspace_index] = Some(surface.clone());
+        self.recent_focus.retain(|other| other != surface);
+        self.recent_focus.insert(0, surface.clone());
     }
 
     pub fn retain_live(&mut self) {
+        let original_count = self.windows.len();
         self.windows.retain(|window| window.surface.alive());
+        if self.windows.len() != original_count {
+            let live: Vec<WlSurface> = self
+                .windows
+                .iter()
+                .map(|window| window.surface.wl_surface().clone())
+                .collect();
+            self.recent_focus.retain(|surface| live.contains(surface));
+            self.end_window_cycle();
+        }
 
         if self
             .dragging
@@ -2317,6 +2537,82 @@ mod tile_constraint_tests {
         assert!(!tile_fits_size_constraints(tile, (100, 121), (0, 0)));
         assert!(!tile_fits_size_constraints(tile, (0, 0), (199, 0)));
         assert!(tile_fits_size_constraints(tile, (100, 90), (400, 180)));
+    }
+}
+
+#[cfg(test)]
+mod spatial_focus_tests {
+    use super::{
+        SnapRect, SpatialDirection, WindowCycleDirection, next_cycle_index, spatial_neighbor,
+    };
+
+    fn rect(x: i32, y: i32, width: i32, height: i32) -> SnapRect {
+        SnapRect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn spatial_navigation_finds_nearest_aligned_neighbor() {
+        let center = rect(100, 100, 100, 100);
+        let candidates = [
+            (0, rect(0, 100, 80, 100)),
+            (1, rect(230, 100, 100, 100)),
+            (2, rect(100, 0, 100, 80)),
+            (3, rect(100, 230, 100, 80)),
+            (4, rect(201, 500, 100, 100)),
+        ];
+        assert_eq!(
+            spatial_neighbor(center, &candidates, SpatialDirection::Left),
+            Some(0)
+        );
+        assert_eq!(
+            spatial_neighbor(center, &candidates, SpatialDirection::Right),
+            Some(1)
+        );
+        assert_eq!(
+            spatial_neighbor(center, &candidates, SpatialDirection::Up),
+            Some(2)
+        );
+        assert_eq!(
+            spatial_neighbor(center, &candidates, SpatialDirection::Down),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn spatial_navigation_rejects_wrong_side_and_handles_negative_coordinates() {
+        let center = rect(-100, -100, 60, 60);
+        assert_eq!(
+            spatial_neighbor(
+                center,
+                &[(0, rect(-200, -100, 80, 60))],
+                SpatialDirection::Right
+            ),
+            None
+        );
+        assert_eq!(
+            spatial_neighbor(
+                center,
+                &[(0, rect(-200, -100, 80, 60))],
+                SpatialDirection::Left
+            ),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn cycle_direction_wraps_and_rejects_single_window() {
+        assert_eq!(next_cycle_index(0, 3, WindowCycleDirection::Next), Some(1));
+        assert_eq!(next_cycle_index(2, 3, WindowCycleDirection::Next), Some(0));
+        assert_eq!(
+            next_cycle_index(0, 3, WindowCycleDirection::Previous),
+            Some(2)
+        );
+        assert_eq!(next_cycle_index(0, 1, WindowCycleDirection::Next), None);
     }
 }
 
