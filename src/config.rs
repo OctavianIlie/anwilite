@@ -24,12 +24,29 @@ impl Default for AppCommands {
     }
 }
 
+// A rule applies only when a NEW XDG toplevel identifies itself. Rules do not
+// retroactively move windows when configuration is reloaded.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowRule {
+    pub app_id: String,
+    pub workspace: usize,
+}
+
+pub fn matching_workspace(rules: &[WindowRule], app_id: &str) -> Option<usize> {
+    rules
+        .iter()
+        .find(|rule| rule.app_id == app_id)
+        .map(|rule| rule.workspace)
+}
+
 #[derive(Debug, Clone)]
 pub struct AnwiliteConfig {
     pub active_border: BorderStyle,
     pub inactive_border: Option<BorderStyle>,
     pub tiling: TilingSettings,
     pub apps: AppCommands,
+    pub window_rules: Vec<WindowRule>,
     pub keybindings: KeyBindings,
 }
 
@@ -40,6 +57,7 @@ impl Default for AnwiliteConfig {
             inactive_border: INACTIVE_BORDER,
             tiling: TilingSettings::default(),
             apps: AppCommands::default(),
+            window_rules: Vec::new(),
             keybindings: KeyBindings::default(),
         }
     }
@@ -53,6 +71,7 @@ impl AnwiliteConfig {
             && self.inactive_border == next.inactive_border
             && self.tiling == next.tiling
             && self.apps == next.apps
+            && self.window_rules == next.window_rules
             && self.keybindings == next.keybindings
         {
             return Ok(false);
@@ -70,6 +89,7 @@ struct FileConfig {
     borders: BorderOptions,
     tiling: TilingOptions,
     apps: AppOptions,
+    window_rules: Vec<WindowRule>,
     keybindings: Option<Vec<BindingSpec>>,
 }
 
@@ -267,6 +287,25 @@ fn parse_config(contents: &str) -> Result<AnwiliteConfig, String> {
     }
 
     config.apps = apps;
+
+    // Reject ambiguous rules rather than relying on declaration order.
+    let mut seen = std::collections::HashSet::new();
+    for rule in &file.window_rules {
+        if rule.app_id.trim().is_empty() || rule.app_id != rule.app_id.trim() {
+            return Err("window_rules.app_id must be a nonempty exact application ID".into());
+        }
+        if !(1..=WORKSPACE_COUNT).contains(&rule.workspace) {
+            return Err(format!(
+                "window rule for '{}': workspace must be 1..={WORKSPACE_COUNT}",
+                rule.app_id
+            ));
+        }
+        if !seen.insert(rule.app_id.as_str()) {
+            return Err(format!("duplicate window rule for '{}'", rule.app_id));
+        }
+    }
+    config.window_rules = file.window_rules;
+
     config.keybindings = match file.keybindings {
         Some(specs) => KeyBindings::from_explicit(&specs)?,
         None => KeyBindings::default(),
@@ -653,6 +692,44 @@ mod tests {
 
         assert!(config.apply_reload(invalid).is_err());
         assert_eq!(config.keybindings, KeyBindings::default());
+    }
+
+    #[test]
+    fn window_rules_match_exact_app_ids_and_workspaces() {
+        let config = parse_config(
+            "[[window_rules]]\napp_id = \"org.mozilla.firefox\"\nworkspace = 2\n\
+             [[window_rules]]\napp_id = \"foot\"\nworkspace = 3\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            matching_workspace(&config.window_rules, "org.mozilla.firefox"),
+            Some(2)
+        );
+        assert_eq!(matching_workspace(&config.window_rules, "foot"), Some(3));
+        assert_eq!(matching_workspace(&config.window_rules, "Foot"), None);
+        assert_eq!(matching_workspace(&config.window_rules, "firefox"), None);
+    }
+
+    #[test]
+    fn invalid_window_rules_are_rejected() {
+        assert!(parse_config("[[window_rules]]\napp_id = \"foo\"\nworkspace = 0\n").is_err());
+        assert!(parse_config("[[window_rules]]\napp_id = \"foo\"\nworkspace = 11\n").is_err());
+        assert!(parse_config("[[window_rules]]\napp_id = \"\"\nworkspace = 2\n").is_err());
+        assert!(
+            parse_config("[[window_rules]]\napp_id = \"foo\"\nworkspace = 2\nunknown = true\n")
+                .is_err()
+        );
+        assert!(parse_config("[[window_rules]]\napp_id = \"foo\"\nworkspace = 2\n[[window_rules]]\napp_id = \"foo\"\nworkspace = 3\n").is_err());
+    }
+
+    #[test]
+    fn window_rules_change_is_detected_on_reload() {
+        let mut config = AnwiliteConfig::default();
+        let next = parse_config("[[window_rules]]\napp_id = \"foot\"\nworkspace = 4\n").unwrap();
+        assert!(config.apply_reload(Ok(next.clone())).unwrap());
+        assert_eq!(matching_workspace(&config.window_rules, "foot"), Some(4));
+        assert!(!config.apply_reload(Ok(next)).unwrap());
     }
 
     #[test]

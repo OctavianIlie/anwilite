@@ -20,6 +20,112 @@ const MIN_WIDTH: f64 = 120.0;
 const MIN_HEIGHT: f64 = 90.0;
 const RESIZE_INTERVAL: Duration = Duration::from_micros(8_333);
 
+// Resize zones are outside XDG client geometry; never swallow titlebar buttons.
+const RESIZE_OUTER_PX: f64 = 12.0;
+// Along-edge corner detection stays outside the client rectangle.
+const RESIZE_CORNER_PX: f64 = 22.0;
+
+fn resize_edge_for_rect(rect: SnapRect, px: f64, py: f64) -> Option<xdg_toplevel::ResizeEdge> {
+    use xdg_toplevel::ResizeEdge as Edge;
+
+    if rect.width <= 0 || rect.height <= 0 || !px.is_finite() || !py.is_finite() {
+        return None;
+    }
+    let left = f64::from(rect.x);
+    let right = left + f64::from(rect.width);
+    let top = f64::from(rect.y);
+    let bottom = top + f64::from(rect.height);
+
+    if px < left - RESIZE_OUTER_PX
+        || px >= right + RESIZE_OUTER_PX
+        || py < top - RESIZE_OUTER_PX
+        || py >= bottom + RESIZE_OUTER_PX
+    {
+        return None;
+    }
+
+    // A client owns its entire XDG geometry, including thin CSD borders,
+    // titlebar buttons, and scrollbars. Only the OUTSIDE band resizes.
+    if px >= left && px < right && py >= top && py < bottom {
+        return None;
+    }
+
+    // Corners take priority only in the exterior band.
+    let near_left_corner = px < left + RESIZE_CORNER_PX;
+    let near_right_corner = px >= right - RESIZE_CORNER_PX;
+    let near_top_corner = py < top + RESIZE_CORNER_PX;
+    let near_bottom_corner = py >= bottom - RESIZE_CORNER_PX;
+    if near_left_corner && near_top_corner {
+        return Some(Edge::TopLeft);
+    }
+    if near_right_corner && near_top_corner {
+        return Some(Edge::TopRight);
+    }
+    if near_left_corner && near_bottom_corner {
+        return Some(Edge::BottomLeft);
+    }
+    if near_right_corner && near_bottom_corner {
+        return Some(Edge::BottomRight);
+    }
+
+    if px < left {
+        Some(Edge::Left)
+    } else if px >= right {
+        Some(Edge::Right)
+    } else if py < top {
+        Some(Edge::Top)
+    } else if py >= bottom {
+        Some(Edge::Bottom)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod client_control_resize_safety_tests {
+    use super::{SnapRect, resize_edge_for_rect};
+    use wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge as Edge;
+
+    const WINDOW: SnapRect = SnapRect {
+        x: 100,
+        y: 80,
+        width: 600,
+        height: 400,
+    };
+
+    #[test]
+    fn all_eight_outside_resize_grabs_work() {
+        for ((x, y), edge) in [
+            ((95.0, 75.0), Edge::TopLeft),
+            ((400.0, 75.0), Edge::Top),
+            ((705.0, 75.0), Edge::TopRight),
+            ((95.0, 280.0), Edge::Left),
+            ((705.0, 280.0), Edge::Right),
+            ((95.0, 485.0), Edge::BottomLeft),
+            ((400.0, 485.0), Edge::Bottom),
+            ((705.0, 485.0), Edge::BottomRight),
+        ] {
+            assert_eq!(resize_edge_for_rect(WINDOW, x, y), Some(edge));
+        }
+    }
+
+    #[test]
+    fn clients_keep_titlebar_and_inner_edges() {
+        for (x, y) in [
+            (690.0, 90.0),  // close
+            (665.0, 90.0),  // maximize
+            (640.0, 90.0),  // minimize
+            (100.0, 280.0), // left inside
+            (400.0, 80.0),  // top inside
+            (699.0, 280.0), // right inside
+            (400.0, 479.0), // bottom inside
+            (400.0, 280.0), // content
+        ] {
+            assert_eq!(resize_edge_for_rect(WINDOW, x, y), None);
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct NormalGeometry {
     left: i32,
@@ -51,6 +157,7 @@ pub struct ManagedWindow {
     pre_tile: Option<NormalGeometry>,
     minimized: bool,
     minimized_order: u64,
+    rule_checked: bool,
 }
 
 impl ManagedWindow {
@@ -208,6 +315,46 @@ fn window_can_fit_tile(window: &ManagedWindow, tile: SnapRect) -> bool {
         )
     });
     tile_fits_size_constraints(tile, minimum, maximum)
+}
+
+// Restrict floating placement to the usable output rectangle supplied by
+// layer-shell, so a panel cannot cover a dragged window's titlebar.
+// Offset comes from XDG window geometry (not the raw wl_surface origin).
+// If an app exceeds the available area, keep its top/left edge reachable.
+fn constrain_floating_origin(
+    work_area: SnapRect,
+    desired: (i32, i32),
+    geometry: Rectangle<i32, Logical>,
+) -> (i32, i32) {
+    if work_area.width <= 0 || work_area.height <= 0 || geometry.size.w <= 0 || geometry.size.h <= 0
+    {
+        return desired;
+    }
+
+    let clamp_axis = |position: i32, offset: i32, dimension: i32, start: i32, extent: i32| {
+        let minimum = i64::from(start);
+        let maximum = (minimum + i64::from(extent) - i64::from(dimension)).max(minimum);
+        let geometry_position = i64::from(position) + i64::from(offset);
+        let surface_position = geometry_position.clamp(minimum, maximum) - i64::from(offset);
+        surface_position.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+    };
+
+    (
+        clamp_axis(
+            desired.0,
+            geometry.loc.x,
+            geometry.size.w,
+            work_area.x,
+            work_area.width,
+        ),
+        clamp_axis(
+            desired.1,
+            geometry.loc.y,
+            geometry.size.h,
+            work_area.y,
+            work_area.height,
+        ),
+    )
 }
 
 // Convert surface-local XDG geometry into compositor output coordinates.
@@ -695,8 +842,54 @@ impl WindowManager {
                 pre_tile: None,
                 minimized: false,
                 minimized_order: 0,
+                rule_checked: false,
             },
         );
+    }
+
+    /// Apply a workspace rule once when the client first supplies an app ID.
+    /// Crucially, this never switches the visible workspace or moves an
+    /// already-placed window again when its app ID later changes.
+    pub fn assign_initial_workspace_rule(
+        &mut self,
+        surface: &WlSurface,
+        destination: Option<usize>,
+        output_size: (i32, i32),
+    ) -> bool {
+        let Some(index) = self
+            .windows
+            .iter()
+            .position(|window| window.surface.alive() && window.surface.wl_surface() == surface)
+        else {
+            return false;
+        };
+
+        if self.windows[index].rule_checked {
+            return false;
+        }
+        self.windows[index].rule_checked = true;
+
+        let Some(destination) = destination.filter(|number| (1..=WORKSPACE_COUNT).contains(number))
+        else {
+            return false;
+        };
+        let previous = self.windows[index].workspace;
+        if previous == destination {
+            return false;
+        }
+
+        self.windows[index].workspace = destination;
+        self.end_window_cycle();
+        if self.last_focused[previous - 1].as_ref() == Some(surface) {
+            self.last_focused[previous - 1] = None;
+        }
+
+        // An unconfigured client may not yet have drawable geometry.
+        // Reflow will be retried from its next commit as usual.
+        self.reflow_tiled_workspace(previous, output_size);
+        self.reflow_tiled_workspace(destination, output_size);
+        println!("Anwilite: assigned new window to workspace {destination}");
+        true
     }
 
     pub fn current_workspace(&self) -> usize {
@@ -1346,12 +1539,11 @@ impl WindowManager {
                     && !window.minimized
             })?
             .workspace;
-        if workspace != self.current_workspace() 
-            && !self.workspaces.switch_to(workspace) {
-                self.end_window_cycle();
-                return None;
-            }
-        
+        if workspace != self.current_workspace() && !self.workspaces.switch_to(workspace) {
+            self.end_window_cycle();
+            return None;
+        }
+
         self.show_desktop[workspace - 1] = false;
         self.last_focused[workspace - 1] = Some(surface.clone());
         self.raise_focused_floating(&surface);
@@ -1365,12 +1557,11 @@ impl WindowManager {
         }
         if let Some(index) = self.windows.iter().position(|window| {
             self.is_window_visible(window) && window.surface.wl_surface() == surface
-        }) 
-            && index != 0 {
-                let window = self.windows.remove(index);
-                self.windows.insert(0, window);
-            }
-        
+        }) && index != 0
+        {
+            let window = self.windows.remove(index);
+            self.windows.insert(0, window);
+        }
     }
 
     fn globally_switchable(&self, surface: &WlSurface) -> bool {
@@ -1651,6 +1842,53 @@ impl WindowManager {
             )?;
 
             Some((surface, (location.x as f64, location.y as f64).into()))
+        })
+    }
+
+    /// Compositor-owned resize hit test: works even if the app has a 1px CSD border.
+    /// A higher window's actual input surface blocks resize hits on lower windows.
+    /// The caller must keep foreground layer-shell surfaces above this region.
+    pub fn resize_hit_at(
+        &self,
+        px: f64,
+        py: f64,
+    ) -> Option<(ToplevelSurface, xdg_toplevel::ResizeEdge)> {
+        if self.is_dragging() || self.is_resizing() {
+            return None;
+        }
+
+        let eligible = |window: &ManagedWindow| {
+            !window.maximized
+                && window.snapped.is_none()
+                && window.tiled.is_none()
+                && window.pending_unsnap.is_none()
+                && self.is_window_visible(window)
+        };
+        let edge_for = |window: &ManagedWindow| {
+            let geometry = window_geometry(window)?;
+            let rect = absolute_window_rect((window.x, window.y), geometry)?;
+            let edge = resize_edge_for_rect(rect, px, py)?;
+            Some((window.surface.clone(), edge))
+        };
+
+        // Never intercept an application's actual input surface, even when
+        // its input region extends outside its XDG window geometry.
+        // Also prevents resizing a window through another application's CSD.
+        if self
+            .windows
+            .iter()
+            .any(|window| self.is_window_visible(window) && Self::hit_window(window, px, py))
+        {
+            return None;
+        }
+
+        // Between windows, a thin outside band remains available for resizing.
+        self.windows.iter().find_map(|window| {
+            if eligible(window) {
+                edge_for(window)
+            } else {
+                None
+            }
         })
     }
 
@@ -2045,6 +2283,15 @@ impl WindowManager {
                 });
 
                 window.surface.send_pending_configure();
+            } else if window.tiled.is_none()
+                && window.surface.alive()
+                && !window.minimized
+                && let Some(geometry) = window_geometry(window)
+            {
+                // Keep existing floating clients reachable when the panel
+                // reserves more space or the nested output becomes smaller.
+                (window.x, window.y) =
+                    constrain_floating_origin(area, (window.x, window.y), geometry);
             }
         }
 
@@ -2103,7 +2350,18 @@ impl WindowManager {
         }
     }
 
-    pub fn sync_mode_position(&mut self, surface: &WlSurface) {
+    pub fn sync_mode_position(&mut self, surface: &WlSurface, output_size: (i32, i32)) {
+        let area = self.current_work_area(output_size);
+        // Live resizes and their deferred position adjustments must retain
+        // their established opposite-edge anchors until settling is finished.
+        let resizing_this_surface = self
+            .resizing
+            .as_ref()
+            .is_some_and(|resize| resize.anchor.surface.wl_surface() == surface)
+            || self
+                .settling
+                .as_ref()
+                .is_some_and(|resize| resize.anchor.surface.wl_surface() == surface);
         // A committed XDG geometry update must not put maximized windows
         // back at the origin, behind an exclusive top or side panel.
         let maximized_origin = self.work_area.map_or((0, 0), |area| (area.x, area.y));
@@ -2124,8 +2382,14 @@ impl WindowManager {
             }
             let left = pending.pointer_x - pending.fraction_x * geometry.size.w as f64;
             let top = pending.pointer_y - pending.grab_y;
-            window.x = left.round() as i32 - geometry.loc.x;
-            window.y = top.round() as i32 - geometry.loc.y;
+            (window.x, window.y) = constrain_floating_origin(
+                area,
+                (
+                    left.round() as i32 - geometry.loc.x,
+                    top.round() as i32 - geometry.loc.y,
+                ),
+                geometry,
+            );
             window.pending_unsnap = None;
 
             if let Some(drag) = self.dragging.as_mut()
@@ -2157,6 +2421,16 @@ impl WindowManager {
             {
                 window.restoring = None;
             }
+        }
+
+        // Client commits can change geometry after a restore or initial map.
+        // Clamp floating XDG geometry, not the client's shadow/surface origin.
+        if !window.maximized
+            && window.snapped.is_none()
+            && window.tiled.is_none()
+            && !resizing_this_surface
+        {
+            (window.x, window.y) = constrain_floating_origin(area, (window.x, window.y), geometry);
         }
     }
 
@@ -2271,10 +2545,11 @@ impl WindowManager {
         true
     }
 
-    pub fn update_drag(&mut self, px: f64, py: f64) {
+    pub fn update_drag(&mut self, px: f64, py: f64, output_size: (i32, i32)) {
         let Some(drag) = self.dragging.as_ref() else {
             return;
         };
+        let area = self.current_work_area(output_size);
 
         let Some(window) = self
             .windows
@@ -2290,8 +2565,13 @@ impl WindowManager {
             return;
         }
 
-        window.x = (px - drag.offset_x).round() as i32;
-        window.y = (py - drag.offset_y).round() as i32;
+        let wanted = (
+            (px - drag.offset_x).round() as i32,
+            (py - drag.offset_y).round() as i32,
+        );
+        (window.x, window.y) = window_geometry(window)
+            .map(|geometry| constrain_floating_origin(area, wanted, geometry))
+            .unwrap_or(wanted);
     }
 
     pub fn end_drag(&mut self) {
@@ -2300,6 +2580,10 @@ impl WindowManager {
 
     pub fn is_resizing(&self) -> bool {
         self.resizing.is_some()
+    }
+
+    pub fn active_resize_edge(&self) -> Option<xdg_toplevel::ResizeEdge> {
+        self.resizing.as_ref().map(|resize| resize.anchor.edges)
     }
 
     pub fn start_resize_for(
@@ -3043,5 +3327,148 @@ mod maximized_placement_tests {
     fn side_panel_offsets_window_geometry_horizontally() {
         let geometry = Rectangle::<i32, Logical>::new((3, 7).into(), (1200, 800).into());
         assert_eq!(origin_for_maximized_geometry((64, 0), geometry), (61, -7));
+    }
+}
+
+#[cfg(test)]
+mod compositor_resize_hit_tests {
+    use super::{SnapRect, resize_edge_for_rect};
+    use wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge as Edge;
+
+    const RECT: SnapRect = SnapRect {
+        x: 100,
+        y: 80,
+        width: 600,
+        height: 400,
+    };
+
+    #[test]
+    fn all_eight_resize_directions_work_outside_client_geometry() {
+        for (point, expected) in [
+            ((95.0, 75.0), Edge::TopLeft),
+            ((400.0, 75.0), Edge::Top),
+            ((705.0, 75.0), Edge::TopRight),
+            ((95.0, 280.0), Edge::Left),
+            ((705.0, 280.0), Edge::Right),
+            ((95.0, 485.0), Edge::BottomLeft),
+            ((400.0, 485.0), Edge::Bottom),
+            ((705.0, 485.0), Edge::BottomRight),
+        ] {
+            assert_eq!(resize_edge_for_rect(RECT, point.0, point.1), Some(expected));
+        }
+    }
+
+    #[test]
+    fn exterior_strip_and_corners_are_recognized() {
+        assert_eq!(resize_edge_for_rect(RECT, 90.0, 280.0), Some(Edge::Left));
+        assert_eq!(resize_edge_for_rect(RECT, 710.0, 280.0), Some(Edge::Right));
+        assert_eq!(resize_edge_for_rect(RECT, 110.0, 75.0), Some(Edge::TopLeft));
+        assert_eq!(
+            resize_edge_for_rect(RECT, 690.0, 485.0),
+            Some(Edge::BottomRight)
+        );
+        assert_eq!(resize_edge_for_rect(RECT, 400.0, 70.0), Some(Edge::Top));
+    }
+
+    #[test]
+    fn client_controls_and_far_outside_are_not_resize_targets() {
+        for (x, y) in [
+            (400.0, 280.0), // content
+            (400.0, 100.0), // titlebar
+            (690.0, 90.0),  // close
+            (665.0, 90.0),  // maximize
+            (640.0, 90.0),  // minimize
+            (100.0, 280.0), // left edge inside client
+            (699.0, 280.0), // right edge inside client
+            (400.0, 479.0), // bottom edge inside client
+            (40.0, 280.0),  // far outside
+            (400.0, 510.0), // far outside
+        ] {
+            assert_eq!(resize_edge_for_rect(RECT, x, y), None);
+        }
+        assert_eq!(resize_edge_for_rect(RECT, f64::NAN, 280.0), None);
+    }
+}
+
+#[cfg(test)]
+mod floating_work_area_drag_bounds_tests {
+    use super::{SnapRect, constrain_floating_origin};
+    use smithay::utils::{Logical, Rectangle};
+
+    fn area() -> SnapRect {
+        SnapRect {
+            x: 0,
+            y: 30,
+            width: 1280,
+            height: 770,
+        }
+    }
+
+    fn geometry(width: i32, height: i32) -> Rectangle<i32, Logical> {
+        Rectangle::new((0, 0).into(), (width, height).into())
+    }
+
+    #[test]
+    fn drag_cannot_cross_waybar_or_output_edges() {
+        let shape = geometry(600, 400);
+        assert_eq!(
+            constrain_floating_origin(area(), (80, -200), shape),
+            (80, 30)
+        );
+        assert_eq!(
+            constrain_floating_origin(area(), (-500, 55), shape),
+            (0, 55)
+        );
+        assert_eq!(
+            constrain_floating_origin(area(), (1200, 600), shape),
+            (680, 400)
+        );
+        assert_eq!(
+            constrain_floating_origin(area(), (110, 70), shape),
+            (110, 70)
+        );
+    }
+
+    #[test]
+    fn xdg_geometry_offsets_and_left_panels_are_preserved() {
+        let work = SnapRect {
+            x: 40,
+            y: 38,
+            width: 900,
+            height: 660,
+        };
+        let shape = Rectangle::new((5, -3).into(), (500, 400).into());
+        assert_eq!(constrain_floating_origin(work, (0, 0), shape), (35, 41));
+        assert_eq!(
+            constrain_floating_origin(work, (900, 600), shape),
+            (435, 301)
+        );
+    }
+
+    #[test]
+    fn oversized_windows_stay_recoverable() {
+        let shape = geometry(1600, 1000);
+        assert_eq!(
+            constrain_floating_origin(area(), (400, -100), shape),
+            (0, 30)
+        );
+        assert_eq!(
+            constrain_floating_origin(area(), (-900, 25), shape),
+            (0, 30)
+        );
+    }
+
+    #[test]
+    fn invalid_area_does_not_shift_windows() {
+        let invalid = SnapRect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 100,
+        };
+        assert_eq!(
+            constrain_floating_origin(invalid, (30, 40), geometry(200, 200)),
+            (30, 40)
+        );
     }
 }

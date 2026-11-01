@@ -11,6 +11,7 @@ use calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic};
 use keybindings::WorkspaceCommand;
 use layout::{SnapRect, focus_border_outside_tile};
 
+use ::winit::cursor::CursorIcon;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::desktop::{
     LayerSurface as DesktopLayerSurface, WindowSurfaceType, layer_map_for_output,
@@ -62,6 +63,7 @@ use smithay::{
         },
         shell::xdg::{
             PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
+            XdgToplevelSurfaceData,
         },
         shm::{ShmHandler, ShmState},
     },
@@ -85,6 +87,21 @@ use wayland_server::{
     },
 };
 use window::WindowManager;
+
+fn resize_cursor_icon(edge: xdg_toplevel::ResizeEdge) -> CursorIcon {
+    use xdg_toplevel::ResizeEdge as Edge;
+    match edge {
+        Edge::TopLeft => CursorIcon::NwResize,
+        Edge::Top => CursorIcon::NResize,
+        Edge::TopRight => CursorIcon::NeResize,
+        Edge::Left => CursorIcon::WResize,
+        Edge::Right => CursorIcon::EResize,
+        Edge::BottomLeft => CursorIcon::SwResize,
+        Edge::Bottom => CursorIcon::SResize,
+        Edge::BottomRight => CursorIcon::SeResize,
+        _ => CursorIcon::Default,
+    }
+}
 
 const ANWILITE_SOCKET_NAME: &str = "octlitch-0";
 
@@ -120,13 +137,24 @@ impl XdgShellHandler for App {
         &mut self.xdg_shell_state
     }
 
+    fn app_id_changed(&mut self, surface: ToplevelSurface) {
+        self.apply_new_window_rule(&surface);
+    }
+
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         // Add the window to the current workspace.
         self.windows.add(surface.clone());
+        self.apply_new_window_rule(&surface);
         self.needs_redraw = true;
 
+        // Do not advertise an off-workspace, automatically routed window as
+        // activated. A later app_id_changed event will also repair focus.
         surface.with_pending_state(|state| {
-            state.states.set(xdg_toplevel::State::Activated);
+            if self.windows.focus_is_valid(surface.wl_surface()) {
+                state.states.set(xdg_toplevel::State::Activated);
+            } else {
+                state.states.unset(xdg_toplevel::State::Activated);
+            }
         });
 
         surface.send_configure();
@@ -141,6 +169,7 @@ impl XdgShellHandler for App {
 
         // Do not steal keyboard focus from a visible layer-shell launcher.
         if self.active_layer_keyboard.is_none()
+            && self.windows.focus_is_valid(surface.wl_surface())
             && let Some(keyboard) = self.seat.get_keyboard()
         {
             let serial = smithay::utils::SERIAL_COUNTER.next_serial();
@@ -387,7 +416,7 @@ impl CompositorHandler for App {
 
         // Preserve all existing XDG window behavior.
         self.windows.sync_resize_position(surface);
-        self.windows.sync_mode_position(surface);
+        self.windows.sync_mode_position(surface, self.output_size);
         self.windows
             .trace_geometry_on_commit(surface, self.output_size);
 
@@ -447,9 +476,59 @@ struct App {
     initial_layer_configures: HashSet<WlSurface>,
     active_layer_keyboard: Option<WlSurface>,
     saved_xdg_keyboard_focus: Option<WlSurface>,
+    window_rules: Vec<config::WindowRule>,
 }
 
 impl App {
+    fn apply_new_window_rule(&mut self, surface: &ToplevelSurface) {
+        // Smithay reports set_app_id through XdgShellHandler::app_id_changed.
+        // Resolve the metadata after that event; no poll or title matching.
+        let app_id = with_states(surface.wl_surface(), |states| {
+            states
+                .data_map
+                .get::<XdgToplevelSurfaceData>()
+                .and_then(|data| data.lock().ok()?.app_id.clone())
+        });
+        let Some(app_id) = app_id else {
+            return;
+        };
+        println!("Anwilite: XDG application ID: {app_id:?}");
+        let destination = config::matching_workspace(&self.window_rules, &app_id);
+        if self.windows.assign_initial_workspace_rule(
+            surface.wl_surface(),
+            destination,
+            self.output_size,
+        ) {
+            // If the client identified itself after initial configure, remove
+            // its stale activated hint when routed to a hidden workspace.
+            if !self.windows.focus_is_valid(surface.wl_surface()) {
+                surface.with_pending_state(|state| {
+                    state.states.unset(xdg_toplevel::State::Activated);
+                });
+                if surface.is_initial_configure_sent() {
+                    surface.send_pending_configure();
+                }
+            }
+            if self.active_layer_keyboard.is_none()
+                && let Some(keyboard) = self.seat.get_keyboard()
+            {
+                let focus = keyboard.current_focus();
+                if focus
+                    .as_ref()
+                    .is_some_and(|focus| !self.windows.focus_is_valid(focus))
+                {
+                    let replacement = self.windows.focused_surface();
+                    keyboard.set_focus(
+                        self,
+                        replacement,
+                        smithay::utils::SERIAL_COUNTER.next_serial(),
+                    );
+                }
+            }
+            self.needs_redraw = true;
+        }
+    }
+
     fn refresh_work_area(&mut self) -> bool {
         // Drop Smithay's LayerMap lock before entering WindowManager.
         // The work area is output-local, not a replacement for output_size.
@@ -741,6 +820,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             initial_layer_configures: HashSet::new(),
             active_layer_keyboard: None,
             saved_xdg_keyboard_focus: None,
+            window_rules: config.window_rules.clone(),
         }
     };
     state.windows.configure_startup(config.tiling);
@@ -833,6 +913,9 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
         .add_keyboard(Default::default(), 200, 200)
         .unwrap();
     let pointer = state.seat.add_pointer();
+    let mut host_cursor = CursorIcon::Default;
+    // Distinguish compositor-initiated border resize from client XDG resize.
+    let mut border_resize_active = false;
     let mut launched_children = Vec::<std::process::Child>::new();
 
     if config.apps.autostart_terminal {
@@ -869,6 +952,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             let output_size = state.output_size;
 
             if reload_configuration(&mut config, &mut state.windows, output_size) {
+                state.window_rules = config.window_rules.clone();
                 state.needs_redraw = true;
             }
         }
@@ -935,6 +1019,13 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 WinitEvent::Focus(focused) => {
                     if !focused {
+                        backend.window().set_cursor(CursorIcon::Default);
+                        host_cursor = CursorIcon::Default;
+                        if border_resize_active {
+                            state.windows.finish_resize();
+                            border_resize_active = false;
+                            state.needs_redraw = true;
+                        }
                         state.windows.end_window_cycle();
                     }
                     let held_keys = keyboard.pressed_keys();
@@ -1198,11 +1289,15 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
                                     WorkspaceCommand::ReloadConfig => {
                                         last_config_snapshot = config::snapshot();
-                                        reload_configuration(
+                                        let reloaded = reload_configuration(
                                             &mut config,
                                             &mut state.windows,
                                             state.output_size,
-                                        )
+                                        );
+                                        if reloaded {
+                                            state.window_rules = config.window_rules.clone();
+                                        }
+                                        reloaded
                                     }
 
                                     WorkspaceCommand::LaunchTerminal => {
@@ -1303,11 +1398,33 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
                         if state.windows.is_resizing() {
                             state.windows.update_resize(x, y);
+                            if let Some(edges) = state.windows.active_resize_edge() {
+                                let icon = resize_cursor_icon(edges);
+                                if icon != host_cursor {
+                                    backend.window().set_cursor(icon);
+                                    host_cursor = icon;
+                                }
+                            }
                             state.needs_redraw = true;
                         } else if state.windows.is_dragging() {
-                            state.windows.update_drag(x, y);
+                            state.windows.update_drag(x, y, state.output_size);
                             state.needs_redraw = true;
                         } else {
+                            // The host cursor reflects the compositor's effective resize
+                            // region, rather than relying on client-side frame thickness.
+                            let next_cursor = if state.foreground_layer_hit_at(x, y).is_some() {
+                                CursorIcon::Default
+                            } else {
+                                state
+                                    .windows
+                                    .resize_hit_at(x, y)
+                                    .map(|(_, edges)| resize_cursor_icon(edges))
+                                    .unwrap_or(CursorIcon::Default)
+                            };
+                            if next_cursor != host_cursor {
+                                backend.window().set_cursor(next_cursor);
+                                host_cursor = next_cursor;
+                            }
                             // Match the actual rendered stacking order, including layers.
                             let focus = state.pointer_surface_at(x, y);
 
@@ -1343,6 +1460,63 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             None
                         };
+
+                        // Compositor border-grab: consume the left-button sequence.
+                        // Without this, the app's client-side controls receive a press
+                        // even though Anwilite is resizing the window.
+                        if event.button() == Some(MouseButton::Left) {
+                            if event.state() == ButtonState::Pressed
+                                && foreground_hit.is_none()
+                                && let Some((surface, edges)) = state.windows.resize_hit_at(x, y)
+                                && state.windows.start_resize_for(&surface, x, y, edges)
+                            {
+                                state.move_press = None;
+                                border_resize_active = true;
+                                state.windows.end_window_cycle();
+                                state.windows.raise_focused_floating(surface.wl_surface());
+                                state.focus_xdg_from_click(surface.wl_surface().clone(), serial);
+                                let icon = resize_cursor_icon(edges);
+                                if host_cursor != icon {
+                                    backend.window().set_cursor(icon);
+                                    host_cursor = icon;
+                                }
+                                state.needs_redraw = true;
+                                continue;
+                            }
+                            // Never swallow a client-initiated XDG resize release: that
+                            // client already received the corresponding button press.
+                            if event.state() == ButtonState::Released && border_resize_active {
+                                border_resize_active = false;
+                                state.move_press = None;
+                                state.windows.finish_resize();
+                                let next_icon = if foreground_hit.is_some() {
+                                    CursorIcon::Default
+                                } else {
+                                    state
+                                        .windows
+                                        .resize_hit_at(x, y)
+                                        .map(|(_, edges)| resize_cursor_icon(edges))
+                                        .unwrap_or(CursorIcon::Default)
+                                };
+                                if next_icon != host_cursor {
+                                    backend.window().set_cursor(next_icon);
+                                    host_cursor = next_icon;
+                                }
+                                let focus = state.pointer_surface_at(x, y);
+                                pointer.motion(
+                                    &mut state,
+                                    focus,
+                                    &MotionEvent {
+                                        location: (x, y).into(),
+                                        serial,
+                                        time,
+                                    },
+                                );
+                                pointer.frame(&mut state);
+                                state.needs_redraw = true;
+                                continue;
+                            }
+                        }
 
                         if event.button() == Some(MouseButton::Left)
                             && event.state() == ButtonState::Pressed

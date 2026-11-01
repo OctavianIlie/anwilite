@@ -4,6 +4,10 @@ use crate::workspace::WORKSPACE_COUNT;
 pub enum SnapSide {
     Left,
     Right,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,30 +59,38 @@ pub fn tile_rects_in_area(
 }
 
 pub fn snap_rect(output_size: (i32, i32), side: SnapSide) -> Option<SnapRect> {
-    let (output_width, output_height) = output_size;
-
-    if output_width < 2 || output_height < 1 {
+    let (width, height) = output_size;
+    if width < 2 || height < 1 {
+        return None;
+    }
+    if height < 2 && !matches!(side, SnapSide::Left | SnapSide::Right) {
         return None;
     }
 
-    let left_width = output_width / 2;
-    let right_width = output_width - left_width;
+    let left_width = width / 2;
+    let right_width = width - left_width;
+    let top_height = height / 2;
+    let bottom_height = height - top_height;
 
-    let rect = match side {
-        SnapSide::Left => SnapRect {
-            x: 0,
-            y: 0,
-            width: left_width,
-            height: output_height,
-        },
-        SnapSide::Right => SnapRect {
-            x: left_width,
-            y: 0,
-            width: right_width,
-            height: output_height,
-        },
+    let (x, y, width, height) = match side {
+        SnapSide::Left => (0, 0, left_width, height),
+        SnapSide::Right => (left_width, 0, right_width, height),
+        SnapSide::TopLeft => (0, 0, left_width, top_height),
+        SnapSide::TopRight => (left_width, 0, right_width, top_height),
+        SnapSide::BottomLeft => (0, top_height, left_width, bottom_height),
+        SnapSide::BottomRight => (left_width, top_height, right_width, bottom_height),
     };
-    Some(rect)
+
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+
+    Some(SnapRect {
+        x,
+        y,
+        width,
+        height,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,32 +136,165 @@ pub fn snap_rect_with_gaps(
     if gaps.outer < 0 || gaps.inner < 0 {
         return None;
     }
-    let half = snap_rect(output_size, side)?;
+    let cell = snap_rect(output_size, side)?;
 
-    let inner_left = gaps.inner / 2;
-    let inner_right = gaps.inner - inner_left;
+    // Split odd inner gaps predictably, as in the existing half-screen
+    // placement. This keeps the total gap between adjacent cells exact.
+    let inner_before = gaps.inner / 2;
+    let inner_after = gaps.inner - inner_before;
 
-    let (left_inset, right_inset) = match side {
-        SnapSide::Left => (gaps.outer, inner_right),
-        SnapSide::Right => (inner_left, gaps.outer),
+    let on_left = matches!(
+        side,
+        SnapSide::Left | SnapSide::TopLeft | SnapSide::BottomLeft
+    );
+    let (left_inset, right_inset) = if on_left {
+        (gaps.outer, inner_after)
+    } else {
+        (inner_before, gaps.outer)
     };
 
-    let width = half
+    let (top_inset, bottom_inset) = match side {
+        SnapSide::Left | SnapSide::Right => (gaps.outer, gaps.outer),
+        SnapSide::TopLeft | SnapSide::TopRight => (gaps.outer, inner_after),
+        SnapSide::BottomLeft | SnapSide::BottomRight => (inner_before, gaps.outer),
+    };
+
+    let width = cell
         .width
         .checked_sub(left_inset)?
         .checked_sub(right_inset)?;
-
-    let height = half.height.checked_sub(gaps.outer.checked_mul(2)?)?;
+    let height = cell
+        .height
+        .checked_sub(top_inset)?
+        .checked_sub(bottom_inset)?;
 
     if width <= 0 || height <= 0 {
         return None;
     }
+
     Some(SnapRect {
-        x: half.x.checked_add(left_inset)?,
-        y: gaps.outer,
+        x: cell.x.checked_add(left_inset)?,
+        y: cell.y.checked_add(top_inset)?,
         width,
         height,
     })
+}
+
+#[cfg(test)]
+mod quarter_snap_tests {
+    use super::*;
+
+    const QUARTERS: [SnapSide; 4] = [
+        SnapSide::TopLeft,
+        SnapSide::TopRight,
+        SnapSide::BottomLeft,
+        SnapSide::BottomRight,
+    ];
+
+    #[test]
+    fn quarters_partition_odd_sized_output_without_missing_pixels() {
+        let [tl, tr, bl, br] = QUARTERS.map(|side| snap_rect((1001, 701), side).unwrap());
+        assert_eq!((tl.x, tl.y, tl.width, tl.height), (0, 0, 500, 350));
+        assert_eq!((tr.x, tr.y, tr.width, tr.height), (500, 0, 501, 350));
+        assert_eq!((bl.x, bl.y, bl.width, bl.height), (0, 350, 500, 351));
+        assert_eq!((br.x, br.y, br.width, br.height), (500, 350, 501, 351));
+    }
+
+    #[test]
+    fn quarter_gaps_apply_outer_and_inner_insets() {
+        let gaps = SnapGaps {
+            outer: 11,
+            inner: 7,
+        };
+        let [tl, tr, bl, br] =
+            QUARTERS.map(|side| snap_rect_with_gaps((1001, 701), side, gaps).unwrap());
+        assert_eq!((tl.x, tl.y, tl.width, tl.height), (11, 11, 485, 335));
+        assert_eq!((tr.x, tr.y, tr.width, tr.height), (503, 11, 487, 335));
+        assert_eq!((bl.x, bl.y, bl.width, bl.height), (11, 353, 485, 337));
+        assert_eq!((br.x, br.y, br.width, br.height), (503, 353, 487, 337));
+        assert_eq!(tr.x - (tl.x + tl.width), 7);
+        assert_eq!(bl.y - (tl.y + tl.height), 7);
+    }
+
+    #[test]
+    fn half_screen_snaps_keep_previous_behavior() {
+        let gaps = SnapGaps {
+            outer: 12,
+            inner: 7,
+        };
+        let left = snap_rect_with_gaps((1200, 800), SnapSide::Left, gaps).unwrap();
+        let right = snap_rect_with_gaps((1200, 800), SnapSide::Right, gaps).unwrap();
+        assert_eq!(
+            left,
+            SnapRect {
+                x: 12,
+                y: 12,
+                width: 584,
+                height: 776
+            }
+        );
+        assert_eq!(
+            right,
+            SnapRect {
+                x: 603,
+                y: 12,
+                width: 585,
+                height: 776
+            }
+        );
+    }
+
+    #[test]
+    fn quarter_snapping_respects_waybar_work_area_and_output_resize() {
+        let small = SnapRect {
+            x: 0,
+            y: 36,
+            width: 1280,
+            height: 764,
+        };
+        let large = SnapRect {
+            x: 0,
+            y: 36,
+            width: 2560,
+            height: 1205,
+        };
+
+        assert_eq!(
+            snap_rect_in_area(small, SnapSide::TopLeft, DEFAULT_SNAP_GAPS),
+            Some(SnapRect {
+                x: 6,
+                y: 42,
+                width: 631,
+                height: 373,
+            })
+        );
+        assert_eq!(
+            snap_rect_in_area(large, SnapSide::TopRight, DEFAULT_SNAP_GAPS),
+            Some(SnapRect {
+                x: 1283,
+                y: 42,
+                width: 1271,
+                height: 593,
+            })
+        );
+    }
+
+    #[test]
+    fn quarter_snap_rejects_insufficient_output_or_gaps() {
+        assert_eq!(snap_rect((1, 800), SnapSide::TopLeft), None);
+        assert_eq!(snap_rect((800, 1), SnapSide::BottomRight), None);
+        assert_eq!(
+            snap_rect_with_gaps(
+                (30, 30),
+                SnapSide::TopLeft,
+                SnapGaps {
+                    outer: 12,
+                    inner: 12
+                }
+            ),
+            None
+        );
+    }
 }
 
 fn split_columns(
