@@ -1,6 +1,4 @@
-use crate::layout::{
-    SnapRect, SnapSide, TilingSettings, snap_rect_with_gaps, tile_rects_with_ratio,
-};
+use crate::layout::{SnapRect, SnapSide, TilingSettings, snap_rect_in_area, tile_rects_in_area};
 use crate::workspace::{WORKSPACE_COUNT, Workspaces};
 
 use smithay::{
@@ -227,6 +225,20 @@ fn absolute_window_rect(origin: (i32, i32), geometry: Rectangle<i32, Logical>) -
     })
 }
 
+// XDG geometry may begin inside the wl_surface (for example, to exclude shadows).
+// Keep the *XDG window geometry* aligned with the work-area origin, not the raw
+// wl_surface origin. This is independent of whether the client chooses to draw
+// a titlebar when it receives xdg_toplevel::State::Maximized.
+fn origin_for_maximized_geometry(
+    work_origin: (i32, i32),
+    geometry: Rectangle<i32, Logical>,
+) -> (i32, i32) {
+    (
+        work_origin.0 - geometry.loc.x,
+        work_origin.1 - geometry.loc.y,
+    )
+}
+
 fn window_geometry(window: &ManagedWindow) -> Option<Rectangle<i32, Logical>> {
     let bounds = bbox_from_surface_tree(window.surface.wl_surface(), (0, 0));
     let geometry = with_states(window.surface.wl_surface(), |states| {
@@ -364,9 +376,56 @@ pub struct WindowManager {
     master_ratios: [Option<u8>; WORKSPACE_COUNT],
     tiling_settings: TilingSettings,
     show_desktop: [bool; WORKSPACE_COUNT],
+
+    work_area: Option<SnapRect>,
 }
 
 impl WindowManager {
+    fn current_work_area(&self, output_size: (i32, i32)) -> SnapRect {
+        self.work_area.unwrap_or(SnapRect {
+            x: 0,
+            y: 0,
+            width: output_size.0,
+            height: output_size.1,
+        })
+    }
+
+    pub fn set_work_area(&mut self, area: SnapRect, output_size: (i32, i32)) -> bool {
+        let valid = area.width > 0
+            && area.height > 0
+            && area.x >= 0
+            && area.y >= 0
+            && area
+                .x
+                .checked_add(area.width)
+                .is_some_and(|x| x <= output_size.0)
+            && area
+                .y
+                .checked_add(area.height)
+                .is_some_and(|y| y <= output_size.1);
+
+        if !valid {
+            eprintln!("Anwilite: ignoring invalid work area: {area:?}");
+            return false;
+        }
+
+        if self.current_work_area(output_size) == area {
+            return false;
+        }
+
+        self.work_area = Some(area);
+
+        // Resize maximized and snapped windows and update tiled layouts.
+        self.resize_placed_windows(output_size);
+
+        println!(
+            "Anwilite: work area updated: ({}, {}) {}x{}",
+            area.x, area.y, area.width, area.height
+        );
+
+        true
+    }
+
     pub fn configure_startup(&mut self, settings: TilingSettings) {
         assert!(settings.is_valid());
 
@@ -446,11 +505,13 @@ impl WindowManager {
                 // Preserve per-workspace master-ratio overrides.
                 let ratio = self.master_ratios[workspace - 1].unwrap_or(next.default_master_ratio);
 
-                let targets =
-                    tile_rects_with_ratio(output_size, participants.len(), next.gaps, ratio)
-                        .ok_or_else(|| {
-                            format!("workspace {workspace} cannot fit the new layout")
-                        })?;
+                let targets = tile_rects_in_area(
+                    self.current_work_area(output_size),
+                    participants.len(),
+                    next.gaps,
+                    ratio,
+                )
+                .ok_or_else(|| format!("workspace {workspace} cannot fit the new layout"))?;
 
                 if participants
                     .iter()
@@ -470,8 +531,9 @@ impl WindowManager {
                         continue;
                     };
 
-                    let target = snap_rect_with_gaps(output_size, side, next.gaps)
-                        .ok_or("new snapping geometry is invalid")?;
+                    let target =
+                        snap_rect_in_area(self.current_work_area(output_size), side, next.gaps)
+                            .ok_or("new snapping geometry is invalid")?;
 
                     if !window_can_fit_tile(window, target) || window_geometry(window).is_none() {
                         return Err("a snapped window cannot fit the new gaps".into());
@@ -484,6 +546,7 @@ impl WindowManager {
         self.tiling_settings = next;
 
         if gaps_changed {
+            let area = self.current_work_area(output_size);
             for window in &mut self.windows {
                 if !window.surface.alive() {
                     continue;
@@ -493,7 +556,7 @@ impl WindowManager {
                     continue;
                 };
 
-                let Some(target) = snap_rect_with_gaps(output_size, side, next.gaps) else {
+                let Some(target) = snap_rect_in_area(area, side, next.gaps) else {
                     continue;
                 };
 
@@ -612,8 +675,8 @@ impl WindowManager {
 
         // Validate before changing the stored ratio.
         // Calculate the proposed layout before changing the ratio.
-        let Some(targets) = tile_rects_with_ratio(
-            output_size,
+        let Some(targets) = tile_rects_in_area(
+            self.current_work_area(output_size),
             participants.len(),
             self.tiling_settings.gaps,
             percent,
@@ -771,8 +834,8 @@ impl WindowManager {
             .collect();
 
         let master_percent = self.master_ratio_for_workspace(workspace);
-        let Some(targets) = tile_rects_with_ratio(
-            output_size,
+        let Some(targets) = tile_rects_in_area(
+            self.current_work_area(output_size),
             indices.len(),
             self.tiling_settings.gaps,
             master_percent,
@@ -965,8 +1028,8 @@ impl WindowManager {
             return false;
         }
 
-        let Some(targets) = tile_rects_with_ratio(
-            output_size,
+        let Some(targets) = tile_rects_in_area(
+            self.current_work_area(output_size),
             windows.len(),
             self.tiling_settings.gaps,
             self.master_ratio_for_workspace(workspace),
@@ -1188,9 +1251,12 @@ impl WindowManager {
         let ratio = self.master_ratio_for_workspace(workspace);
 
         // Calculate the target rectangles using the configured gaps and ratio.
-        let Some(targets) =
-            tile_rects_with_ratio(output_size, indices.len(), self.tiling_settings.gaps, ratio)
-        else {
+        let Some(targets) = tile_rects_in_area(
+            self.current_work_area(output_size),
+            indices.len(),
+            self.tiling_settings.gaps,
+            ratio,
+        ) else {
             return false;
         };
 
@@ -1399,7 +1465,11 @@ impl WindowManager {
             return false;
         }
 
-        let Some(target) = snap_rect_with_gaps(output_size, side, self.tiling_settings.gaps) else {
+        let Some(target) = snap_rect_in_area(
+            self.current_work_area(output_size),
+            side,
+            self.tiling_settings.gaps,
+        ) else {
             return false;
         };
 
@@ -1452,6 +1522,8 @@ impl WindowManager {
 
     pub fn maximize(&mut self, surface: &ToplevelSurface, output_size: (i32, i32)) -> bool {
         // Don't maximize during an interactive drag or resize.
+        let area = self.current_work_area(output_size);
+
         if self.dragging.is_some() || self.resizing.is_some() {
             return false;
         }
@@ -1539,12 +1611,11 @@ impl WindowManager {
             window.maximized = true;
 
             // Maximized windows cover the entire output.
-            window.x = -geometry.loc.x;
-            window.y = -geometry.loc.y;
+            (window.x, window.y) = origin_for_maximized_geometry((area.x, area.y), geometry);
 
             window.surface.with_pending_state(|state| {
                 state.states.set(xdg_toplevel::State::Maximized);
-                state.size = Some(output_size.into());
+                state.size = Some((area.width, area.height).into());
             });
 
             window.surface.send_configure();
@@ -1570,12 +1641,11 @@ impl WindowManager {
         window.maximized = true;
         window.snapped = None;
 
-        window.x = -geometry.loc.x;
-        window.y = -geometry.loc.y;
+        (window.x, window.y) = origin_for_maximized_geometry((area.x, area.y), geometry);
 
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Maximized);
-            state.size = Some(output_size.into());
+            state.size = Some((area.width, area.height).into());
         });
 
         surface.send_configure();
@@ -1707,8 +1777,8 @@ impl WindowManager {
 
             let next_count = visible_count.checked_add(1)?;
 
-            tile_rects_with_ratio(
-                output_size,
+            tile_rects_in_area(
+                self.current_work_area(output_size),
                 next_count,
                 self.tiling_settings.gaps,
                 self.master_ratio_for_workspace(workspace),
@@ -1725,17 +1795,21 @@ impl WindowManager {
     }
 
     pub fn resize_placed_windows(&mut self, output_size: (i32, i32)) {
+        let area = self.current_work_area(output_size);
         for window in &mut self.windows {
             if window.maximized {
+                if let Some(geometry) = window_geometry(window) {
+                    (window.x, window.y) =
+                        origin_for_maximized_geometry((area.x, area.y), geometry);
+                }
+
                 window.surface.with_pending_state(|state| {
-                    state.size = Some(output_size.into());
+                    state.size = Some((area.width, area.height).into());
                 });
 
                 window.surface.send_pending_configure();
             } else if let Some((side, _)) = window.snapped {
-                let Some(target) =
-                    snap_rect_with_gaps(output_size, side, self.tiling_settings.gaps)
-                else {
+                let Some(target) = snap_rect_in_area(area, side, self.tiling_settings.gaps) else {
                     continue;
                 };
 
@@ -1774,8 +1848,8 @@ impl WindowManager {
                 .collect();
 
             let master_percent = self.master_ratio_for_workspace(workspace);
-            let Some(rectangles) = tile_rects_with_ratio(
-                output_size,
+            let Some(rectangles) = tile_rects_in_area(
+                self.current_work_area(output_size),
                 indices.len(),
                 self.tiling_settings.gaps,
                 master_percent,
@@ -1810,6 +1884,9 @@ impl WindowManager {
     }
 
     pub fn sync_mode_position(&mut self, surface: &WlSurface) {
+        // A committed XDG geometry update must not put maximized windows
+        // back at the origin, behind an exclusive top or side panel.
+        let maximized_origin = self.work_area.map_or((0, 0), |area| (area.x, area.y));
         let Some(window) = self
             .windows
             .iter_mut()
@@ -1848,8 +1925,7 @@ impl WindowManager {
         }
 
         if window.maximized {
-            window.x = -geometry.loc.x;
-            window.y = -geometry.loc.y;
+            (window.x, window.y) = origin_for_maximized_geometry(maximized_origin, geometry);
         } else if let Some((_, target)) = window.snapped {
             window.x = target.x - geometry.loc.x;
             window.y = target.y - geometry.loc.y;
@@ -1862,6 +1938,46 @@ impl WindowManager {
                 window.restoring = None;
             }
         }
+    }
+
+    // Opt-in diagnostics for maximized windows whose client-side titlebar
+    // appears to disappear behind an exclusive-zone panel.
+    // Enable with ANWILITE_TRACE_GEOMETRY=1; inactive by default.
+    pub fn trace_geometry_on_commit(&self, surface: &WlSurface, output_size: (i32, i32)) {
+        if std::env::var_os("ANWILITE_TRACE_GEOMETRY").is_none() {
+            return;
+        }
+
+        let Some(window) = self
+            .windows
+            .iter()
+            .find(|w| w.surface.wl_surface() == surface)
+        else {
+            return;
+        };
+
+        let bbox = bbox_from_surface_tree(window.surface.wl_surface(), (0, 0));
+        let xdg_geometry = with_states(window.surface.wl_surface(), |states| {
+            states
+                .cached_state
+                .get::<SurfaceCachedState>()
+                .current()
+                .geometry
+        });
+        let resolved = window_geometry(window);
+        let area = self.current_work_area(output_size);
+
+        eprintln!(
+            "Anwilite geometry trace: maximized={} snapped={} tiled={} \
+             work_area={area:?} surface_origin=({}, {}) \
+             surface_bbox={bbox:?} xdg_geometry={xdg_geometry:?} \
+             effective_geometry={resolved:?}",
+            window.maximized,
+            window.snapped.is_some(),
+            window.tiled.is_some(),
+            window.x,
+            window.y,
+        );
     }
 
     pub fn is_dragging(&self) -> bool {
@@ -2536,5 +2652,100 @@ mod show_desktop_tests {
 
         // Workspace 2 keeps its own Show Desktop state.
         assert!(manager.show_desktop[1]);
+    }
+}
+
+#[cfg(test)]
+mod reserved_work_area_tests {
+    use super::*;
+
+    fn area(x: i32, y: i32, width: i32, height: i32) -> SnapRect {
+        SnapRect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn work_area_changes_only_once() {
+        let mut manager = WindowManager::default();
+        let reserved = area(0, 36, 1280, 764);
+        assert!(manager.set_work_area(reserved, (1280, 800)));
+        assert!(!manager.set_work_area(reserved, (1280, 800)));
+        assert_eq!(manager.current_work_area((1280, 800)), reserved);
+    }
+
+    #[test]
+    fn invalid_work_area_does_not_replace_previous_one() {
+        let mut manager = WindowManager::default();
+        let reserved = area(0, 36, 1280, 764);
+        assert!(manager.set_work_area(reserved, (1280, 800)));
+        assert!(!manager.set_work_area(area(0, 36, 1280, 800), (1280, 800)));
+        assert_eq!(manager.current_work_area((1280, 800)), reserved);
+    }
+
+    #[test]
+    fn top_bar_offsets_a_single_tile() {
+        let reserved = area(0, 36, 1280, 764);
+        let tiles = tile_rects_in_area(
+            reserved,
+            1,
+            crate::layout::SnapGaps { outer: 0, inner: 0 },
+            50,
+        )
+        .unwrap();
+        assert_eq!(tiles, vec![reserved]);
+    }
+
+    #[test]
+    fn top_bar_offsets_snapped_windows() {
+        let reserved = area(0, 36, 1280, 764);
+        let left = snap_rect_in_area(
+            reserved,
+            SnapSide::Left,
+            crate::layout::SnapGaps { outer: 0, inner: 0 },
+        )
+        .unwrap();
+        assert_eq!(left, area(0, 36, 640, 764));
+    }
+
+    #[test]
+    fn left_panel_moves_tile_origin() {
+        let reserved = area(64, 0, 1216, 800);
+        let tiles = tile_rects_in_area(
+            reserved,
+            1,
+            crate::layout::SnapGaps { outer: 0, inner: 0 },
+            50,
+        )
+        .unwrap();
+        assert_eq!(tiles, vec![reserved]);
+    }
+}
+
+#[cfg(test)]
+mod maximized_placement_tests {
+    use super::*;
+
+    #[test]
+    fn window_geometry_starts_below_top_bar() {
+        let geometry = Rectangle::<i32, Logical>::new((0, 0).into(), (1280, 764).into());
+        assert_eq!(origin_for_maximized_geometry((0, 36), geometry), (0, 36));
+    }
+
+    #[test]
+    fn xdg_geometry_offset_aligns_window_with_work_area() {
+        // Geometry can exclude shadow pixels. The client decides whether a
+        // titlebar is present, but the compositor must position its geometry.
+        let geometry = Rectangle::<i32, Logical>::new((5, 10).into(), (1280, 764).into());
+        assert_eq!(origin_for_maximized_geometry((0, 36), geometry), (-5, 26));
+    }
+
+    #[test]
+    fn side_panel_offsets_window_geometry_horizontally() {
+        let geometry = Rectangle::<i32, Logical>::new((3, 7).into(), (1200, 800).into());
+        assert_eq!(origin_for_maximized_geometry((64, 0), geometry), (61, -7));
     }
 }

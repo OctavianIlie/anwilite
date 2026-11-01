@@ -9,7 +9,7 @@ use appearance::border_style;
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic};
 use keybindings::WorkspaceCommand;
-use layout::focus_border_outside_tile;
+use layout::{SnapRect, focus_border_outside_tile};
 
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::desktop::{
@@ -320,6 +320,8 @@ impl WlrLayerShellHandler for App {
                 self.restore_xdg_keyboard_focus();
             }
         }
+        // Unmapping a panel removes its exclusive zone immediately.
+        self.refresh_work_area();
         self.needs_redraw = true;
     }
 }
@@ -354,11 +356,13 @@ impl CompositorHandler for App {
         // Layer-shell clients first commit without a buffer.
         // Only then do we send their initial configure.
         let mut committed_interactive_layer = false;
+        let mut layer_committed = false;
         if let Some(layer) = self
             .layer_surfaces
             .iter()
             .find(|layer| layer.wl_surface() == surface)
         {
+            layer_committed = true;
             layer_map_for_output(&self.output).arrange();
 
             if self.initial_layer_configures.insert(surface.clone()) {
@@ -372,6 +376,10 @@ impl CompositorHandler for App {
             }
         }
 
+        if layer_committed {
+            self.refresh_work_area();
+        }
+
         if committed_interactive_layer && self.preferred_keyboard_layer().as_ref() == Some(surface)
         {
             self.focus_layer(surface.clone());
@@ -380,6 +388,8 @@ impl CompositorHandler for App {
         // Preserve all existing XDG window behavior.
         self.windows.sync_resize_position(surface);
         self.windows.sync_mode_position(surface);
+        self.windows
+            .trace_geometry_on_commit(surface, self.output_size);
 
         self.windows.reflow_for_surface(surface, self.output_size);
 
@@ -440,6 +450,24 @@ struct App {
 }
 
 impl App {
+    fn refresh_work_area(&mut self) -> bool {
+        // Drop Smithay's LayerMap lock before entering WindowManager.
+        // The work area is output-local, not a replacement for output_size.
+        let zone = layer_map_for_output(&self.output).non_exclusive_zone();
+        let area = SnapRect {
+            x: zone.loc.x,
+            y: zone.loc.y,
+            width: zone.size.w,
+            height: zone.size.h,
+        };
+
+        let changed = self.windows.set_work_area(area, self.output_size);
+        if changed {
+            self.needs_redraw = true;
+        }
+        changed
+    }
+
     fn layer_keyboard_mode(layer: &DesktopLayerSurface) -> KeyboardInteractivity {
         with_states(layer.wl_surface(), |states| {
             states
@@ -868,14 +896,21 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             state.output_size = output_dims;
-            state.windows.resize_placed_windows(output_dims);
-            state.windows.reflow_all_tiled_workspaces(output_dims);
 
             // Refresh layer geometry against the new virtual output size.
             // LayerMap normally sends a pending configure when dimensions change.
             // Explicitly resend it here as a nested-output resize compatibility
             // safeguard for existing Waybar/Swaybg layer surfaces.
             let layer_layout_changed = layer_map_for_output(&state.output).arrange();
+
+            // LayerMap owns the exclusive zones. Update window placement only
+            // after arranging the layers for the *new* output dimensions.
+            let work_area_changed = state.refresh_work_area();
+            if !work_area_changed {
+                // Output size can change even if the usable area is unchanged.
+                state.windows.resize_placed_windows(output_dims);
+            }
+
             let mut configured_layers = 0;
             for layer in &state.layer_surfaces {
                 let shell = layer.layer_surface();

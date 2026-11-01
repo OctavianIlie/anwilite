@@ -1,6 +1,5 @@
 #!/bin/sh
-# Anwilite Lesson 33B: nested development session launcher.
-# This is NOT a standalone login/session manager or a security sandbox.
+
 set -eu
 
 usage() {

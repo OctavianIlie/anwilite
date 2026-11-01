@@ -14,6 +14,46 @@ pub struct SnapRect {
     pub height: i32,
 }
 
+pub fn snap_rect_in_area(area: SnapRect, side: SnapSide, gaps: SnapGaps) -> Option<SnapRect> {
+    if area.width <= 0 || area.height <= 0 {
+        return None;
+    }
+
+    let mut rect = snap_rect_with_gaps((area.width, area.height), side, gaps)?;
+
+    rect.x = rect.x.checked_add(area.x)?;
+    rect.y = rect.y.checked_add(area.y)?;
+
+    Some(rect)
+}
+
+pub fn tile_rects_in_area(
+    area: SnapRect,
+    window_count: usize,
+    gaps: SnapGaps,
+    master_percent: u8,
+) -> Option<Vec<SnapRect>> {
+    if area.width <= 0 || area.height <= 0 {
+        return None;
+    }
+
+    let rects = tile_rects_with_ratio(
+        (area.width, area.height),
+        window_count,
+        gaps,
+        master_percent,
+    )?;
+
+    rects
+        .into_iter()
+        .map(|mut rect| {
+            rect.x = rect.x.checked_add(area.x)?;
+            rect.y = rect.y.checked_add(area.y)?;
+            Some(rect)
+        })
+        .collect()
+}
+
 pub fn snap_rect(output_size: (i32, i32), side: SnapSide) -> Option<SnapRect> {
     let (output_width, output_height) = output_size;
 
