@@ -116,6 +116,7 @@ struct TilingOptions {
     default_master_ratio: Option<u8>,
     start_tiled: Option<bool>,
     tiled_workspaces: Option<Vec<usize>>,
+    grid_workspaces: Option<Vec<usize>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -241,6 +242,21 @@ fn parse_config(contents: &str) -> Result<AnwiliteConfig, String> {
         }
 
         tiling.tiled_workspaces = Some(mask);
+    }
+    if let Some(workspaces) = options.grid_workspaces {
+        let mut mask = [false; WORKSPACE_COUNT];
+        for workspace in workspaces {
+            if !(1..=WORKSPACE_COUNT).contains(&workspace) {
+                return Err(format!(
+                    "invalid grid workspace {workspace}; expected 1..={WORKSPACE_COUNT}"
+                ));
+            }
+            if mask[workspace - 1] {
+                return Err(format!("grid workspace {workspace} appears more than once"));
+            }
+            mask[workspace - 1] = true;
+        }
+        tiling.grid_workspaces = Some(mask);
     }
 
     if !tiling.is_valid() {
@@ -737,5 +753,27 @@ mod tests {
         let config = parse_config("[apps]\nmenu = [\"weston-terminal\"]\n").unwrap();
 
         assert_eq!(config.apps.menu, vec!["weston-terminal"]);
+    }
+}
+
+#[cfg(test)]
+mod grid_config_tests {
+    use super::*;
+    #[test]
+    fn grid_workspaces_are_independent_of_tiling_enablement() {
+        let config =
+            parse_config("[tiling]\ntiled_workspaces = [1, 3]\ngrid_workspaces = [3, 4]\n")
+                .unwrap();
+        let tiled = config.tiling.tiled_workspaces.unwrap();
+        let grids = config.tiling.grid_workspaces.unwrap();
+        assert!(tiled[0] && tiled[2]);
+        assert!(!tiled[3] && grids[3] && grids[2]);
+        assert!(!grids[0]);
+    }
+    #[test]
+    fn bad_grid_workspace_is_rejected() {
+        for list in ["[0]", "[11]", "[2, 2]"] {
+            assert!(parse_config(&format!("[tiling]\ngrid_workspaces = {list}\n")).is_err());
+        }
     }
 }

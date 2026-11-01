@@ -1153,6 +1153,10 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                         state.windows.toggle_tiling(state.output_size)
                                     }
 
+                                    WorkspaceCommand::ToggleGrid => {
+                                        state.windows.toggle_grid_layout(state.output_size)
+                                    }
+
                                     WorkspaceCommand::AdjustMasterRatio(delta) => {
                                         state.windows.adjust_master_ratio(delta, state.output_size)
                                     }
@@ -1338,6 +1342,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                         WorkspaceCommand::SwitchTo(_)
                                             | WorkspaceCommand::MoveAndFollow(_)
                                             | WorkspaceCommand::ToggleTiling
+                                            | WorkspaceCommand::ToggleGrid
                                             | WorkspaceCommand::Minimize
                                             | WorkspaceCommand::ToggleShowDesktop
                                             | WorkspaceCommand::CycleWindow(_)

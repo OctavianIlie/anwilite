@@ -13,6 +13,7 @@ pub enum WorkspaceCommand {
     Maximize,
     Restore,
     ToggleTiling,
+    ToggleGrid,
     AdjustMasterRatio(i8),
     ResetMasterRatio,
     FocusTile(TileFocusDirection),
@@ -178,6 +179,7 @@ fn parse_action(spec: &BindingSpec) -> Result<WorkspaceCommand, String> {
         ("launch_terminal", None) => Ok(Command::LaunchTerminal),
         ("launch_file_manager", None) => Ok(Command::LaunchFileManager),
         ("toggle_tiling", None) => Ok(Command::ToggleTiling),
+        ("toggle_grid", None) => Ok(Command::ToggleGrid),
         ("minimize", None) => Ok(Command::Minimize),
         ("restore_minimized", None) => Ok(Command::RestoreMinimized),
         ("maximize", None) => Ok(Command::Maximize),
@@ -236,6 +238,7 @@ impl Default for KeyBindings {
             ("M", Command::Minimize),
             ("Shift+M", Command::RestoreMinimized),
             ("Shift+T", Command::ToggleTiling),
+            ("Shift+G", Command::ToggleGrid),
             ("Shift+H", Command::FocusTile(TileFocusDirection::Previous)),
             ("Shift+J", Command::FocusTile(TileFocusDirection::Next)),
             (
@@ -678,6 +681,38 @@ mod tests {
 
         assert!(
             KeyBindings::from_explicit(&[spec("Super+Shift+C", "launch_menu", None),]).is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod grid_keybinding_tests {
+    use super::*;
+    #[test]
+    fn grid_toggle_has_nested_and_default_shortcuts() {
+        for name in ["Super+Shift+G", "Ctrl+Alt+Shift+G"] {
+            assert_eq!(
+                KeyBindings::default().action_for(Shortcut::parse(name).unwrap()),
+                Some(WorkspaceCommand::ToggleGrid)
+            );
+            let explicit = KeyBindings::from_explicit(&[BindingSpec {
+                key: name.into(),
+                action: "toggle_grid".into(),
+                workspace: None,
+            }])
+            .unwrap();
+            assert_eq!(
+                explicit.action_for(Shortcut::parse(name).unwrap()),
+                Some(WorkspaceCommand::ToggleGrid)
+            );
+        }
+        assert!(
+            KeyBindings::from_explicit(&[BindingSpec {
+                key: "Super+Shift+G".into(),
+                action: "toggle_grid".into(),
+                workspace: Some(2),
+            }])
+            .is_err()
         );
     }
 }

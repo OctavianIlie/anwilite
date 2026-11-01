@@ -1,4 +1,7 @@
-use crate::layout::{SnapRect, SnapSide, TilingSettings, snap_rect_in_area, tile_rects_in_area};
+use crate::layout::{
+    SnapRect, SnapSide, TilePattern, TilingSettings, layout_rects_in_area, snap_rect_in_area,
+    tile_rects_in_area,
+};
 use crate::workspace::{WORKSPACE_COUNT, Workspaces};
 
 use smithay::{
@@ -605,6 +608,7 @@ pub struct WindowManager {
     resizing: Option<ResizeState>,
     settling: Option<SettlingResize>,
     layout_modes: [LayoutMode; WORKSPACE_COUNT],
+    tile_patterns: [TilePattern; WORKSPACE_COUNT],
     minimize_counter: u64,
     master_ratios: [Option<u8>; WORKSPACE_COUNT],
     tiling_settings: TilingSettings,
@@ -672,6 +676,18 @@ impl WindowManager {
         };
 
         self.layout_modes = [default_mode; WORKSPACE_COUNT];
+        self.tile_patterns =
+            settings
+                .grid_workspaces
+                .map_or([TilePattern::MasterStack; WORKSPACE_COUNT], |mask| {
+                    mask.map(|grid| {
+                        if grid {
+                            TilePattern::Grid
+                        } else {
+                            TilePattern::MasterStack
+                        }
+                    })
+                });
 
         // An explicit workspace list overrides the global startup mode.
         if let Some(tiled_workspaces) = settings.tiled_workspaces {
@@ -699,8 +715,10 @@ impl WindowManager {
         }
 
         let gaps_changed = self.tiling_settings.gaps != next.gaps;
-        let geometry_changed =
-            gaps_changed || self.tiling_settings.default_master_ratio != next.default_master_ratio;
+        let pattern_changed = self.tiling_settings.grid_workspaces != next.grid_workspaces;
+        let geometry_changed = gaps_changed
+            || pattern_changed
+            || self.tiling_settings.default_master_ratio != next.default_master_ratio;
 
         // Don't change window geometry during an interactive operation.
         if geometry_changed && (self.is_dragging() || self.is_resizing() || self.settling.is_some())
@@ -738,11 +756,24 @@ impl WindowManager {
                 // Preserve per-workspace master-ratio overrides.
                 let ratio = self.master_ratios[workspace - 1].unwrap_or(next.default_master_ratio);
 
-                let targets = tile_rects_in_area(
+                let next_pattern = if pattern_changed {
+                    next.grid_workspaces
+                        .map_or(TilePattern::MasterStack, |mask| {
+                            if mask[workspace - 1] {
+                                TilePattern::Grid
+                            } else {
+                                TilePattern::MasterStack
+                            }
+                        })
+                } else {
+                    self.tile_patterns[workspace - 1]
+                };
+                let targets = layout_rects_in_area(
                     self.current_work_area(output_size),
                     participants.len(),
                     next.gaps,
                     ratio,
+                    next_pattern,
                 )
                 .ok_or_else(|| format!("workspace {workspace} cannot fit the new layout"))?;
 
@@ -777,6 +808,19 @@ impl WindowManager {
 
         // Validation succeeded. Now we can commit the new settings.
         self.tiling_settings = next;
+        if pattern_changed {
+            self.tile_patterns =
+                next.grid_workspaces
+                    .map_or([TilePattern::MasterStack; WORKSPACE_COUNT], |mask| {
+                        mask.map(|grid| {
+                            if grid {
+                                TilePattern::Grid
+                            } else {
+                                TilePattern::MasterStack
+                            }
+                        })
+                    });
+        }
 
         if gaps_changed {
             let area = self.current_work_area(output_size);
@@ -914,12 +958,85 @@ impl WindowManager {
         self.layout_modes[self.current_workspace() - 1]
     }
 
+    fn tile_targets_for_workspace(
+        &self,
+        workspace: usize,
+        count: usize,
+        output_size: (i32, i32),
+    ) -> Option<Vec<SnapRect>> {
+        layout_rects_in_area(
+            self.current_work_area(output_size),
+            count,
+            self.tiling_settings.gaps,
+            self.master_ratio_for_workspace(workspace),
+            self.tile_patterns[workspace - 1],
+        )
+    }
+
+    pub fn tile_pattern_for_workspace(&self, workspace: usize) -> TilePattern {
+        self.tile_patterns[workspace - 1]
+    }
+
+    /// Switch only the active workspace's preferred tiling arrangement.
+    /// Floating workspaces remember the choice until tiling is enabled.
+    pub fn toggle_grid_layout(&mut self, output_size: (i32, i32)) -> bool {
+        if self.is_dragging() || self.is_resizing() || self.settling.is_some() {
+            return false;
+        }
+        let workspace = self.current_workspace();
+        let next = match self.tile_patterns[workspace - 1] {
+            TilePattern::MasterStack => TilePattern::Grid,
+            TilePattern::Grid => TilePattern::MasterStack,
+        };
+        if self.current_layout_mode() == LayoutMode::Tiled {
+            let participants: Vec<&ManagedWindow> = self
+                .windows
+                .iter()
+                .filter(|window| {
+                    window.workspace == workspace && window.surface.alive() && !window.minimized
+                })
+                .collect();
+            if participants.iter().any(|window| {
+                window.tiled.is_none()
+                    || window.maximized
+                    || window.restoring.is_some()
+                    || window.pending_unsnap.is_some()
+                    || window_geometry(window).is_none()
+            }) {
+                return false;
+            }
+            let Some(targets) = layout_rects_in_area(
+                self.current_work_area(output_size),
+                participants.len(),
+                self.tiling_settings.gaps,
+                self.master_ratio_for_workspace(workspace),
+                next,
+            ) else {
+                return false;
+            };
+            if participants
+                .iter()
+                .zip(targets.iter())
+                .any(|(window, &tile)| !window_can_fit_tile(window, tile))
+            {
+                return false;
+            }
+        }
+        self.tile_patterns[workspace - 1] = next;
+        if self.current_layout_mode() == LayoutMode::Tiled {
+            self.reflow_tiled_workspace(workspace, output_size);
+        }
+        println!("Anwilite: workspace {workspace} tile layout: {next:?}");
+        true
+    }
+
     pub fn master_ratio_for_workspace(&self, workspace: usize) -> u8 {
         self.master_ratios[workspace - 1].unwrap_or(self.tiling_settings.default_master_ratio)
     }
 
     pub fn set_master_ratio(&mut self, percent: u8, output_size: (i32, i32)) -> bool {
         if self.current_layout_mode() != LayoutMode::Tiled
+            || self.tile_pattern_for_workspace(self.current_workspace()) != TilePattern::MasterStack
             || self.is_dragging()
             || self.is_resizing()
             || self.settling.is_some()
@@ -989,6 +1106,7 @@ impl WindowManager {
 
     pub fn reset_master_ratio(&mut self, output_size: (i32, i32)) -> bool {
         if self.current_layout_mode() != LayoutMode::Tiled
+            || self.tile_pattern_for_workspace(self.current_workspace()) != TilePattern::MasterStack
             || self.is_dragging()
             || self.is_resizing()
             || self.settling.is_some()
@@ -1112,13 +1230,8 @@ impl WindowManager {
             .map(|(index, _)| index)
             .collect();
 
-        let master_percent = self.master_ratio_for_workspace(workspace);
-        let Some(targets) = tile_rects_in_area(
-            self.current_work_area(output_size),
-            indices.len(),
-            self.tiling_settings.gaps,
-            master_percent,
-        ) else {
+        let Some(targets) = self.tile_targets_for_workspace(workspace, indices.len(), output_size)
+        else {
             let maximized_surfaces: Vec<ToplevelSurface> = indices
                 .iter()
                 .filter_map(|&index| {
@@ -1307,12 +1420,8 @@ impl WindowManager {
             return false;
         }
 
-        let Some(targets) = tile_rects_in_area(
-            self.current_work_area(output_size),
-            windows.len(),
-            self.tiling_settings.gaps,
-            self.master_ratio_for_workspace(workspace),
-        ) else {
+        let Some(targets) = self.tile_targets_for_workspace(workspace, windows.len(), output_size)
+        else {
             return false;
         };
 
@@ -1646,16 +1755,9 @@ impl WindowManager {
             return false;
         }
 
-        // Make sure the output can fit the current layout.
-        let ratio = self.master_ratio_for_workspace(workspace);
-
-        // Calculate the target rectangles using the configured gaps and ratio.
-        let Some(targets) = tile_rects_in_area(
-            self.current_work_area(output_size),
-            indices.len(),
-            self.tiling_settings.gaps,
-            ratio,
-        ) else {
+        // Calculate the selected layout's target rectangles before swapping.
+        let Some(targets) = self.tile_targets_for_workspace(workspace, indices.len(), output_size)
+        else {
             return false;
         };
 
@@ -2235,12 +2337,30 @@ impl WindowManager {
 
             let next_count = visible_count.checked_add(1)?;
 
-            tile_rects_in_area(
-                self.current_work_area(output_size),
-                next_count,
-                self.tiling_settings.gaps,
-                self.master_ratio_for_workspace(workspace),
-            )?;
+            let targets = self.tile_targets_for_workspace(workspace, next_count, output_size)?;
+            // The restoring window must be validated at its actual stacking
+            // index, not assumed to be the last tile.
+            let indices: Vec<usize> = self
+                .windows
+                .iter()
+                .enumerate()
+                .filter(|(candidate, window)| {
+                    window.workspace == workspace
+                        && window.surface.alive()
+                        && (!window.minimized || *candidate == index)
+                })
+                .map(|(candidate, _)| candidate)
+                .collect();
+            if indices.len() != targets.len()
+                || indices
+                    .into_iter()
+                    .zip(targets.iter())
+                    .any(|(candidate, &target)| {
+                        !window_can_fit_tile(&self.windows[candidate], target)
+                    })
+            {
+                return None;
+            }
         }
 
         self.windows[index].minimized = false;
@@ -2314,13 +2434,9 @@ impl WindowManager {
                 .map(|(index, _)| index)
                 .collect();
 
-            let master_percent = self.master_ratio_for_workspace(workspace);
-            let Some(rectangles) = tile_rects_in_area(
-                self.current_work_area(output_size),
-                indices.len(),
-                self.tiling_settings.gaps,
-                master_percent,
-            ) else {
+            let Some(rectangles) =
+                self.tile_targets_for_workspace(workspace, indices.len(), output_size)
+            else {
                 continue;
             };
 
@@ -2791,6 +2907,49 @@ impl WindowManager {
             state.states.unset(xdg_toplevel::State::Resizing);
         });
         resize.anchor.surface.send_pending_configure();
+    }
+}
+
+#[cfg(test)]
+mod grid_pattern_state_tests {
+    use super::*;
+    #[test]
+    fn startup_grid_preferences_are_per_workspace() {
+        let mut manager = WindowManager::default();
+        let mut grids = [false; WORKSPACE_COUNT];
+        grids[0] = true;
+        grids[2] = true;
+        manager.configure_startup(TilingSettings {
+            grid_workspaces: Some(grids),
+            ..TilingSettings::default()
+        });
+        assert_eq!(manager.tile_pattern_for_workspace(1), TilePattern::Grid);
+        assert_eq!(
+            manager.tile_pattern_for_workspace(2),
+            TilePattern::MasterStack
+        );
+        assert_eq!(manager.tile_pattern_for_workspace(3), TilePattern::Grid);
+    }
+
+    #[test]
+    fn toggling_grid_preserves_workspace_independence_even_when_floating() {
+        let mut manager = WindowManager::default();
+        manager.configure_startup(TilingSettings::default());
+        assert!(manager.toggle_grid_layout((1280, 800)));
+        assert_eq!(manager.tile_pattern_for_workspace(1), TilePattern::Grid);
+        assert!(manager.switch_to_workspace(2));
+        assert_eq!(
+            manager.tile_pattern_for_workspace(2),
+            TilePattern::MasterStack
+        );
+        assert!(manager.toggle_grid_layout((1280, 800)));
+        assert!(manager.switch_to_workspace(1));
+        assert_eq!(manager.tile_pattern_for_workspace(1), TilePattern::Grid);
+        assert!(manager.toggle_grid_layout((1280, 800)));
+        assert_eq!(
+            manager.tile_pattern_for_workspace(1),
+            TilePattern::MasterStack
+        );
     }
 }
 

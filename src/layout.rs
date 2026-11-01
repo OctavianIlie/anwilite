@@ -10,6 +10,13 @@ pub enum SnapSide {
     BottomRight,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TilePattern {
+    #[default]
+    MasterStack,
+    Grid,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapRect {
     pub x: i32,
@@ -56,6 +63,79 @@ pub fn tile_rects_in_area(
             Some(rect)
         })
         .collect()
+}
+
+// Keep master-and-stack's existing geometry function unchanged. Grid uses the
+// same outer/inner gap convention, including for odd output dimensions.
+pub fn layout_rects_in_area(
+    area: SnapRect,
+    count: usize,
+    gaps: SnapGaps,
+    master_percent: u8,
+    pattern: TilePattern,
+) -> Option<Vec<SnapRect>> {
+    match pattern {
+        TilePattern::MasterStack => tile_rects_in_area(area, count, gaps, master_percent),
+        TilePattern::Grid => grid_rects_in_area(area, count, gaps),
+    }
+}
+
+// Split an axis into exact integer cells. Remainder pixels go to early cells;
+// no gaps or pixels disappear when a dimension is odd.
+fn grid_axis(origin: i32, size: i32, count: usize, gaps: SnapGaps) -> Option<Vec<(i32, i32)>> {
+    if count == 0 || gaps.outer < 0 || gaps.inner < 0 {
+        return None;
+    }
+    let count_i32 = i32::try_from(count).ok()?;
+    let usable = size
+        .checked_sub(gaps.outer.checked_mul(2)?)?
+        .checked_sub(gaps.inner.checked_mul(count_i32.checked_sub(1)?)?)?;
+    if usable < count_i32 {
+        return None;
+    }
+    let base = usable / count_i32;
+    let extra = usable % count_i32;
+    let mut at = origin.checked_add(gaps.outer)?;
+    let mut segments = Vec::with_capacity(count);
+    for i in 0..count_i32 {
+        let length = base + i32::from(i < extra);
+        segments.push((at, length));
+        at = at.checked_add(length)?.checked_add(gaps.inner)?;
+    }
+    Some(segments)
+}
+
+pub fn grid_rects_in_area(area: SnapRect, count: usize, gaps: SnapGaps) -> Option<Vec<SnapRect>> {
+    if area.width <= 0 || area.height <= 0 || gaps.outer < 0 || gaps.inner < 0 {
+        return None;
+    }
+    if count == 0 {
+        return Some(Vec::new());
+    }
+
+    // Integer ceiling square-root; avoids floating rounding of layout sizes.
+    let mut columns: usize = 1;
+    while columns.checked_mul(columns)? < count {
+        columns = columns.checked_add(1)?;
+    }
+    let rows = count.div_ceil(columns);
+    let y_cells = grid_axis(area.y, area.height, rows, gaps)?;
+    let mut result = Vec::with_capacity(count);
+    for (row, (y, height)) in y_cells.into_iter().enumerate() {
+        let first = row.checked_mul(columns)?;
+        let row_count = (count - first).min(columns);
+        // The last row expands to use the available width, rather than leaving
+        // an awkward empty tile on its right.
+        for (x, width) in grid_axis(area.x, area.width, row_count, gaps)? {
+            result.push(SnapRect {
+                x,
+                y,
+                width,
+                height,
+            });
+        }
+    }
+    Some(result)
 }
 
 pub fn snap_rect(output_size: (i32, i32), side: SnapSide) -> Option<SnapRect> {
@@ -107,6 +187,7 @@ pub struct TilingSettings {
     pub default_master_ratio: u8,
     pub start_tiled: bool,
     pub tiled_workspaces: Option<[bool; WORKSPACE_COUNT]>,
+    pub grid_workspaces: Option<[bool; WORKSPACE_COUNT]>,
 }
 
 impl Default for TilingSettings {
@@ -116,6 +197,7 @@ impl Default for TilingSettings {
             default_master_ratio: 50,
             start_tiled: false,
             tiled_workspaces: None,
+            grid_workspaces: None,
         }
     }
 }
@@ -1011,5 +1093,92 @@ mod tests {
         };
 
         assert!(!settings.is_valid());
+    }
+}
+
+#[cfg(test)]
+mod grid_layout_tests {
+    use super::*;
+    const AREA: SnapRect = SnapRect {
+        x: 0,
+        y: 36,
+        width: 1001,
+        height: 765,
+    };
+    const GAPS: SnapGaps = SnapGaps {
+        outer: 12,
+        inner: 7,
+    };
+
+    #[test]
+    fn grid_zero_one_three_five_and_odd_dimensions() {
+        assert_eq!(grid_rects_in_area(AREA, 0, GAPS), Some(vec![]));
+        let one = grid_rects_in_area(AREA, 1, GAPS).unwrap();
+        assert_eq!(
+            one,
+            vec![SnapRect {
+                x: 12,
+                y: 48,
+                width: 977,
+                height: 741
+            }]
+        );
+        let three = grid_rects_in_area(AREA, 3, GAPS).unwrap();
+        assert_eq!(three.len(), 3);
+        assert_eq!(three[0].y, three[1].y);
+        assert_eq!(three[0].x + three[0].width + 7, three[1].x);
+        assert_eq!(three[2].x, 12);
+        assert_eq!(three[2].width, 977);
+        let five = grid_rects_in_area(AREA, 5, GAPS).unwrap();
+        assert_eq!(five.len(), 5);
+        assert_eq!(five[2].x + five[2].width, 989);
+        assert_eq!(five[3].x, 12);
+        assert_eq!(five[4].x + five[4].width, 989);
+    }
+
+    #[test]
+    fn grid_stays_in_waybar_area_without_overlaps() {
+        for n in 1..=12 {
+            let rects = grid_rects_in_area(AREA, n, GAPS).unwrap();
+            assert_eq!(rects.len(), n);
+            for (i, a) in rects.iter().enumerate() {
+                assert!(a.x >= AREA.x + GAPS.outer && a.y >= AREA.y + GAPS.outer);
+                assert!(a.x + a.width <= AREA.x + AREA.width - GAPS.outer);
+                assert!(a.y + a.height <= AREA.y + AREA.height - GAPS.outer);
+                for b in &rects[i + 1..] {
+                    let overlaps = a.x < b.x + b.width
+                        && b.x < a.x + a.width
+                        && a.y < b.y + b.height
+                        && b.y < a.y + a.height;
+                    assert!(!overlaps, "grid tiles overlap: {a:?} / {b:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grid_rejects_insufficient_area_and_preserves_master_stack() {
+        let tiny = SnapRect {
+            x: 0,
+            y: 0,
+            width: 24,
+            height: 24,
+        };
+        assert!(grid_rects_in_area(tiny, 4, GAPS).is_none());
+        assert!(
+            grid_rects_in_area(
+                AREA,
+                5,
+                SnapGaps {
+                    outer: -1,
+                    inner: 7
+                }
+            )
+            .is_none()
+        );
+        assert_eq!(
+            layout_rects_in_area(AREA, 4, GAPS, 60, TilePattern::MasterStack),
+            tile_rects_in_area(AREA, 4, GAPS, 60),
+        );
     }
 }
