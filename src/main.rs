@@ -1,10 +1,26 @@
+mod appearance;
+mod config;
+mod keybindings;
 mod layout;
 mod window;
 mod workspace;
 
+use appearance::border_style;
+use calloop::timer::{TimeoutAction, Timer};
 use calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic};
-use layout::SnapSide;
+use keybindings::WorkspaceCommand;
+use layout::{SnapRect, focus_border_outside_tile};
+
 use smithay::backend::renderer::damage::OutputDamageTracker;
+use smithay::desktop::{
+    LayerSurface as DesktopLayerSurface, WindowSurfaceType, layer_map_for_output,
+};
+use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel};
+use smithay::wayland::output::{OutputHandler, OutputManagerState};
+use smithay::wayland::shell::wlr_layer::{
+    KeyboardInteractivity, Layer, LayerSurface, LayerSurfaceCachedState, WlrLayerShellHandler,
+    WlrLayerShellState,
+};
 use smithay::wayland::socket::ListeningSocketSource;
 use smithay::{
     backend::{
@@ -14,8 +30,10 @@ use smithay::{
         },
         renderer::{
             element::{
-                Kind,
+                Kind, render_elements,
+                solid::{SolidColorBuffer, SolidColorRenderElement},
                 surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
+                utils::CropRenderElement,
             },
             gles::GlesRenderer,
             utils::on_commit_buffer_handler,
@@ -25,16 +43,16 @@ use smithay::{
     delegate_compositor, delegate_data_device, delegate_seat, delegate_shm, delegate_xdg_shell,
     input::{
         Seat, SeatHandler, SeatState,
-        keyboard::{FilterResult, keysyms},
+        keyboard::FilterResult,
         pointer::{ButtonEvent, MotionEvent},
     },
     reexports::wayland_server::{Display, protocol::wl_seat},
-    utils::{Serial, Transform},
+    utils::{Logical, Physical, Point, Rectangle, Serial, Transform},
     wayland::{
         buffer::BufferHandler,
         compositor::{
             CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes,
-            TraversalAction, with_surface_tree_downward,
+            TraversalAction, with_states, with_surface_tree_downward,
         },
         selection::{
             SelectionHandler,
@@ -48,13 +66,16 @@ use smithay::{
         shm::{ShmHandler, ShmState},
     },
 };
-use std::cell::RefCell;
+use smithay::{delegate_layer_shell, delegate_output};
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::rc::Rc;
 use std::time::Duration;
 use std::{os::unix::io::OwnedFd, sync::Arc};
 use wayland_protocols::xdg::shell::server::xdg_toplevel;
+use wayland_server::protocol::wl_output::WlOutput;
 use wayland_server::{
     Client,
     backend::{ClientData, ClientId, DisconnectReason},
@@ -63,7 +84,32 @@ use wayland_server::{
         wl_surface::{self, WlSurface},
     },
 };
-use window::{TileFocusDirection, WindowManager};
+use window::WindowManager;
+
+const ANWILITE_SOCKET_NAME: &str = "octlitch-0";
+
+/// Only top/overlay layer clients should automatically take desktop focus.
+/// OnDemand is allowed here for application launchers opened by a shortcut;
+/// None is never eligible. Background/Bottom may still receive pointer input.
+fn layer_can_auto_focus(kind: Layer, mode: KeyboardInteractivity) -> bool {
+    matches!(kind, Layer::Top | Layer::Overlay)
+        && matches!(
+            mode,
+            KeyboardInteractivity::Exclusive | KeyboardInteractivity::OnDemand
+        )
+}
+
+struct LayerHit {
+    root: WlSurface,
+    pointer_target: (WlSurface, Point<f64, Logical>),
+}
+
+render_elements! {
+    AnwiliteRenderElement<=GlesRenderer>;
+    Surface=WaylandSurfaceRenderElement<GlesRenderer>,
+    ClippedSurface=CropRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>,
+    FocusBorder=SolidColorRenderElement,
+}
 
 impl BufferHandler for App {
     fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
@@ -93,10 +139,11 @@ impl XdgShellHandler for App {
             self.needs_redraw = true;
         }
 
-        // Give the new window actual keyboard focus.
-        if let Some(keyboard) = self.seat.get_keyboard() {
+        // Do not steal keyboard focus from a visible layer-shell launcher.
+        if self.active_layer_keyboard.is_none()
+            && let Some(keyboard) = self.seat.get_keyboard()
+        {
             let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-
             keyboard.set_focus(self, Some(surface.wl_surface().clone()), serial);
         }
     }
@@ -223,6 +270,62 @@ impl XdgShellHandler for App {
     }
 }
 
+impl OutputHandler for App {}
+
+impl WlrLayerShellHandler for App {
+    fn shell_state(&mut self) -> &mut WlrLayerShellState {
+        &mut self.layer_shell_state
+    }
+
+    fn new_layer_surface(
+        &mut self,
+        surface: LayerSurface,
+        _output: Option<WlOutput>,
+        layer: Layer,
+        namespace: String,
+    ) {
+        println!("Anwilite: new layer: {namespace}, type={layer:?}");
+
+        let desktop_layer = DesktopLayerSurface::new(surface, namespace);
+
+        let result = layer_map_for_output(&self.output).map_layer(&desktop_layer);
+
+        if let Err(error) = result {
+            eprintln!("Anwilite: cannot map layer: {error}");
+            return;
+        }
+
+        self.layer_surfaces.push(desktop_layer);
+        self.needs_redraw = true;
+    }
+
+    fn layer_destroyed(&mut self, surface: LayerSurface) {
+        self.initial_layer_configures.remove(surface.wl_surface());
+
+        if let Some(index) = self
+            .layer_surfaces
+            .iter()
+            .position(|layer| layer.layer_surface() == &surface)
+        {
+            let layer = self.layer_surfaces.remove(index);
+
+            layer_map_for_output(&self.output).unmap_layer(&layer);
+        }
+
+        if self.active_layer_keyboard.as_ref() == Some(surface.wl_surface()) {
+            if let Some(next) = self.preferred_keyboard_layer() {
+                // Keep the original XDG focus saved across multiple layers.
+                self.focus_layer(next);
+            } else {
+                self.restore_xdg_keyboard_focus();
+            }
+        }
+        // Unmapping a panel removes its exclusive zone immediately.
+        self.refresh_work_area();
+        self.needs_redraw = true;
+    }
+}
+
 impl SelectionHandler for App {
     type SelectionUserData = ();
 }
@@ -249,8 +352,44 @@ impl CompositorHandler for App {
 
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
+
+        // Layer-shell clients first commit without a buffer.
+        // Only then do we send their initial configure.
+        let mut committed_interactive_layer = false;
+        let mut layer_committed = false;
+        if let Some(layer) = self
+            .layer_surfaces
+            .iter()
+            .find(|layer| layer.wl_surface() == surface)
+        {
+            layer_committed = true;
+            layer_map_for_output(&self.output).arrange();
+
+            if self.initial_layer_configures.insert(surface.clone()) {
+                // First bufferless commit: configure, but don't steal focus yet.
+                let serial = layer.layer_surface().send_configure();
+                println!("Anwilite: initial layer configure: {serial:?}");
+            } else {
+                // A subsequent commit can present the configured layer.
+                committed_interactive_layer =
+                    layer_can_auto_focus(layer.layer(), Self::layer_keyboard_mode(layer));
+            }
+        }
+
+        if layer_committed {
+            self.refresh_work_area();
+        }
+
+        if committed_interactive_layer && self.preferred_keyboard_layer().as_ref() == Some(surface)
+        {
+            self.focus_layer(surface.clone());
+        }
+
+        // Preserve all existing XDG window behavior.
         self.windows.sync_resize_position(surface);
         self.windows.sync_mode_position(surface);
+        self.windows
+            .trace_geometry_on_commit(surface, self.output_size);
 
         self.windows.reflow_for_surface(surface, self.output_size);
 
@@ -276,6 +415,7 @@ impl SeatHandler for App {
 
     fn focus_changed(&mut self, _seat: &Seat<Self>, focused: Option<&WlSurface>) {
         self.windows.remember_focus(focused);
+        self.needs_redraw = true;
     }
     fn cursor_image(
         &mut self,
@@ -283,23 +423,6 @@ impl SeatHandler for App {
         _image: smithay::input::pointer::CursorImageStatus,
     ) {
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum WorkspaceCommand {
-    SwitchTo(usize),
-    MoveAndFollow(usize),
-    Snap(SnapSide),
-    Maximize,
-    Restore,
-    ToggleTiling,
-    AdjustMasterRatio(i8),
-    ResetMasterRatio,
-    FocusTile(TileFocusDirection),
-    SwapTile(TileFocusDirection),
-    PromoteTile,
-    Minimize,
-    RestoreMinimized,
 }
 
 struct App {
@@ -317,6 +440,175 @@ struct App {
     needs_redraw: bool,
     output_size: (i32, i32),
     surface_commit_count: u64,
+
+    output: Output,
+    layer_shell_state: WlrLayerShellState,
+    layer_surfaces: Vec<DesktopLayerSurface>,
+    initial_layer_configures: HashSet<WlSurface>,
+    active_layer_keyboard: Option<WlSurface>,
+    saved_xdg_keyboard_focus: Option<WlSurface>,
+}
+
+impl App {
+    fn refresh_work_area(&mut self) -> bool {
+        // Drop Smithay's LayerMap lock before entering WindowManager.
+        // The work area is output-local, not a replacement for output_size.
+        let zone = layer_map_for_output(&self.output).non_exclusive_zone();
+        let area = SnapRect {
+            x: zone.loc.x,
+            y: zone.loc.y,
+            width: zone.size.w,
+            height: zone.size.h,
+        };
+
+        let changed = self.windows.set_work_area(area, self.output_size);
+        if changed {
+            self.needs_redraw = true;
+        }
+        changed
+    }
+
+    fn layer_keyboard_mode(layer: &DesktopLayerSurface) -> KeyboardInteractivity {
+        with_states(layer.wl_surface(), |states| {
+            states
+                .cached_state
+                .get::<LayerSurfaceCachedState>()
+                .current()
+                .keyboard_interactivity
+        })
+    }
+
+    fn preferred_keyboard_layer(&self) -> Option<WlSurface> {
+        let map = layer_map_for_output(&self.output);
+        for kind in [Layer::Overlay, Layer::Top] {
+            for layer in map.layers_on(kind).rev() {
+                if layer.layer_surface().alive()
+                    && layer_can_auto_focus(layer.layer(), Self::layer_keyboard_mode(layer))
+                {
+                    return Some(layer.wl_surface().clone());
+                }
+            }
+        }
+        None
+    }
+
+    fn interactive_layer_alive(&self, surface: &WlSurface) -> bool {
+        self.layer_surfaces.iter().any(|layer| {
+            layer.wl_surface() == surface
+                && layer.layer_surface().alive()
+                && layer.can_receive_keyboard_focus()
+        })
+    }
+
+    fn focused_layer_is_exclusive(&self) -> bool {
+        self.active_layer_keyboard.as_ref().is_some_and(|surface| {
+            self.layer_surfaces.iter().any(|layer| {
+                layer.wl_surface() == surface
+                    && Self::layer_keyboard_mode(layer) == KeyboardInteractivity::Exclusive
+            })
+        })
+    }
+
+    fn focus_layer(&mut self, surface: WlSurface) {
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
+        if self.active_layer_keyboard.as_ref() == Some(&surface)
+            && keyboard.current_focus().as_ref() == Some(&surface)
+        {
+            return;
+        }
+        // An exclusive foreground layer must not lose focus to an unrelated
+        // on-demand layer when its surface commits.
+        if self.active_layer_keyboard.as_ref() != Some(&surface)
+            && self.focused_layer_is_exclusive()
+            && self.preferred_keyboard_layer().as_ref() != Some(&surface)
+        {
+            return;
+        }
+        if self.active_layer_keyboard.is_none() {
+            self.saved_xdg_keyboard_focus = keyboard
+                .current_focus()
+                .filter(|focused| self.windows.focus_is_valid(focused))
+                .or_else(|| self.windows.focused_surface());
+        }
+        self.active_layer_keyboard = Some(surface.clone());
+        keyboard.set_focus(
+            self,
+            Some(surface),
+            smithay::utils::SERIAL_COUNTER.next_serial(),
+        );
+        self.needs_redraw = true;
+    }
+
+    fn restore_xdg_keyboard_focus(&mut self) {
+        self.active_layer_keyboard = None;
+        let replacement = self
+            .saved_xdg_keyboard_focus
+            .take()
+            .filter(|surface| self.windows.focus_is_valid(surface))
+            .or_else(|| self.windows.focused_surface());
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            keyboard.set_focus(
+                self,
+                replacement,
+                smithay::utils::SERIAL_COUNTER.next_serial(),
+            );
+        }
+        self.needs_redraw = true;
+    }
+
+    fn focus_xdg_from_click(&mut self, surface: WlSurface, serial: Serial) {
+        if self.focused_layer_is_exclusive() {
+            return;
+        }
+        self.active_layer_keyboard = None;
+        self.saved_xdg_keyboard_focus = None;
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            keyboard.set_focus(self, Some(surface), serial);
+        }
+    }
+
+    /// Hit-test the rendered layer surface tree using output-local coordinates.
+    /// `surface_under` honors Wayland input regions and subsurface offsets.
+    fn layer_hit_at(&self, kind: Layer, x: f64, y: f64) -> Option<LayerHit> {
+        let map = layer_map_for_output(&self.output);
+        let layer = map.layer_under(kind, (x, y))?;
+        let geometry = map.layer_geometry(layer)?;
+        let relative = (x - f64::from(geometry.loc.x), y - f64::from(geometry.loc.y));
+        let (surface, offset) = layer.surface_under(
+            relative,
+            WindowSurfaceType::TOPLEVEL | WindowSurfaceType::SUBSURFACE,
+        )?;
+        let absolute = (
+            f64::from(geometry.loc.x + offset.x),
+            f64::from(geometry.loc.y + offset.y),
+        );
+        Some(LayerHit {
+            root: layer.wl_surface().clone(),
+            pointer_target: (surface, absolute.into()),
+        })
+    }
+
+    fn foreground_layer_hit_at(&self, x: f64, y: f64) -> Option<LayerHit> {
+        self.layer_hit_at(Layer::Overlay, x, y)
+            .or_else(|| self.layer_hit_at(Layer::Top, x, y))
+    }
+
+    fn background_layer_hit_at(&self, x: f64, y: f64) -> Option<LayerHit> {
+        self.layer_hit_at(Layer::Bottom, x, y)
+            .or_else(|| self.layer_hit_at(Layer::Background, x, y))
+    }
+
+    fn pointer_surface_at(&self, x: f64, y: f64) -> Option<(WlSurface, Point<f64, Logical>)> {
+        if let Some(hit) = self.foreground_layer_hit_at(x, y) {
+            return Some(hit.pointer_target);
+        }
+        self.windows.surface_at(x, y).or_else(|| {
+            self.background_layer_hit_at(x, y)
+                .map(|hit| hit.pointer_target)
+        })
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -329,9 +621,97 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     run_winit()
 }
 
+fn reload_configuration(
+    current: &mut config::AnwiliteConfig,
+    windows: &mut WindowManager,
+    output_size: (i32, i32),
+) -> bool {
+    let next = match config::try_load() {
+        Ok(next) => next,
+        Err(error) => {
+            eprintln!("Anwilite: reload failed: {error}");
+            return false;
+        }
+    };
+
+    // Apply tiling only after the window manager validates it.
+    if next.tiling != current.tiling
+        && let Err(error) = windows.apply_tiling_settings(next.tiling, output_size)
+    {
+        eprintln!("Anwilite: reload rejected: {error}; keeping previous settings");
+        return false;
+    }
+
+    match current.apply_reload(Ok(next)) {
+        Ok(true) => {
+            println!("Anwilite: configuration reloaded");
+            true
+        }
+        Ok(false) => {
+            println!("Anwilite: configuration unchanged");
+            false
+        }
+        Err(error) => {
+            eprintln!("Anwilite: reload failed: {error}");
+            false
+        }
+    }
+}
+
+fn launch_configured_app(label: &str, argv: &[String], children: &mut Vec<std::process::Child>) {
+    let Some((program, args)) = argv.split_first() else {
+        eprintln!("Anwilite: no {label} command configured");
+        return;
+    };
+
+    let result = std::process::Command::new(program)
+        .args(args)
+        .env("WAYLAND_DISPLAY", ANWILITE_SOCKET_NAME)
+        .spawn();
+
+    match result {
+        Ok(child) => {
+            println!("Anwilite: launched {label}: {program} (PID {})", child.id());
+
+            children.push(child);
+        }
+
+        Err(error) => {
+            eprintln!("Anwilite: could not launch {label} ({program}): {error}");
+        }
+    }
+}
+
 pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
+    let mut config = config::load();
+    let mut last_config_snapshot = config::snapshot();
+
+    assert!(
+        config.active_border.is_valid(),
+        "Invalid active border configuration"
+    );
+
+    if let Some(style) = config.inactive_border {
+        assert!(style.is_valid(), "Invalid inactive border configuration");
+    }
+
     let mut display: Display<App> = Display::new()?;
     let dh = display.handle();
+    let output = Output::new(
+        "ANWILITE-1".into(),
+        PhysicalProperties {
+            size: (300, 200).into(),
+            subpixel: Subpixel::Unknown,
+            make: "Octlitch".into(),
+            model: "Anwilite Nested Output".into(),
+        },
+    );
+
+    let _output_global = output.create_global::<App>(&dh);
+    // Waybar needs XDG logical-output information in addition to wl_output.
+    let _output_manager_state = OutputManagerState::new_with_xdg_output::<App>(&dh);
+
+    let layer_shell_state = WlrLayerShellState::new::<App>(&dh);
 
     let compositor_state = CompositorState::new::<App>(&dh);
     let shm_state = ShmState::new::<App>(&dh, vec![]);
@@ -353,13 +733,31 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             needs_redraw: true,
             output_size: (1, 1), // Updated immediately after Winit initializes.
             surface_commit_count: 0,
+            output,
+            layer_shell_state,
+            layer_surfaces: Vec::new(),
+            initial_layer_configures: HashSet::new(),
+            active_layer_keyboard: None,
+            saved_xdg_keyboard_focus: None,
         }
     };
-
+    state.windows.configure_startup(config.tiling);
     let mut event_loop = EventLoop::<Vec<UnixStream>>::try_new()?;
+    const CONFIG_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
-    // Register the Octlitch Wayland socket with Calloop.
-    let socket = ListeningSocketSource::with_name("octlitch-0")?;
+    let reload_due = Rc::new(Cell::new(false));
+    let reload_signal = Rc::clone(&reload_due);
+
+    event_loop.handle().insert_source(
+        Timer::from_duration(CONFIG_CHECK_INTERVAL),
+        move |_, _, _| {
+            reload_signal.set(true);
+
+            TimeoutAction::ToDuration(CONFIG_CHECK_INTERVAL)
+        },
+    )?;
+
+    let socket = ListeningSocketSource::with_name(ANWILITE_SOCKET_NAME)?;
 
     event_loop
         .handle()
@@ -382,6 +780,26 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
     let (mut backend, winit) = winit::init::<GlesRenderer>()?;
     let initial_size = backend.window_size();
     state.output_size = (initial_size.w, initial_size.h);
+
+    let mode = OutputMode {
+        size: initial_size,
+        refresh: 60_000,
+    };
+
+    state.output.change_current_state(
+        Some(mode),
+        Some(Transform::Normal),
+        Some(Scale::Integer(1)),
+        Some((0, 0).into()),
+    );
+
+    state.output.set_preferred(mode);
+
+    println!(
+        "Anwilite: registered virtual output ANWILITE-1 ({}x{})",
+        initial_size.w, initial_size.h
+    );
+
     let mut tracked_size = backend.window_size();
     let mut damage_tracker = OutputDamageTracker::new(tracked_size, 1.0, Transform::Flipped180);
     let winit_events = Rc::new(RefCell::new(Vec::new()));
@@ -406,15 +824,18 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
     let mut damage_area: u128 = 0;
     let mut presented_area: u128 = 0;
 
+    let mut border_buffers: HashMap<WlSurface, [SolidColorBuffer; 4]> = HashMap::new();
+
     let keyboard = state
         .seat
         .add_keyboard(Default::default(), 200, 200)
         .unwrap();
     let pointer = state.seat.add_pointer();
-    std::process::Command::new("weston-terminal")
-        .env("WAYLAND_DISPLAY", "octlitch-0")
-        .spawn()
-        .ok();
+    let mut launched_children = Vec::<std::process::Child>::new();
+
+    if config.apps.autostart_terminal {
+        launch_configured_app("terminal", &config.apps.terminal, &mut launched_children);
+    }
 
     loop {
         let wait = if state.needs_redraw {
@@ -423,13 +844,85 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             state.windows.pending_resize_wait()
         };
         event_loop.dispatch(wait, &mut pending_clients)?;
+        // Check whether applications launched by Anwilite have exited.
+        launched_children.retain_mut(|child| match child.try_wait() {
+            Ok(None) => true,
+
+            Ok(Some(status)) => {
+                println!("Anwilite: process {} exited with {status}", child.id());
+
+                false
+            }
+
+            Err(error) => {
+                eprintln!("Anwilite: cannot check process {}: {error}", child.id());
+
+                false
+            }
+        });
+
+        if reload_due.replace(false)
+            && config::snapshot_changed(&mut last_config_snapshot, config::snapshot())
+        {
+            let output_size = state.output_size;
+
+            if reload_configuration(&mut config, &mut state.windows, output_size) {
+                state.needs_redraw = true;
+            }
+        }
 
         let output_size = backend.window_size();
         let output_dims = (output_size.w, output_size.h);
-        if output_dims != state.output_size {
+        if output_dims != state.output_size && output_dims.0 > 0 && output_dims.1 > 0 {
+            // The nested host window acts as Anwilite's single virtual output.
+            // Only update advertised modes when its dimensions actually change.
+            let previous_mode = state.output.current_mode();
+            let new_mode = OutputMode {
+                size: output_size,
+                refresh: 60_000,
+            };
+
+            state
+                .output
+                .change_current_state(Some(new_mode), None, None, None);
+            state.output.set_preferred(new_mode);
+
+            // wl_output cannot retract modes from already-connected clients,
+            // but newly connected clients should not see resize history.
+            if let Some(previous) = previous_mode
+                && previous != new_mode
+            {
+                state.output.delete_mode(previous);
+            }
+
             state.output_size = output_dims;
-            state.windows.resize_placed_windows(output_dims);
-            state.windows.reflow_all_tiled_workspaces(output_dims);
+
+            // Refresh layer geometry against the new virtual output size.
+            // LayerMap normally sends a pending configure when dimensions change.
+            // Explicitly resend it here as a nested-output resize compatibility
+            // safeguard for existing Waybar/Swaybg layer surfaces.
+            let layer_layout_changed = layer_map_for_output(&state.output).arrange();
+
+            // LayerMap owns the exclusive zones. Update window placement only
+            // after arranging the layers for the *new* output dimensions.
+            let work_area_changed = state.refresh_work_area();
+            if !work_area_changed {
+                // Output size can change even if the usable area is unchanged.
+                state.windows.resize_placed_windows(output_dims);
+            }
+
+            let mut configured_layers = 0;
+            for layer in &state.layer_surfaces {
+                let shell = layer.layer_surface();
+                if shell.alive() && state.initial_layer_configures.contains(layer.wl_surface()) {
+                    shell.send_configure();
+                    configured_layers += 1;
+                }
+            }
+            println!(
+                "Anwilite: output resized to {}x{}; layer layout changed={}; layers reconfigured={}",
+                output_dims.0, output_dims.1, layer_layout_changed, configured_layers
+            );
             state.needs_redraw = true;
         }
         let events = std::mem::take(&mut *winit_events.borrow_mut());
@@ -483,6 +976,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                 keyboard.modifier_state(),
                             );
                         }
+                        let layer_has_keyboard = state.active_layer_keyboard.is_some();
                         let requested_command = keyboard.input::<WorkspaceCommand, _>(
                             &mut state,
                             event.key_code(),
@@ -490,111 +984,20 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                             serial,
                             time,
                             |_, modifiers, handle| {
-                                // Super+number is our normal shortcut.
-                                // Ctrl+Alt+number is a nested-VM testing fallback.
-                                if !modifiers.logo && !(modifiers.ctrl && modifiers.alt) {
+                                let Some(symbol) = handle.raw_syms().first().map(|sym| sym.raw())
+                                else {
                                     return FilterResult::Forward;
-                                }
-
-                                // Get the unmodified keyboard symbol.
-                                let symbol = handle.raw_syms().first().map(|sym| sym.raw());
-                                if matches!(symbol, Some(keysyms::KEY_m | keysyms::KEY_M)) {
-                                    return FilterResult::Intercept(if modifiers.shift {
-                                        WorkspaceCommand::RestoreMinimized
-                                    } else {
-                                        WorkspaceCommand::Minimize
-                                    });
-                                }
-
-                                if modifiers.shift
-                                    && matches!(symbol, Some(keysyms::KEY_t | keysyms::KEY_T))
-                                {
-                                    return FilterResult::Intercept(WorkspaceCommand::ToggleTiling);
-                                }
-
-                                // Shift+H/J navigates focus; plain H/J adjusts the ratio.
-                                // Shift+H/J navigates focus.
-                                // Shift+Left/Right swaps tiles.
-                                if modifiers.shift {
-                                    let shortcut = match symbol {
-                                        Some(keysyms::KEY_h | keysyms::KEY_H) => {
-                                            Some(WorkspaceCommand::FocusTile(
-                                                TileFocusDirection::Previous,
-                                            ))
-                                        }
-
-                                        Some(keysyms::KEY_j | keysyms::KEY_J) => Some(
-                                            WorkspaceCommand::FocusTile(TileFocusDirection::Next),
-                                        ),
-
-                                        Some(keysyms::KEY_Left) => {
-                                            Some(WorkspaceCommand::SwapTile(
-                                                TileFocusDirection::Previous,
-                                            ))
-                                        }
-
-                                        Some(keysyms::KEY_Right) => Some(
-                                            WorkspaceCommand::SwapTile(TileFocusDirection::Next),
-                                        ),
-
-                                        Some(keysyms::KEY_p | keysyms::KEY_P) => {
-                                            Some(WorkspaceCommand::PromoteTile)
-                                        }
-
-                                        _ => None,
-                                    };
-
-                                    if let Some(command) = shortcut {
-                                        return FilterResult::Intercept(command);
-                                    }
-                                }
-
-                                if !modifiers.shift {
-                                    let shortcut = match symbol {
-                                        Some(keysyms::KEY_h | keysyms::KEY_H) => {
-                                            Some(WorkspaceCommand::AdjustMasterRatio(-5))
-                                        }
-                                        Some(keysyms::KEY_j | keysyms::KEY_J) => {
-                                            Some(WorkspaceCommand::AdjustMasterRatio(5))
-                                        }
-                                        Some(keysyms::KEY_r | keysyms::KEY_R) => {
-                                            Some(WorkspaceCommand::ResetMasterRatio)
-                                        }
-                                        Some(keysyms::KEY_Left) => {
-                                            Some(WorkspaceCommand::Snap(SnapSide::Left))
-                                        }
-                                        Some(keysyms::KEY_Right) => {
-                                            Some(WorkspaceCommand::Snap(SnapSide::Right))
-                                        }
-                                        Some(keysyms::KEY_Up) => Some(WorkspaceCommand::Maximize),
-                                        Some(keysyms::KEY_Down) => Some(WorkspaceCommand::Restore),
-                                        _ => None,
-                                    };
-
-                                    if let Some(command) = shortcut {
-                                        return FilterResult::Intercept(command);
-                                    }
-                                }
-
-                                let workspace = match symbol {
-                                    Some(sym)
-                                        if (keysyms::KEY_1..=keysyms::KEY_9).contains(&sym) =>
-                                    {
-                                        Some((sym - keysyms::KEY_1 + 1) as usize)
-                                    }
-                                    Some(keysyms::KEY_0) => Some(10),
-                                    _ => None,
                                 };
 
-                                match workspace {
-                                    Some(number) if modifiers.shift => FilterResult::Intercept(
-                                        WorkspaceCommand::MoveAndFollow(number),
-                                    ),
-
-                                    Some(number) => {
-                                        FilterResult::Intercept(WorkspaceCommand::SwitchTo(number))
+                                let action = config.keybindings.match_event(modifiers, symbol);
+                                // Let Fuzzel type, navigate, and handle Escape. Keep
+                                // the reserved recovery reload key available.
+                                match action {
+                                    Some(WorkspaceCommand::ReloadConfig) => {
+                                        FilterResult::Intercept(WorkspaceCommand::ReloadConfig)
                                     }
-
+                                    _ if layer_has_keyboard => FilterResult::Forward,
+                                    Some(command) => FilterResult::Intercept(command),
                                     None => FilterResult::Forward,
                                 }
                             },
@@ -602,204 +1005,237 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
                         // Switch on key press, not on key release.
 
-                        if event.state() == KeyState::Pressed {
-                            if let Some(command) = requested_command {
-                                // Avoid switching while a mouse press is active.
-                                if state.move_press.is_none() {
-                                    let changed = match command {
-                                        WorkspaceCommand::Minimize => {
-                                            let focused = keyboard.current_focus();
+                        if event.state() == KeyState::Pressed
+                            && let Some(command) = requested_command
+                        {
+                            // Avoid switching while a mouse press is active.
+                            if state.move_press.is_none() {
+                                let changed = match command {
+                                    WorkspaceCommand::Minimize => {
+                                        let focused = keyboard.current_focus();
 
-                                            focused
-                                                .as_ref()
-                                                .and_then(|surface| {
-                                                    state.windows.toplevel_for_surface(surface)
-                                                })
-                                                .is_some_and(|surface| {
-                                                    state.windows.minimize_window(
-                                                        &surface,
-                                                        state.output_size,
-                                                    )
-                                                })
-                                        }
-
-                                        WorkspaceCommand::RestoreMinimized => {
-                                            if let Some(surface) = state
-                                                .windows
-                                                .restore_last_minimized(state.output_size)
-                                            {
-                                                // Immediately focus the restored window.
-                                                keyboard.set_focus(
-                                                    &mut state,
-                                                    Some(surface),
-                                                    smithay::utils::SERIAL_COUNTER.next_serial(),
-                                                );
-
-                                                true
-                                            } else {
-                                                false
-                                            }
-                                        }
-
-                                        WorkspaceCommand::ToggleTiling => {
-                                            state.windows.toggle_tiling(state.output_size)
-                                        }
-
-                                        WorkspaceCommand::AdjustMasterRatio(delta) => state
-                                            .windows
-                                            .adjust_master_ratio(delta, state.output_size),
-
-                                        WorkspaceCommand::ResetMasterRatio => {
-                                            state.windows.reset_master_ratio(state.output_size)
-                                        }
-
-                                        WorkspaceCommand::FocusTile(direction) => {
-                                            let focused = keyboard.current_focus();
-                                            if let Some(next) = state
-                                                .windows
-                                                .adjacent_tiled_surface(focused.as_ref(), direction)
-                                            {
-                                                // Focus only: do not raise or reorder any tiles.
-                                                keyboard.set_focus(
-                                                    &mut state,
-                                                    Some(next),
-                                                    smithay::utils::SERIAL_COUNTER.next_serial(),
-                                                );
-                                                true
-                                            } else {
-                                                false
-                                            }
-                                        }
-                                        WorkspaceCommand::SwapTile(direction) => {
-                                            let focused = keyboard.current_focus();
-                                            let output_size = state.output_size;
-
-                                            focused.as_ref().is_some_and(|surface| {
-                                                state.windows.swap_focused_tile(
-                                                    surface,
-                                                    direction,
-                                                    output_size,
-                                                )
+                                        focused
+                                            .as_ref()
+                                            .and_then(|surface| {
+                                                state.windows.toplevel_for_surface(surface)
                                             })
-                                        }
-
-                                        WorkspaceCommand::PromoteTile => {
-                                            let focused = keyboard.current_focus();
-                                            let output_size = state.output_size;
-
-                                            focused.as_ref().is_some_and(|surface| {
+                                            .is_some_and(|surface| {
                                                 state
                                                     .windows
-                                                    .promote_focused_tile(surface, output_size)
+                                                    .minimize_window(&surface, state.output_size)
                                             })
-                                        }
+                                    }
 
-                                        WorkspaceCommand::SwitchTo(number) => {
-                                            state.windows.switch_to_workspace(number)
-                                        }
-
-                                        WorkspaceCommand::MoveAndFollow(number) => {
-                                            let focused = keyboard.current_focus();
-                                            let output_size = state.output_size;
-
-                                            focused.as_ref().is_some_and(|surface| {
-                                                state.windows.move_focused_to_workspace(
-                                                    surface,
-                                                    number,
-                                                    output_size,
-                                                )
-                                            })
-                                        }
-
-                                        WorkspaceCommand::Snap(side) => {
-                                            let focused = keyboard.current_focus();
-
-                                            focused.as_ref().is_some_and(|surface| {
-                                                state.windows.snap(surface, side, state.output_size)
-                                            })
-                                        }
-
-                                        WorkspaceCommand::Maximize => {
-                                            let focused = keyboard.current_focus();
-
-                                            focused
-                                                .as_ref()
-                                                .and_then(|surface| {
-                                                    state.windows.toplevel_for_surface(surface)
-                                                })
-                                                .is_some_and(|surface| {
-                                                    state
-                                                        .windows
-                                                        .maximize(&surface, state.output_size)
-                                                })
-                                        }
-
-                                        WorkspaceCommand::Restore => {
-                                            let focused = keyboard.current_focus();
-
-                                            focused
-                                                .as_ref()
-                                                .and_then(|surface| {
-                                                    state.windows.toplevel_for_surface(surface)
-                                                })
-                                                .is_some_and(|surface| {
-                                                    state.windows.restore(&surface)
-                                                })
-                                        }
-                                    };
-
-                                    if changed {
-                                        if matches!(
-                                            command,
-                                            WorkspaceCommand::SwitchTo(_)
-                                                | WorkspaceCommand::MoveAndFollow(_)
-                                                | WorkspaceCommand::ToggleTiling
-                                                | WorkspaceCommand::Minimize
-                                        ) {
-                                            let focus = state.windows.focused_surface();
-
+                                    WorkspaceCommand::RestoreMinimized => {
+                                        if let Some(surface) =
+                                            state.windows.restore_last_minimized(state.output_size)
+                                        {
+                                            // Immediately focus the restored window.
                                             keyboard.set_focus(
                                                 &mut state,
-                                                focus.clone(),
+                                                Some(surface),
                                                 smithay::utils::SERIAL_COUNTER.next_serial(),
                                             );
 
-                                            let actual_focus = keyboard.current_focus();
-
-                                            println!(
-                                                "Octlitch focus: workspace={} requested={} actual={} matched={}",
-                                                state.windows.current_workspace(),
-                                                focus.is_some(),
-                                                actual_focus.is_some(),
-                                                actual_focus == focus
-                                            );
-
-                                            // Recalculate pointer focus for visible windows.
-                                            let (x, y) = state.pointer_position;
-                                            let pointer_focus = state.windows.surface_at(x, y);
-
-                                            pointer.motion(
-                                                &mut state,
-                                                pointer_focus,
-                                                &MotionEvent {
-                                                    location: (x, y).into(),
-                                                    serial: smithay::utils::SERIAL_COUNTER
-                                                        .next_serial(),
-                                                    time,
-                                                },
-                                            );
-
-                                            pointer.frame(&mut state);
+                                            true
+                                        } else {
+                                            false
                                         }
-                                        // Force the output to update.
-                                        state.needs_redraw = true;
+                                    }
+
+                                    WorkspaceCommand::ToggleTiling => {
+                                        state.windows.toggle_tiling(state.output_size)
+                                    }
+
+                                    WorkspaceCommand::AdjustMasterRatio(delta) => {
+                                        state.windows.adjust_master_ratio(delta, state.output_size)
+                                    }
+
+                                    WorkspaceCommand::ResetMasterRatio => {
+                                        state.windows.reset_master_ratio(state.output_size)
+                                    }
+
+                                    WorkspaceCommand::FocusTile(direction) => {
+                                        let focused = keyboard.current_focus();
+                                        if let Some(next) = state
+                                            .windows
+                                            .adjacent_tiled_surface(focused.as_ref(), direction)
+                                        {
+                                            // Focus only: do not raise or reorder any tiles.
+                                            keyboard.set_focus(
+                                                &mut state,
+                                                Some(next),
+                                                smithay::utils::SERIAL_COUNTER.next_serial(),
+                                            );
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    }
+                                    WorkspaceCommand::SwapTile(direction) => {
+                                        let focused = keyboard.current_focus();
+                                        let output_size = state.output_size;
+
+                                        focused.as_ref().is_some_and(|surface| {
+                                            state.windows.swap_focused_tile(
+                                                surface,
+                                                direction,
+                                                output_size,
+                                            )
+                                        })
+                                    }
+
+                                    WorkspaceCommand::PromoteTile => {
+                                        let focused = keyboard.current_focus();
+                                        let output_size = state.output_size;
+
+                                        focused.as_ref().is_some_and(|surface| {
+                                            state.windows.promote_focused_tile(surface, output_size)
+                                        })
+                                    }
+
+                                    WorkspaceCommand::SwitchTo(number) => {
+                                        state.windows.switch_to_workspace(number)
+                                    }
+
+                                    WorkspaceCommand::MoveAndFollow(number) => {
+                                        let focused = keyboard.current_focus();
+                                        let output_size = state.output_size;
+
+                                        focused.as_ref().is_some_and(|surface| {
+                                            state.windows.move_focused_to_workspace(
+                                                surface,
+                                                number,
+                                                output_size,
+                                            )
+                                        })
+                                    }
+
+                                    WorkspaceCommand::Snap(side) => {
+                                        let focused = keyboard.current_focus();
+
+                                        focused.as_ref().is_some_and(|surface| {
+                                            state.windows.snap(surface, side, state.output_size)
+                                        })
+                                    }
+
+                                    WorkspaceCommand::Maximize => {
+                                        let focused = keyboard.current_focus();
+
+                                        focused
+                                            .as_ref()
+                                            .and_then(|surface| {
+                                                state.windows.toplevel_for_surface(surface)
+                                            })
+                                            .is_some_and(|surface| {
+                                                state.windows.maximize(&surface, state.output_size)
+                                            })
+                                    }
+
+                                    WorkspaceCommand::Restore => {
+                                        let focused = keyboard.current_focus();
+
+                                        focused
+                                            .as_ref()
+                                            .and_then(|surface| {
+                                                state.windows.toplevel_for_surface(surface)
+                                            })
+                                            .is_some_and(|surface| state.windows.restore(&surface))
+                                    }
+
+                                    WorkspaceCommand::ReloadConfig => {
+                                        last_config_snapshot = config::snapshot();
+                                        reload_configuration(
+                                            &mut config,
+                                            &mut state.windows,
+                                            state.output_size,
+                                        )
+                                    }
+
+                                    WorkspaceCommand::LaunchTerminal => {
+                                        launch_configured_app(
+                                            "terminal",
+                                            &config.apps.terminal,
+                                            &mut launched_children,
+                                        );
+                                        false
+                                    }
+
+                                    WorkspaceCommand::LaunchFileManager => {
+                                        launch_configured_app(
+                                            "file manager",
+                                            &config.apps.file_manager,
+                                            &mut launched_children,
+                                        );
+                                        false
+                                    }
+                                    WorkspaceCommand::LaunchMenu => {
+                                        launch_configured_app(
+                                            "application menu",
+                                            &config.apps.menu,
+                                            &mut launched_children,
+                                        );
+
+                                        false
+                                    }
+
+                                    WorkspaceCommand::ToggleShowDesktop => {
+                                        state.windows.toggle_show_desktop()
+                                    }
+                                };
+
+                                if changed {
+                                    if matches!(
+                                        command,
+                                        WorkspaceCommand::SwitchTo(_)
+                                            | WorkspaceCommand::MoveAndFollow(_)
+                                            | WorkspaceCommand::ToggleTiling
+                                            | WorkspaceCommand::Minimize
+                                            | WorkspaceCommand::ToggleShowDesktop
+                                    ) {
+                                        let focus = state.windows.focused_surface();
+
+                                        keyboard.set_focus(
+                                            &mut state,
+                                            focus.clone(),
+                                            smithay::utils::SERIAL_COUNTER.next_serial(),
+                                        );
+
+                                        let actual_focus = keyboard.current_focus();
 
                                         println!(
-                                            "Octlitch: {:?}, active workspace {}",
-                                            command,
-                                            state.windows.current_workspace()
+                                            "Octlitch focus: workspace={} requested={} actual={} matched={}",
+                                            state.windows.current_workspace(),
+                                            focus.is_some(),
+                                            actual_focus.is_some(),
+                                            actual_focus == focus
                                         );
+
+                                        // Recalculate pointer focus for visible windows.
+                                        let (x, y) = state.pointer_position;
+                                        let pointer_focus = state.pointer_surface_at(x, y);
+
+                                        pointer.motion(
+                                            &mut state,
+                                            pointer_focus,
+                                            &MotionEvent {
+                                                location: (x, y).into(),
+                                                serial: smithay::utils::SERIAL_COUNTER
+                                                    .next_serial(),
+                                                time,
+                                            },
+                                        );
+
+                                        pointer.frame(&mut state);
                                     }
+                                    // Force the output to update.
+                                    state.needs_redraw = true;
+
+                                    println!(
+                                        "Octlitch: {:?}, active workspace {}",
+                                        command,
+                                        state.windows.current_workspace()
+                                    );
                                 }
                             }
                         }
@@ -818,8 +1254,8 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                             state.windows.update_drag(x, y);
                             state.needs_redraw = true;
                         } else {
-                            // Find the Wayland surface under the pointer.
-                            let focus = state.windows.surface_at(x, y);
+                            // Match the actual rendered stacking order, including layers.
+                            let focus = state.pointer_surface_at(x, y);
 
                             pointer.motion(
                                 &mut state,
@@ -842,13 +1278,29 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
                         let time = start_time.elapsed().as_millis() as u32;
 
+                        let foreground_hit = state.foreground_layer_hit_at(x, y);
+                        let ordinary_window_hit = if foreground_hit.is_none() {
+                            state.windows.surface_at(x, y).is_some()
+                        } else {
+                            false
+                        };
+                        let background_hit = if foreground_hit.is_none() && !ordinary_window_hit {
+                            state.background_layer_hit_at(x, y)
+                        } else {
+                            None
+                        };
+
                         if event.button() == Some(MouseButton::Left)
                             && event.state() == ButtonState::Pressed
                         {
-                            state.move_press = state
-                                .windows
-                                .toplevel_at(x, y)
-                                .map(|surface| (serial, surface));
+                            state.move_press = if foreground_hit.is_none() {
+                                state
+                                    .windows
+                                    .toplevel_at(x, y)
+                                    .map(|surface| (serial, surface))
+                            } else {
+                                None
+                            };
                         }
 
                         if event.button() == Some(MouseButton::Left)
@@ -866,22 +1318,24 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         if event.state() == ButtonState::Pressed {
-                            let clicked_window = state.windows.raise_at(x, y);
-
-                            if let Some(surface) = clicked_window {
-                                keyboard.set_focus(&mut state, Some(surface.clone()), serial);
-                                println!(
-                                    "Anwilite focus: clicked window, focus_matched={}",
-                                    keyboard.current_focus().as_ref() == Some(&surface),
-                                );
-                            } else {
-                                println!("Anwilite focus: background click, preserving focus");
+                            if let Some(hit) = foreground_hit.as_ref().or(background_hit.as_ref()) {
+                                if state.interactive_layer_alive(&hit.root) {
+                                    state.focus_layer(hit.root.clone());
+                                }
+                            } else if ordinary_window_hit
+                                && let Some(surface) = state.windows.raise_at(x, y)
+                            {
+                                state.focus_xdg_from_click(surface, serial);
                             }
+
                             state.needs_redraw = true;
                         }
 
                         // Octlitch's window-dragging behavior.
-                        if event.button() == Some(MouseButton::Middle) {
+                        if event.button() == Some(MouseButton::Middle)
+                            && foreground_hit.is_none()
+                            && ordinary_window_hit
+                        {
                             match event.state() {
                                 ButtonState::Pressed => {
                                     state.windows.start_drag(x, y);
@@ -890,7 +1344,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                 ButtonState::Released => {
                                     state.windows.end_drag();
 
-                                    let focus = state.windows.surface_at(x, y);
+                                    let focus = state.pointer_surface_at(x, y);
 
                                     pointer.motion(
                                         &mut state,
@@ -906,7 +1360,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                         } else {
-                            let focus = state.windows.surface_at(x, y);
+                            let focus = state.pointer_surface_at(x, y);
 
                             pointer.motion(
                                 &mut state,
@@ -964,6 +1418,13 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
         let previous_count = state.windows.windows.len();
 
         state.windows.retain_live();
+        border_buffers.retain(|surface, _| {
+            state
+                .windows
+                .windows
+                .iter()
+                .any(|window| window.surface.wl_surface() == surface)
+        });
 
         if state.windows.windows.len() != previous_count {
             println!(
@@ -978,13 +1439,28 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             state.needs_redraw = true;
         }
 
-        let current_focus = keyboard.current_focus();
-
-        let focus_valid = current_focus
+        // The old XDG-only recovery loop would steal focus from Fuzzel on
+        // every iteration. Accept a live interactive layer as valid focus.
+        if state
+            .active_layer_keyboard
             .as_ref()
-            .is_some_and(|surface| state.windows.focus_is_valid(surface));
+            .is_some_and(|surface| !state.interactive_layer_alive(surface))
+        {
+            state.restore_xdg_keyboard_focus();
+        }
+
+        let current_focus = keyboard.current_focus();
+        let focus_valid = current_focus.as_ref().is_some_and(|surface| {
+            state.windows.focus_is_valid(surface)
+                || (state.active_layer_keyboard.as_ref() == Some(surface)
+                    && state.interactive_layer_alive(surface))
+        });
         if !focus_valid {
-            let replacement = state.windows.focused_surface();
+            let replacement = state
+                .active_layer_keyboard
+                .clone()
+                .filter(|surface| state.interactive_layer_alive(surface))
+                .or_else(|| state.windows.focused_surface());
 
             if current_focus != replacement {
                 println!(
@@ -1029,12 +1505,92 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             let submit_damage = {
                 let (renderer, mut framebuffer) = backend.bind().unwrap();
 
-                let elements = state
+                // Keyboard focus determines each window's border style.
+                let focused = keyboard.current_focus();
+                let focused_rect = state.windows.focused_window_rect(focused.as_ref());
+
+                let mut elements = Vec::<AnwiliteRenderElement>::new();
+
+                // Foreground layer-shell surfaces are in front of normal windows.
+                // The render-elements list uses front-to-back stacking order.
+                {
+                    let layer_map = layer_map_for_output(&state.output);
+                    for kind in [Layer::Overlay, Layer::Top] {
+                        for layer in layer_map.layers_on(kind).rev() {
+                            let Some(geometry) = layer_map.layer_geometry(layer) else {
+                                continue;
+                            };
+
+                            elements.extend(
+                                render_elements_from_surface_tree(
+                                    renderer,
+                                    layer.wl_surface(),
+                                    (geometry.loc.x, geometry.loc.y),
+                                    1.0,
+                                    1.0,
+                                    Kind::Unspecified,
+                                )
+                                .into_iter()
+                                .map(AnwiliteRenderElement::Surface),
+                            );
+                        }
+                    }
+                }
+
+                // Window order is front-to-back.
+                for window in state
                     .windows
                     .windows
                     .iter()
                     .filter(|window| state.windows.is_window_visible(window))
-                    .flat_map(|window| {
+                {
+                    let is_focused = focused.as_ref() == Some(window.surface.wl_surface());
+
+                    // Use the same trusted geometry path as Lesson 29C.
+                    let rect = if is_focused {
+                        focused_rect
+                    } else {
+                        window.focus_rect()
+                    };
+
+                    // Draw this window's border, if enabled.
+                    if let (Some(style), Some(rect)) = (
+                        border_style(is_focused, config.active_border, config.inactive_border),
+                        rect,
+                    ) && let Some(edges) =
+                        focus_border_outside_tile(rect, style.thickness, style.clearance)
+                    {
+                        let buffers = border_buffers
+                            .entry(window.surface.wl_surface().clone())
+                            .or_insert_with(|| {
+                                std::array::from_fn(|_| SolidColorBuffer::new((1, 1), style.rgba))
+                            });
+
+                        for (buffer, edge) in buffers.iter_mut().zip(edges) {
+                            buffer.update((edge.width, edge.height), style.rgba);
+
+                            let border = SolidColorRenderElement::from_buffer(
+                                buffer,
+                                (edge.x, edge.y),
+                                1.0,
+                                1.0,
+                                Kind::Unspecified,
+                            );
+
+                            elements.push(AnwiliteRenderElement::FocusBorder(border));
+                        }
+                    }
+
+                    // Preserve the existing tiled/snapped client clipping.
+                    let clip = window.placed_rect_for_render().map(|tile| {
+                        Rectangle::<i32, Physical>::new(
+                            (tile.x, tile.y).into(),
+                            (tile.width, tile.height).into(),
+                        )
+                    });
+
+                    // Draw the application's surfaces after its border.
+                    elements.extend(
                         render_elements_from_surface_tree(
                             renderer,
                             window.surface.wl_surface(),
@@ -1043,8 +1599,39 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                             1.0,
                             Kind::Unspecified,
                         )
-                    })
-                    .collect::<Vec<WaylandSurfaceRenderElement<GlesRenderer>>>();
+                        .into_iter()
+                        .filter_map(move |element| match clip {
+                            Some(rect) => CropRenderElement::from_element(element, 1.0, rect)
+                                .map(AnwiliteRenderElement::ClippedSurface),
+                            None => Some(AnwiliteRenderElement::Surface(element)),
+                        }),
+                    );
+                }
+
+                // Bottom/background surfaces are behind ordinary windows.
+                {
+                    let layer_map = layer_map_for_output(&state.output);
+                    for kind in [Layer::Bottom, Layer::Background] {
+                        for layer in layer_map.layers_on(kind).rev() {
+                            let Some(geometry) = layer_map.layer_geometry(layer) else {
+                                continue;
+                            };
+
+                            elements.extend(
+                                render_elements_from_surface_tree(
+                                    renderer,
+                                    layer.wl_surface(),
+                                    (geometry.loc.x, geometry.loc.y),
+                                    1.0,
+                                    1.0,
+                                    Kind::Unspecified,
+                                )
+                                .into_iter()
+                                .map(AnwiliteRenderElement::Surface),
+                            );
+                        }
+                    }
+                }
 
                 let result = damage_tracker.render_output(
                     renderer,
@@ -1083,6 +1670,14 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             {
                 send_frames_surface_tree(
                     window.surface.wl_surface(),
+                    start_time.elapsed().as_millis() as u32,
+                );
+            }
+
+            // Layer-shell clients need frame callbacks to advance rendering.
+            for layer in &state.layer_surfaces {
+                send_frames_surface_tree(
+                    layer.wl_surface(),
                     start_time.elapsed().as_millis() as u32,
                 );
             }
@@ -1176,3 +1771,32 @@ delegate_compositor!(App);
 delegate_shm!(App);
 delegate_seat!(App);
 delegate_data_device!(App);
+delegate_output!(App);
+delegate_layer_shell!(App);
+
+#[cfg(test)]
+mod layer_input_policy_tests {
+    use super::*;
+
+    #[test]
+    fn foreground_layers_honor_keyboard_interactivity() {
+        for kind in [Layer::Overlay, Layer::Top] {
+            assert!(layer_can_auto_focus(kind, KeyboardInteractivity::Exclusive));
+            assert!(layer_can_auto_focus(kind, KeyboardInteractivity::OnDemand));
+            assert!(!layer_can_auto_focus(kind, KeyboardInteractivity::None));
+        }
+    }
+
+    #[test]
+    fn background_layers_never_auto_steal_focus() {
+        for kind in [Layer::Background, Layer::Bottom] {
+            for mode in [
+                KeyboardInteractivity::None,
+                KeyboardInteractivity::OnDemand,
+                KeyboardInteractivity::Exclusive,
+            ] {
+                assert!(!layer_can_auto_focus(kind, mode));
+            }
+        }
+    }
+}

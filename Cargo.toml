@@ -10,3 +10,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wayland-protocols = { version = "0.32", features = ["server"] }
 wayland-server = "0.31"
 winit = { version = "0.30", default-features = false, features = ["wayland", "wayland-dlopen", "x11", "rwh_06"] }
+serde = { version = "1", features =["derive"] }
+toml = "1"

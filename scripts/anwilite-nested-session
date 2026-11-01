@@ -1,0 +1,97 @@
+#!/bin/sh
+
+set -eu
+
+usage() {
+    cat <<'HELP'
+Usage: anwilite-nested-session [--shared-bus|--private-bus] [--check] [--] [command [args...]]
+
+  --shared-bus    Keep the KDE session bus (default; known-working baseline).
+  --private-bus   Run Anwilite and its child processes on a separate D-Bus bus.
+  --check         Validate environment without starting the compositor.
+  --help          Show this help.
+
+If no command is specified, starts: cargo run --release
+Install at <Anwilite checkout>/scripts/anwilite-nested-session.
+
+IMPORTANT: WAYLAND_DISPLAY before launching must refer to the HOST KDE
+compositor, not Anwilite's own octlitch-0 server. Anwilite sets the display
+for the applications it launches. This script does not change it.
+HELP
+}
+
+bus_mode=shared
+check_only=0
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --shared-bus) bus_mode=shared; shift ;;
+        --private-bus) bus_mode=private; shift ;;
+        --check) check_only=1; shift ;;
+        --help|-h) usage; exit 0 ;;
+        --) shift; break ;;
+        -*) printf 'Unknown option: %s\n' "$1" >&2; usage >&2; exit 64 ;;
+        *) break ;;
+    esac
+done
+
+if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
+    printf 'Anwilite: XDG_RUNTIME_DIR is missing; run from your normal KDE user session.\n' >&2
+    exit 69
+fi
+
+if [ -z "${WAYLAND_DISPLAY:-}" ]; then
+    printf 'Anwilite: host WAYLAND_DISPLAY is missing; this launcher expects a Wayland KDE session.\n' >&2
+    exit 69
+fi
+
+if [ "$WAYLAND_DISPLAY" = 'octlitch-0' ]; then
+    printf 'Anwilite: WAYLAND_DISPLAY=octlitch-0 points to Anwilite itself, not the host.\n' >&2
+    printf 'Open a new KDE terminal and run the launcher there instead.\n' >&2
+    exit 69
+fi
+
+if [ "$bus_mode" = private ] && ! command -v dbus-run-session >/dev/null 2>&1; then
+    printf 'Anwilite: dbus-run-session is missing (Fedora package: dbus-daemon).\n' >&2
+    exit 69
+fi
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+project_dir=$(CDPATH='' cd -- "$script_dir/.." && pwd)
+
+# A nested compositor is not a new logind/PAM login session. Leave
+# XDG_SESSION_DESKTOP and XDG_SESSION_TYPE unchanged. The shared-bus
+# baseline also keeps KDE's XDG_CURRENT_DESKTOP unchanged.
+export ANWILITE_NESTED_DEVELOPMENT=1
+if [ "$bus_mode" = private ]; then
+    # Scoped to the Anwilite child process tree, not KDE or systemd --user.
+    export XDG_CURRENT_DESKTOP=Anwilite
+fi
+
+if [ "$check_only" -eq 1 ]; then
+    printf 'mode=%s\n' "$bus_mode"
+    printf 'project=%s\n' "$project_dir"
+    printf 'host_wayland_display=%s\n' "$WAYLAND_DISPLAY"
+    printf 'XDG_CURRENT_DESKTOP=%s\n' "$XDG_CURRENT_DESKTOP"
+    printf 'XDG_SESSION_DESKTOP=%s\n' "$XDG_SESSION_DESKTOP"
+    printf 'XDG_RUNTIME_DIR=set\n'
+    if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+        printf 'inherited_dbus_address=set (value hidden)\n'
+    else
+        printf 'inherited_dbus_address=unset\n'
+    fi
+    printf 'No compositor was started.\n'
+    exit 0
+fi
+
+cd -- "$project_dir"
+if [ "$#" -eq 0 ]; then
+    set -- cargo run --release
+fi
+
+if [ "$bus_mode" = private ]; then
+    printf 'Anwilite: private D-Bus development mode (host Wayland=%s)\n' "$WAYLAND_DISPLAY"
+    exec dbus-run-session -- "$@"
+fi
+
+printf 'Anwilite: shared D-Bus development mode (host Wayland=%s)\n' "$WAYLAND_DISPLAY"
+exec "$@"
