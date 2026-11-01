@@ -11,9 +11,12 @@ use calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic};
 use keybindings::WorkspaceCommand;
 use layout::{SnapRect, focus_border_outside_tile};
 
+use ::winit::cursor::CursorIcon;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::desktop::{
-    LayerSurface as DesktopLayerSurface, WindowSurfaceType, layer_map_for_output,
+    LayerSurface as DesktopLayerSurface, PopupKind, PopupManager, WindowSurfaceType,
+    find_popup_root_surface, get_popup_toplevel_coords, layer_map_for_output,
+    utils::under_from_surface_tree,
 };
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
@@ -62,6 +65,7 @@ use smithay::{
         },
         shell::xdg::{
             PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
+            XdgToplevelSurfaceData,
         },
         shm::{ShmHandler, ShmState},
     },
@@ -86,7 +90,42 @@ use wayland_server::{
 };
 use window::WindowManager;
 
+fn resize_cursor_icon(edge: xdg_toplevel::ResizeEdge) -> CursorIcon {
+    use xdg_toplevel::ResizeEdge as Edge;
+    match edge {
+        Edge::TopLeft => CursorIcon::NwResize,
+        Edge::Top => CursorIcon::NResize,
+        Edge::TopRight => CursorIcon::NeResize,
+        Edge::Left => CursorIcon::WResize,
+        Edge::Right => CursorIcon::EResize,
+        Edge::BottomLeft => CursorIcon::SwResize,
+        Edge::Bottom => CursorIcon::SResize,
+        Edge::BottomRight => CursorIcon::SeResize,
+        _ => CursorIcon::Default,
+    }
+}
+
 const ANWILITE_SOCKET_NAME: &str = "octlitch-0";
+
+/// Area relative to the geometry origin of the popup's direct parent.
+fn popup_constraint_area(area: SnapRect, parent: (i32, i32)) -> Rectangle<i32, Logical> {
+    Rectangle::new(
+        (area.x - parent.0, area.y - parent.1).into(),
+        (area.width.max(1), area.height.max(1)).into(),
+    )
+}
+
+/// Render/input coordinates for the popup wl_surface (not its XDG geometry).
+fn popup_surface_origin(
+    root: (i32, i32),
+    location: Point<i32, Logical>,
+    geometry: Rectangle<i32, Logical>,
+) -> (i32, i32) {
+    (
+        root.0 + location.x - geometry.loc.x,
+        root.1 + location.y - geometry.loc.y,
+    )
+}
 
 /// Only top/overlay layer clients should automatically take desktop focus.
 /// OnDemand is allowed here for application launchers opened by a shortcut;
@@ -120,13 +159,27 @@ impl XdgShellHandler for App {
         &mut self.xdg_shell_state
     }
 
+    fn app_id_changed(&mut self, surface: ToplevelSurface) {
+        self.apply_new_window_rule(&surface);
+    }
+
+    // parent_changed is deliberately not overridden: Smithay's default is fine.
+    // We reconcile parent metadata outside dispatch_clients() below.
+
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         // Add the window to the current workspace.
         self.windows.add(surface.clone());
+        self.apply_new_window_rule(&surface);
         self.needs_redraw = true;
 
+        // Do not advertise an off-workspace, automatically routed window as
+        // activated. A later app_id_changed event will also repair focus.
         surface.with_pending_state(|state| {
-            state.states.set(xdg_toplevel::State::Activated);
+            if self.windows.focus_is_valid(surface.wl_surface()) {
+                state.states.set(xdg_toplevel::State::Activated);
+            } else {
+                state.states.unset(xdg_toplevel::State::Activated);
+            }
         });
 
         surface.send_configure();
@@ -141,6 +194,7 @@ impl XdgShellHandler for App {
 
         // Do not steal keyboard focus from a visible layer-shell launcher.
         if self.active_layer_keyboard.is_none()
+            && self.windows.focus_is_valid(surface.wl_surface())
             && let Some(keyboard) = self.seat.get_keyboard()
         {
             let serial = smithay::utils::SERIAL_COUNTER.next_serial();
@@ -187,21 +241,25 @@ impl XdgShellHandler for App {
         }
     }
 
-    fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {
-        // Handle popup creation here
+    fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
+        // Do not inspect parent/role data from within the Smithay callback.
+        self.pending_new_popups.push((surface, positioner));
     }
 
-    fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {
-        // Handle popup grab here
+    fn grab(&mut self, surface: PopupSurface, seat: wl_seat::WlSeat, serial: Serial) {
+        if self.seat.owns(&seat) {
+            self.pending_popup_grabs.push((surface, serial));
+        }
     }
 
     fn reposition_request(
         &mut self,
-        _surface: PopupSurface,
-        _positioner: PositionerState,
-        _token: u32,
+        surface: PopupSurface,
+        positioner: PositionerState,
+        token: u32,
     ) {
-        // Handle popup reposition here
+        self.pending_popup_repositions
+            .push((surface, positioner, token));
     }
 
     fn move_request(&mut self, surface: ToplevelSurface, seat: wl_seat::WlSeat, serial: Serial) {
@@ -352,6 +410,9 @@ impl CompositorHandler for App {
 
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
+        // PopupManager::commit may read XDG role state. Process it only after
+        // display.dispatch_clients() has completed, avoiding callback re-entry.
+        self.pending_popup_commits.push(surface.clone());
 
         // Layer-shell clients first commit without a buffer.
         // Only then do we send their initial configure.
@@ -387,7 +448,7 @@ impl CompositorHandler for App {
 
         // Preserve all existing XDG window behavior.
         self.windows.sync_resize_position(surface);
-        self.windows.sync_mode_position(surface);
+        self.windows.sync_mode_position(surface, self.output_size);
         self.windows
             .trace_geometry_on_commit(surface, self.output_size);
 
@@ -447,9 +508,189 @@ struct App {
     initial_layer_configures: HashSet<WlSurface>,
     active_layer_keyboard: Option<WlSurface>,
     saved_xdg_keyboard_focus: Option<WlSurface>,
+    window_rules: Vec<config::WindowRule>,
+    popup_manager: PopupManager,
+    pending_new_popups: Vec<(PopupSurface, PositionerState)>,
+    pending_popup_repositions: Vec<(PopupSurface, PositionerState, u32)>,
+    pending_popup_grabs: Vec<(PopupSurface, Serial)>,
+    pending_popup_commits: Vec<WlSurface>,
+    grabbed_popups: Vec<PopupSurface>,
 }
 
 impl App {
+    /// Resolve the ancestor window / layer geometry without reading popup role
+    /// state during a Smithay dispatch callback.
+    fn popup_parent_origin(&self, popup: &PopupSurface) -> Option<(i32, i32)> {
+        let kind = PopupKind::Xdg(popup.clone());
+        let root = find_popup_root_surface(&kind).ok()?;
+        let ancestor = get_popup_toplevel_coords(&kind);
+        let root_origin = self.windows.popup_root_origin(&root).or_else(|| {
+            let map = layer_map_for_output(&self.output);
+            self.layer_surfaces.iter().find_map(|layer| {
+                if layer.wl_surface() == &root {
+                    let rect = map.layer_geometry(layer)?;
+                    Some((rect.loc.x, rect.loc.y))
+                } else {
+                    None
+                }
+            })
+        })?;
+        Some((root_origin.0 + ancestor.x, root_origin.1 + ancestor.y))
+    }
+
+    fn configure_popup(
+        &mut self,
+        popup: &PopupSurface,
+        positioner: PositionerState,
+        token: Option<u32>,
+    ) {
+        if !popup.alive() {
+            return;
+        }
+        let parent = self.popup_parent_origin(popup).unwrap_or((0, 0));
+        let available = self.windows.work_area_for_popup(self.output_size);
+        let target = popup_constraint_area(available, parent);
+        let geometry = positioner.get_unconstrained_geometry(target);
+        popup.with_pending_state(|state| {
+            state.positioner = positioner;
+            state.geometry = geometry;
+        });
+        if let Some(token) = token {
+            popup.send_repositioned(token);
+        } else if let Err(error) = popup.send_configure() {
+            eprintln!("Anwilite: XDG popup configure rejected: {error:?}");
+        }
+    }
+
+    /// Call only after display.dispatch_clients, not from protocol callbacks.
+    fn service_popup_requests(&mut self) {
+        for surface in std::mem::take(&mut self.pending_popup_commits) {
+            self.popup_manager.commit(&surface);
+        }
+        for (popup, positioner) in std::mem::take(&mut self.pending_new_popups) {
+            if !popup.alive() {
+                continue;
+            }
+            if let Err(error) = self
+                .popup_manager
+                .track_popup(PopupKind::Xdg(popup.clone()))
+            {
+                eprintln!("Anwilite: cannot track XDG popup: {error:?}");
+                continue;
+            }
+            self.configure_popup(&popup, positioner, None);
+            self.needs_redraw = true;
+        }
+        for (popup, positioner, token) in std::mem::take(&mut self.pending_popup_repositions) {
+            self.configure_popup(&popup, positioner, Some(token));
+            self.needs_redraw = true;
+        }
+        let grabs = std::mem::take(&mut self.pending_popup_grabs);
+        for (popup, serial) in grabs {
+            if !popup.alive() {
+                continue;
+            }
+            // A real popup grab comes from an input event delivered to this seat.
+            if self
+                .seat
+                .get_pointer()
+                .is_some_and(|pointer| pointer.has_grab(serial))
+            {
+                self.grabbed_popups
+                    .retain(|old| old.wl_surface() != popup.wl_surface());
+                self.grabbed_popups.push(popup.clone());
+                if let Some(keyboard) = self.seat.get_keyboard() {
+                    keyboard.set_focus(
+                        self,
+                        Some(popup.wl_surface().clone()),
+                        smithay::utils::SERIAL_COUNTER.next_serial(),
+                    );
+                }
+            }
+        }
+        self.grabbed_popups.retain(|popup| popup.alive());
+        self.popup_manager.cleanup();
+    }
+
+    /// Topmost popup input must outrank the owning window and its resize region.
+    fn popup_hit_at(&self, x: f64, y: f64) -> Option<(WlSurface, Point<f64, Logical>)> {
+        for window in &self.windows.windows {
+            let Some(root) = self.windows.popup_root_origin(window.surface.wl_surface()) else {
+                continue;
+            };
+            for (popup, relative) in PopupManager::popups_for_surface(window.surface.wl_surface()) {
+                let origin = popup_surface_origin(root, relative, popup.geometry());
+                if let Some((hit, at)) = under_from_surface_tree(
+                    popup.wl_surface(),
+                    (x, y).into(),
+                    origin,
+                    WindowSurfaceType::TOPLEVEL | WindowSurfaceType::SUBSURFACE,
+                ) {
+                    return Some((hit, (f64::from(at.x), f64::from(at.y)).into()));
+                }
+            }
+        }
+        None
+    }
+
+    fn dismiss_grabbed_popups(&mut self) {
+        for popup in self.grabbed_popups.drain(..).rev() {
+            if popup.alive() {
+                popup.send_popup_done();
+            }
+        }
+        self.needs_redraw = true;
+    }
+
+    fn apply_new_window_rule(&mut self, surface: &ToplevelSurface) {
+        // Smithay reports set_app_id through XdgShellHandler::app_id_changed.
+        // Resolve the metadata after that event; no poll or title matching.
+        let app_id = with_states(surface.wl_surface(), |states| {
+            states
+                .data_map
+                .get::<XdgToplevelSurfaceData>()
+                .and_then(|data| data.lock().ok()?.app_id.clone())
+        });
+        let Some(app_id) = app_id else {
+            return;
+        };
+        println!("Anwilite: XDG application ID: {app_id:?}");
+        let destination = config::matching_workspace(&self.window_rules, &app_id);
+        if self.windows.assign_initial_workspace_rule(
+            surface.wl_surface(),
+            destination,
+            self.output_size,
+        ) {
+            // If the client identified itself after initial configure, remove
+            // its stale activated hint when routed to a hidden workspace.
+            if !self.windows.focus_is_valid(surface.wl_surface()) {
+                surface.with_pending_state(|state| {
+                    state.states.unset(xdg_toplevel::State::Activated);
+                });
+                if surface.is_initial_configure_sent() {
+                    surface.send_pending_configure();
+                }
+            }
+            if self.active_layer_keyboard.is_none()
+                && let Some(keyboard) = self.seat.get_keyboard()
+            {
+                let focus = keyboard.current_focus();
+                if focus
+                    .as_ref()
+                    .is_some_and(|focus| !self.windows.focus_is_valid(focus))
+                {
+                    let replacement = self.windows.focused_surface();
+                    keyboard.set_focus(
+                        self,
+                        replacement,
+                        smithay::utils::SERIAL_COUNTER.next_serial(),
+                    );
+                }
+            }
+            self.needs_redraw = true;
+        }
+    }
+
     fn refresh_work_area(&mut self) -> bool {
         // Drop Smithay's LayerMap lock before entering WindowManager.
         // The work area is output-local, not a replacement for output_size.
@@ -510,6 +751,7 @@ impl App {
     }
 
     fn focus_layer(&mut self, surface: WlSurface) {
+        self.windows.end_window_cycle();
         let Some(keyboard) = self.seat.get_keyboard() else {
             return;
         };
@@ -559,6 +801,7 @@ impl App {
     }
 
     fn focus_xdg_from_click(&mut self, surface: WlSurface, serial: Serial) {
+        self.windows.end_window_cycle();
         if self.focused_layer_is_exclusive() {
             return;
         }
@@ -604,10 +847,12 @@ impl App {
         if let Some(hit) = self.foreground_layer_hit_at(x, y) {
             return Some(hit.pointer_target);
         }
-        self.windows.surface_at(x, y).or_else(|| {
-            self.background_layer_hit_at(x, y)
-                .map(|hit| hit.pointer_target)
-        })
+        self.popup_hit_at(x, y)
+            .or_else(|| self.windows.surface_at(x, y))
+            .or_else(|| {
+                self.background_layer_hit_at(x, y)
+                    .map(|hit| hit.pointer_target)
+            })
     }
 }
 
@@ -739,6 +984,13 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             initial_layer_configures: HashSet::new(),
             active_layer_keyboard: None,
             saved_xdg_keyboard_focus: None,
+            window_rules: config.window_rules.clone(),
+            popup_manager: PopupManager::default(),
+            pending_new_popups: Vec::new(),
+            pending_popup_repositions: Vec::new(),
+            pending_popup_grabs: Vec::new(),
+            pending_popup_commits: Vec::new(),
+            grabbed_popups: Vec::new(),
         }
     };
     state.windows.configure_startup(config.tiling);
@@ -831,6 +1083,9 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
         .add_keyboard(Default::default(), 200, 200)
         .unwrap();
     let pointer = state.seat.add_pointer();
+    let mut host_cursor = CursorIcon::Default;
+    // Distinguish compositor-initiated border resize from client XDG resize.
+    let mut border_resize_active = false;
     let mut launched_children = Vec::<std::process::Child>::new();
 
     if config.apps.autostart_terminal {
@@ -867,6 +1122,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             let output_size = state.output_size;
 
             if reload_configuration(&mut config, &mut state.windows, output_size) {
+                state.window_rules = config.window_rules.clone();
                 state.needs_redraw = true;
             }
         }
@@ -932,6 +1188,16 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                     state.needs_redraw = true;
                 }
                 WinitEvent::Focus(focused) => {
+                    if !focused {
+                        backend.window().set_cursor(CursorIcon::Default);
+                        host_cursor = CursorIcon::Default;
+                        if border_resize_active {
+                            state.windows.finish_resize();
+                            border_resize_active = false;
+                            state.needs_redraw = true;
+                        }
+                        state.windows.end_window_cycle();
+                    }
                     let held_keys = keyboard.pressed_keys();
 
                     println!(
@@ -976,7 +1242,10 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                 keyboard.modifier_state(),
                             );
                         }
-                        let layer_has_keyboard = state.active_layer_keyboard.is_some();
+                        let layer_has_keyboard = state.active_layer_keyboard.is_some()
+                            || keyboard.current_focus().as_ref().is_some_and(|focused| {
+                                state.popup_manager.find_popup(focused).is_some()
+                            });
                         let requested_command = keyboard.input::<WorkspaceCommand, _>(
                             &mut state,
                             event.key_code(),
@@ -1003,6 +1272,13 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                             },
                         );
 
+                        // Releasing the initiating modifiers ends an Alt+Tab
+                        // session without changing the settled MRU history.
+                        let modifiers = keyboard.modifier_state();
+                        if !modifiers.alt && !modifiers.logo {
+                            state.windows.end_window_cycle();
+                        }
+
                         // Switch on key press, not on key release.
 
                         if event.state() == KeyState::Pressed
@@ -1010,6 +1286,9 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                         {
                             // Avoid switching while a mouse press is active.
                             if state.move_press.is_none() {
+                                if !matches!(command, WorkspaceCommand::CycleWindow(_)) {
+                                    state.windows.end_window_cycle();
+                                }
                                 let changed = match command {
                                     WorkspaceCommand::Minimize => {
                                         let focused = keyboard.current_focus();
@@ -1047,6 +1326,10 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                         state.windows.toggle_tiling(state.output_size)
                                     }
 
+                                    WorkspaceCommand::ToggleGrid => {
+                                        state.windows.toggle_grid_layout(state.output_size)
+                                    }
+
                                     WorkspaceCommand::AdjustMasterRatio(delta) => {
                                         state.windows.adjust_master_ratio(delta, state.output_size)
                                     }
@@ -1072,6 +1355,44 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                             false
                                         }
                                     }
+                                    WorkspaceCommand::FocusSpatial(direction) => {
+                                        let focused = keyboard.current_focus();
+                                        if let Some(next) = state
+                                            .windows
+                                            .spatial_surface(focused.as_ref(), direction)
+                                        {
+                                            state.windows.raise_focused_floating(&next);
+                                            keyboard.set_focus(
+                                                &mut state,
+                                                Some(next),
+                                                smithay::utils::SERIAL_COUNTER.next_serial(),
+                                            );
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    }
+
+                                    WorkspaceCommand::CycleWindow(direction) => {
+                                        let focused = keyboard.current_focus();
+                                        state
+                                            .windows
+                                            .cycle_global_window(focused.as_ref(), direction)
+                                            .is_some()
+                                    }
+
+                                    WorkspaceCommand::CloseWindow => {
+                                        if let Some(surface) =
+                                            keyboard.current_focus().as_ref().and_then(|focused| {
+                                                state.windows.toplevel_for_surface(focused)
+                                            })
+                                        {
+                                            // XDG close is a request, not a forced disconnect.
+                                            surface.send_close();
+                                        }
+                                        false
+                                    }
+
                                     WorkspaceCommand::SwapTile(direction) => {
                                         let focused = keyboard.current_focus();
                                         let output_size = state.output_size;
@@ -1145,11 +1466,15 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
                                     WorkspaceCommand::ReloadConfig => {
                                         last_config_snapshot = config::snapshot();
-                                        reload_configuration(
+                                        let reloaded = reload_configuration(
                                             &mut config,
                                             &mut state.windows,
                                             state.output_size,
-                                        )
+                                        );
+                                        if reloaded {
+                                            state.window_rules = config.window_rules.clone();
+                                        }
+                                        reloaded
                                     }
 
                                     WorkspaceCommand::LaunchTerminal => {
@@ -1190,8 +1515,10 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                         WorkspaceCommand::SwitchTo(_)
                                             | WorkspaceCommand::MoveAndFollow(_)
                                             | WorkspaceCommand::ToggleTiling
+                                            | WorkspaceCommand::ToggleGrid
                                             | WorkspaceCommand::Minimize
                                             | WorkspaceCommand::ToggleShowDesktop
+                                            | WorkspaceCommand::CycleWindow(_)
                                     ) {
                                         let focus = state.windows.focused_surface();
 
@@ -1249,11 +1576,35 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
                         if state.windows.is_resizing() {
                             state.windows.update_resize(x, y);
+                            if let Some(edges) = state.windows.active_resize_edge() {
+                                let icon = resize_cursor_icon(edges);
+                                if icon != host_cursor {
+                                    backend.window().set_cursor(icon);
+                                    host_cursor = icon;
+                                }
+                            }
                             state.needs_redraw = true;
                         } else if state.windows.is_dragging() {
-                            state.windows.update_drag(x, y);
+                            state.windows.update_drag(x, y, state.output_size);
                             state.needs_redraw = true;
                         } else {
+                            // The host cursor reflects the compositor's effective resize
+                            // region, rather than relying on client-side frame thickness.
+                            let next_cursor = if state.foreground_layer_hit_at(x, y).is_some()
+                                || state.popup_hit_at(x, y).is_some()
+                            {
+                                CursorIcon::Default
+                            } else {
+                                state
+                                    .windows
+                                    .resize_hit_at(x, y)
+                                    .map(|(_, edges)| resize_cursor_icon(edges))
+                                    .unwrap_or(CursorIcon::Default)
+                            };
+                            if next_cursor != host_cursor {
+                                backend.window().set_cursor(next_cursor);
+                                host_cursor = next_cursor;
+                            }
                             // Match the actual rendered stacking order, including layers.
                             let focus = state.pointer_surface_at(x, y);
 
@@ -1279,21 +1630,94 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                         let time = start_time.elapsed().as_millis() as u32;
 
                         let foreground_hit = state.foreground_layer_hit_at(x, y);
-                        let ordinary_window_hit = if foreground_hit.is_none() {
+                        let popup_hit = if foreground_hit.is_none() {
+                            state.popup_hit_at(x, y)
+                        } else {
+                            None
+                        };
+                        if event.state() == ButtonState::Pressed
+                            && popup_hit.is_none()
+                            && !state.grabbed_popups.is_empty()
+                        {
+                            state.dismiss_grabbed_popups();
+                        }
+                        let ordinary_window_hit = if foreground_hit.is_none() && popup_hit.is_none()
+                        {
                             state.windows.surface_at(x, y).is_some()
                         } else {
                             false
                         };
-                        let background_hit = if foreground_hit.is_none() && !ordinary_window_hit {
+                        let background_hit = if foreground_hit.is_none()
+                            && popup_hit.is_none()
+                            && !ordinary_window_hit
+                        {
                             state.background_layer_hit_at(x, y)
                         } else {
                             None
                         };
 
+                        // Compositor border-grab: consume the left-button sequence.
+                        // Without this, the app's client-side controls receive a press
+                        // even though Anwilite is resizing the window.
+                        if event.button() == Some(MouseButton::Left) {
+                            if event.state() == ButtonState::Pressed
+                                && foreground_hit.is_none()
+                                && popup_hit.is_none()
+                                && let Some((surface, edges)) = state.windows.resize_hit_at(x, y)
+                                && state.windows.start_resize_for(&surface, x, y, edges)
+                            {
+                                state.move_press = None;
+                                border_resize_active = true;
+                                state.windows.end_window_cycle();
+                                state.windows.raise_focused_floating(surface.wl_surface());
+                                state.focus_xdg_from_click(surface.wl_surface().clone(), serial);
+                                let icon = resize_cursor_icon(edges);
+                                if host_cursor != icon {
+                                    backend.window().set_cursor(icon);
+                                    host_cursor = icon;
+                                }
+                                state.needs_redraw = true;
+                                continue;
+                            }
+                            // Never swallow a client-initiated XDG resize release: that
+                            // client already received the corresponding button press.
+                            if event.state() == ButtonState::Released && border_resize_active {
+                                border_resize_active = false;
+                                state.move_press = None;
+                                state.windows.finish_resize();
+                                let next_icon = if foreground_hit.is_some() {
+                                    CursorIcon::Default
+                                } else {
+                                    state
+                                        .windows
+                                        .resize_hit_at(x, y)
+                                        .map(|(_, edges)| resize_cursor_icon(edges))
+                                        .unwrap_or(CursorIcon::Default)
+                                };
+                                if next_icon != host_cursor {
+                                    backend.window().set_cursor(next_icon);
+                                    host_cursor = next_icon;
+                                }
+                                let focus = state.pointer_surface_at(x, y);
+                                pointer.motion(
+                                    &mut state,
+                                    focus,
+                                    &MotionEvent {
+                                        location: (x, y).into(),
+                                        serial,
+                                        time,
+                                    },
+                                );
+                                pointer.frame(&mut state);
+                                state.needs_redraw = true;
+                                continue;
+                            }
+                        }
+
                         if event.button() == Some(MouseButton::Left)
                             && event.state() == ButtonState::Pressed
                         {
-                            state.move_press = if foreground_hit.is_none() {
+                            state.move_press = if foreground_hit.is_none() && popup_hit.is_none() {
                                 state
                                     .windows
                                     .toplevel_at(x, y)
@@ -1318,11 +1742,15 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         if event.state() == ButtonState::Pressed {
-                            if let Some(hit) = foreground_hit.as_ref().or(background_hit.as_ref()) {
+                            if popup_hit.is_none()
+                                && let Some(hit) =
+                                    foreground_hit.as_ref().or(background_hit.as_ref())
+                            {
                                 if state.interactive_layer_alive(&hit.root) {
                                     state.focus_layer(hit.root.clone());
                                 }
-                            } else if ordinary_window_hit
+                            } else if popup_hit.is_none()
+                                && ordinary_window_hit
                                 && let Some(surface) = state.windows.raise_at(x, y)
                             {
                                 state.focus_xdg_from_click(surface, serial);
@@ -1334,6 +1762,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                         // Octlitch's window-dragging behavior.
                         if event.button() == Some(MouseButton::Middle)
                             && foreground_hit.is_none()
+                            && popup_hit.is_none()
                             && ordinary_window_hit
                         {
                             match event.state() {
@@ -1414,6 +1843,12 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
         // 2. Process pending client requests FIRST.
 
         display.dispatch_clients(&mut state)?;
+        state.service_popup_requests();
+        // XDG metadata is safe to inspect only after request dispatch returns.
+        // All compositor paths below use our cached parent reference.
+        if state.windows.refresh_transient_parents(state.output_size) {
+            state.needs_redraw = true;
+        }
 
         let previous_count = state.windows.windows.len();
 
@@ -1452,6 +1887,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
         let current_focus = keyboard.current_focus();
         let focus_valid = current_focus.as_ref().is_some_and(|surface| {
             state.windows.focus_is_valid(surface)
+                || state.popup_manager.find_popup(surface).is_some()
                 || (state.active_layer_keyboard.as_ref() == Some(surface)
                     && state.interactive_layer_alive(surface))
         });
@@ -1534,6 +1970,33 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                 .map(AnwiliteRenderElement::Surface),
                             );
                         }
+                    }
+                }
+
+                // Popup menus are above every ordinary toplevel, even when
+                // they extend beyond the parent's rectangle (no tile cropping).
+                // Foreground layers such as Waybar remain above the popups.
+                for window in &state.windows.windows {
+                    let Some(root) = state.windows.popup_root_origin(window.surface.wl_surface())
+                    else {
+                        continue;
+                    };
+                    for (popup, relative) in
+                        PopupManager::popups_for_surface(window.surface.wl_surface())
+                    {
+                        let origin = popup_surface_origin(root, relative, popup.geometry());
+                        elements.extend(
+                            render_elements_from_surface_tree(
+                                renderer,
+                                popup.wl_surface(),
+                                origin,
+                                1.0,
+                                1.0,
+                                Kind::Unspecified,
+                            )
+                            .into_iter()
+                            .map(AnwiliteRenderElement::Surface),
+                        );
                     }
                 }
 
@@ -1674,6 +2137,19 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
 
+            // Each popup is a separate wl_surface tree and needs frame callbacks.
+            for window in &state.windows.windows {
+                if !state.windows.is_window_visible(window) {
+                    continue;
+                }
+                for (popup, _) in PopupManager::popups_for_surface(window.surface.wl_surface()) {
+                    send_frames_surface_tree(
+                        popup.wl_surface(),
+                        start_time.elapsed().as_millis() as u32,
+                    );
+                }
+            }
+
             // Layer-shell clients need frame callbacks to advance rendering.
             for layer in &state.layer_surfaces {
                 send_frames_surface_tree(
@@ -1798,5 +2274,32 @@ mod layer_input_policy_tests {
                 assert!(!layer_can_auto_focus(kind, mode));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod xdg_popup_geometry_tests {
+    use super::*;
+
+    #[test]
+    fn popup_constraints_follow_waybar_and_parent_origin() {
+        let area = SnapRect {
+            x: 0,
+            y: 32,
+            width: 1280,
+            height: 768,
+        };
+        let target = popup_constraint_area(area, (400, 250));
+        assert_eq!((target.loc.x, target.loc.y), (-400, -218));
+        assert_eq!((target.size.w, target.size.h), (1280, 768));
+    }
+
+    #[test]
+    fn popup_surface_origin_accounts_for_xdg_geometry_offset() {
+        let geometry = Rectangle::new((4, 6).into(), (200, 100).into());
+        assert_eq!(
+            popup_surface_origin((100, 50), (20, 40).into(), geometry),
+            (116, 84)
+        );
     }
 }

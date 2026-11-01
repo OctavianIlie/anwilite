@@ -223,9 +223,9 @@ The following stages describe planned capabilities, not guaranteed release dates
 - [x] Minimize/restore, show desktop, and configurable application-launcher shortcuts.
 - [x] Configurable keybindings, application commands, appearance, and startup tiling preferences.
 - [x] Focus borders and exclusive work areas respected by maximized, snapped, and tiled windows.
-- [ ] Quarter-screen snapping and additional placement transitions.
-- [ ] Spatial directional focus, global Alt+Tab, and further window-management shortcuts.
-- [ ] Configurable automatic window/workspace rules and additional layout types.
+- [x] Quarter-screen snapping and additional placement transitions.
+- [x] Spatial directional focus, global Alt+Tab, and further window-management shortcuts.
+- [x] Configurable automatic window/workspace rules and additional layout types (including grid).
 - [ ] More robust handling of size-constrained clients, transient dialogs, and uncommon window lifecycle transitions.
 - [ ] Optional decoration policies, including compositor-drawn controls where appropriate.
 
@@ -233,7 +233,7 @@ The following stages describe planned capabilities, not guaranteed release dates
 
 - [x] Layer-shell support for background, bottom, top, and overlay surfaces in the nested backend.
 - [x] Layer-shell exclusive zones, keyboard/pointer focus handling, and virtual output information.
-- [ ] Complete XDG popup placement, grabbing, repositioning, and transient-window behavior.
+- [x] XDG popup placement, grabbing, repositioning, nested submenus, outside-click and Escape dismissal; Dolphin transient-dialog behavior tested.
 - [ ] True fullscreen with correct stacking, focus, and restore semantics, separate from maximize.
 - [ ] Anwilite IPC API and events for workspaces, active windows, layouts, and configuration.
 - [ ] Clipboard and drag-and-drop hardening, primary selection, and text input/IME support.

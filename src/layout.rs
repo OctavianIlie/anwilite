@@ -4,6 +4,17 @@ use crate::workspace::WORKSPACE_COUNT;
 pub enum SnapSide {
     Left,
     Right,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TilePattern {
+    #[default]
+    MasterStack,
+    Grid,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,31 +65,112 @@ pub fn tile_rects_in_area(
         .collect()
 }
 
-pub fn snap_rect(output_size: (i32, i32), side: SnapSide) -> Option<SnapRect> {
-    let (output_width, output_height) = output_size;
+// Keep master-and-stack's existing geometry function unchanged. Grid uses the
+// same outer/inner gap convention, including for odd output dimensions.
+pub fn layout_rects_in_area(
+    area: SnapRect,
+    count: usize,
+    gaps: SnapGaps,
+    master_percent: u8,
+    pattern: TilePattern,
+) -> Option<Vec<SnapRect>> {
+    match pattern {
+        TilePattern::MasterStack => tile_rects_in_area(area, count, gaps, master_percent),
+        TilePattern::Grid => grid_rects_in_area(area, count, gaps),
+    }
+}
 
-    if output_width < 2 || output_height < 1 {
+// Split an axis into exact integer cells. Remainder pixels go to early cells;
+// no gaps or pixels disappear when a dimension is odd.
+fn grid_axis(origin: i32, size: i32, count: usize, gaps: SnapGaps) -> Option<Vec<(i32, i32)>> {
+    if count == 0 || gaps.outer < 0 || gaps.inner < 0 {
+        return None;
+    }
+    let count_i32 = i32::try_from(count).ok()?;
+    let usable = size
+        .checked_sub(gaps.outer.checked_mul(2)?)?
+        .checked_sub(gaps.inner.checked_mul(count_i32.checked_sub(1)?)?)?;
+    if usable < count_i32 {
+        return None;
+    }
+    let base = usable / count_i32;
+    let extra = usable % count_i32;
+    let mut at = origin.checked_add(gaps.outer)?;
+    let mut segments = Vec::with_capacity(count);
+    for i in 0..count_i32 {
+        let length = base + i32::from(i < extra);
+        segments.push((at, length));
+        at = at.checked_add(length)?.checked_add(gaps.inner)?;
+    }
+    Some(segments)
+}
+
+pub fn grid_rects_in_area(area: SnapRect, count: usize, gaps: SnapGaps) -> Option<Vec<SnapRect>> {
+    if area.width <= 0 || area.height <= 0 || gaps.outer < 0 || gaps.inner < 0 {
+        return None;
+    }
+    if count == 0 {
+        return Some(Vec::new());
+    }
+
+    // Integer ceiling square-root; avoids floating rounding of layout sizes.
+    let mut columns: usize = 1;
+    while columns.checked_mul(columns)? < count {
+        columns = columns.checked_add(1)?;
+    }
+    let rows = count.div_ceil(columns);
+    let y_cells = grid_axis(area.y, area.height, rows, gaps)?;
+    let mut result = Vec::with_capacity(count);
+    for (row, (y, height)) in y_cells.into_iter().enumerate() {
+        let first = row.checked_mul(columns)?;
+        let row_count = (count - first).min(columns);
+        // The last row expands to use the available width, rather than leaving
+        // an awkward empty tile on its right.
+        for (x, width) in grid_axis(area.x, area.width, row_count, gaps)? {
+            result.push(SnapRect {
+                x,
+                y,
+                width,
+                height,
+            });
+        }
+    }
+    Some(result)
+}
+
+pub fn snap_rect(output_size: (i32, i32), side: SnapSide) -> Option<SnapRect> {
+    let (width, height) = output_size;
+    if width < 2 || height < 1 {
+        return None;
+    }
+    if height < 2 && !matches!(side, SnapSide::Left | SnapSide::Right) {
         return None;
     }
 
-    let left_width = output_width / 2;
-    let right_width = output_width - left_width;
+    let left_width = width / 2;
+    let right_width = width - left_width;
+    let top_height = height / 2;
+    let bottom_height = height - top_height;
 
-    let rect = match side {
-        SnapSide::Left => SnapRect {
-            x: 0,
-            y: 0,
-            width: left_width,
-            height: output_height,
-        },
-        SnapSide::Right => SnapRect {
-            x: left_width,
-            y: 0,
-            width: right_width,
-            height: output_height,
-        },
+    let (x, y, width, height) = match side {
+        SnapSide::Left => (0, 0, left_width, height),
+        SnapSide::Right => (left_width, 0, right_width, height),
+        SnapSide::TopLeft => (0, 0, left_width, top_height),
+        SnapSide::TopRight => (left_width, 0, right_width, top_height),
+        SnapSide::BottomLeft => (0, top_height, left_width, bottom_height),
+        SnapSide::BottomRight => (left_width, top_height, right_width, bottom_height),
     };
-    Some(rect)
+
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+
+    Some(SnapRect {
+        x,
+        y,
+        width,
+        height,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +187,7 @@ pub struct TilingSettings {
     pub default_master_ratio: u8,
     pub start_tiled: bool,
     pub tiled_workspaces: Option<[bool; WORKSPACE_COUNT]>,
+    pub grid_workspaces: Option<[bool; WORKSPACE_COUNT]>,
 }
 
 impl Default for TilingSettings {
@@ -104,6 +197,7 @@ impl Default for TilingSettings {
             default_master_ratio: 50,
             start_tiled: false,
             tiled_workspaces: None,
+            grid_workspaces: None,
         }
     }
 }
@@ -124,32 +218,165 @@ pub fn snap_rect_with_gaps(
     if gaps.outer < 0 || gaps.inner < 0 {
         return None;
     }
-    let half = snap_rect(output_size, side)?;
+    let cell = snap_rect(output_size, side)?;
 
-    let inner_left = gaps.inner / 2;
-    let inner_right = gaps.inner - inner_left;
+    // Split odd inner gaps predictably, as in the existing half-screen
+    // placement. This keeps the total gap between adjacent cells exact.
+    let inner_before = gaps.inner / 2;
+    let inner_after = gaps.inner - inner_before;
 
-    let (left_inset, right_inset) = match side {
-        SnapSide::Left => (gaps.outer, inner_right),
-        SnapSide::Right => (inner_left, gaps.outer),
+    let on_left = matches!(
+        side,
+        SnapSide::Left | SnapSide::TopLeft | SnapSide::BottomLeft
+    );
+    let (left_inset, right_inset) = if on_left {
+        (gaps.outer, inner_after)
+    } else {
+        (inner_before, gaps.outer)
     };
 
-    let width = half
+    let (top_inset, bottom_inset) = match side {
+        SnapSide::Left | SnapSide::Right => (gaps.outer, gaps.outer),
+        SnapSide::TopLeft | SnapSide::TopRight => (gaps.outer, inner_after),
+        SnapSide::BottomLeft | SnapSide::BottomRight => (inner_before, gaps.outer),
+    };
+
+    let width = cell
         .width
         .checked_sub(left_inset)?
         .checked_sub(right_inset)?;
-
-    let height = half.height.checked_sub(gaps.outer.checked_mul(2)?)?;
+    let height = cell
+        .height
+        .checked_sub(top_inset)?
+        .checked_sub(bottom_inset)?;
 
     if width <= 0 || height <= 0 {
         return None;
     }
+
     Some(SnapRect {
-        x: half.x.checked_add(left_inset)?,
-        y: gaps.outer,
+        x: cell.x.checked_add(left_inset)?,
+        y: cell.y.checked_add(top_inset)?,
         width,
         height,
     })
+}
+
+#[cfg(test)]
+mod quarter_snap_tests {
+    use super::*;
+
+    const QUARTERS: [SnapSide; 4] = [
+        SnapSide::TopLeft,
+        SnapSide::TopRight,
+        SnapSide::BottomLeft,
+        SnapSide::BottomRight,
+    ];
+
+    #[test]
+    fn quarters_partition_odd_sized_output_without_missing_pixels() {
+        let [tl, tr, bl, br] = QUARTERS.map(|side| snap_rect((1001, 701), side).unwrap());
+        assert_eq!((tl.x, tl.y, tl.width, tl.height), (0, 0, 500, 350));
+        assert_eq!((tr.x, tr.y, tr.width, tr.height), (500, 0, 501, 350));
+        assert_eq!((bl.x, bl.y, bl.width, bl.height), (0, 350, 500, 351));
+        assert_eq!((br.x, br.y, br.width, br.height), (500, 350, 501, 351));
+    }
+
+    #[test]
+    fn quarter_gaps_apply_outer_and_inner_insets() {
+        let gaps = SnapGaps {
+            outer: 11,
+            inner: 7,
+        };
+        let [tl, tr, bl, br] =
+            QUARTERS.map(|side| snap_rect_with_gaps((1001, 701), side, gaps).unwrap());
+        assert_eq!((tl.x, tl.y, tl.width, tl.height), (11, 11, 485, 335));
+        assert_eq!((tr.x, tr.y, tr.width, tr.height), (503, 11, 487, 335));
+        assert_eq!((bl.x, bl.y, bl.width, bl.height), (11, 353, 485, 337));
+        assert_eq!((br.x, br.y, br.width, br.height), (503, 353, 487, 337));
+        assert_eq!(tr.x - (tl.x + tl.width), 7);
+        assert_eq!(bl.y - (tl.y + tl.height), 7);
+    }
+
+    #[test]
+    fn half_screen_snaps_keep_previous_behavior() {
+        let gaps = SnapGaps {
+            outer: 12,
+            inner: 7,
+        };
+        let left = snap_rect_with_gaps((1200, 800), SnapSide::Left, gaps).unwrap();
+        let right = snap_rect_with_gaps((1200, 800), SnapSide::Right, gaps).unwrap();
+        assert_eq!(
+            left,
+            SnapRect {
+                x: 12,
+                y: 12,
+                width: 584,
+                height: 776
+            }
+        );
+        assert_eq!(
+            right,
+            SnapRect {
+                x: 603,
+                y: 12,
+                width: 585,
+                height: 776
+            }
+        );
+    }
+
+    #[test]
+    fn quarter_snapping_respects_waybar_work_area_and_output_resize() {
+        let small = SnapRect {
+            x: 0,
+            y: 36,
+            width: 1280,
+            height: 764,
+        };
+        let large = SnapRect {
+            x: 0,
+            y: 36,
+            width: 2560,
+            height: 1205,
+        };
+
+        assert_eq!(
+            snap_rect_in_area(small, SnapSide::TopLeft, DEFAULT_SNAP_GAPS),
+            Some(SnapRect {
+                x: 6,
+                y: 42,
+                width: 631,
+                height: 373,
+            })
+        );
+        assert_eq!(
+            snap_rect_in_area(large, SnapSide::TopRight, DEFAULT_SNAP_GAPS),
+            Some(SnapRect {
+                x: 1283,
+                y: 42,
+                width: 1271,
+                height: 593,
+            })
+        );
+    }
+
+    #[test]
+    fn quarter_snap_rejects_insufficient_output_or_gaps() {
+        assert_eq!(snap_rect((1, 800), SnapSide::TopLeft), None);
+        assert_eq!(snap_rect((800, 1), SnapSide::BottomRight), None);
+        assert_eq!(
+            snap_rect_with_gaps(
+                (30, 30),
+                SnapSide::TopLeft,
+                SnapGaps {
+                    outer: 12,
+                    inner: 12
+                }
+            ),
+            None
+        );
+    }
 }
 
 fn split_columns(
@@ -866,5 +1093,92 @@ mod tests {
         };
 
         assert!(!settings.is_valid());
+    }
+}
+
+#[cfg(test)]
+mod grid_layout_tests {
+    use super::*;
+    const AREA: SnapRect = SnapRect {
+        x: 0,
+        y: 36,
+        width: 1001,
+        height: 765,
+    };
+    const GAPS: SnapGaps = SnapGaps {
+        outer: 12,
+        inner: 7,
+    };
+
+    #[test]
+    fn grid_zero_one_three_five_and_odd_dimensions() {
+        assert_eq!(grid_rects_in_area(AREA, 0, GAPS), Some(vec![]));
+        let one = grid_rects_in_area(AREA, 1, GAPS).unwrap();
+        assert_eq!(
+            one,
+            vec![SnapRect {
+                x: 12,
+                y: 48,
+                width: 977,
+                height: 741
+            }]
+        );
+        let three = grid_rects_in_area(AREA, 3, GAPS).unwrap();
+        assert_eq!(three.len(), 3);
+        assert_eq!(three[0].y, three[1].y);
+        assert_eq!(three[0].x + three[0].width + 7, three[1].x);
+        assert_eq!(three[2].x, 12);
+        assert_eq!(three[2].width, 977);
+        let five = grid_rects_in_area(AREA, 5, GAPS).unwrap();
+        assert_eq!(five.len(), 5);
+        assert_eq!(five[2].x + five[2].width, 989);
+        assert_eq!(five[3].x, 12);
+        assert_eq!(five[4].x + five[4].width, 989);
+    }
+
+    #[test]
+    fn grid_stays_in_waybar_area_without_overlaps() {
+        for n in 1..=12 {
+            let rects = grid_rects_in_area(AREA, n, GAPS).unwrap();
+            assert_eq!(rects.len(), n);
+            for (i, a) in rects.iter().enumerate() {
+                assert!(a.x >= AREA.x + GAPS.outer && a.y >= AREA.y + GAPS.outer);
+                assert!(a.x + a.width <= AREA.x + AREA.width - GAPS.outer);
+                assert!(a.y + a.height <= AREA.y + AREA.height - GAPS.outer);
+                for b in &rects[i + 1..] {
+                    let overlaps = a.x < b.x + b.width
+                        && b.x < a.x + a.width
+                        && a.y < b.y + b.height
+                        && b.y < a.y + a.height;
+                    assert!(!overlaps, "grid tiles overlap: {a:?} / {b:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grid_rejects_insufficient_area_and_preserves_master_stack() {
+        let tiny = SnapRect {
+            x: 0,
+            y: 0,
+            width: 24,
+            height: 24,
+        };
+        assert!(grid_rects_in_area(tiny, 4, GAPS).is_none());
+        assert!(
+            grid_rects_in_area(
+                AREA,
+                5,
+                SnapGaps {
+                    outer: -1,
+                    inner: 7
+                }
+            )
+            .is_none()
+        );
+        assert_eq!(
+            layout_rects_in_area(AREA, 4, GAPS, 60, TilePattern::MasterStack),
+            tile_rects_in_area(AREA, 4, GAPS, 60),
+        );
     }
 }

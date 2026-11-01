@@ -24,12 +24,29 @@ impl Default for AppCommands {
     }
 }
 
+// A rule applies only when a NEW XDG toplevel identifies itself. Rules do not
+// retroactively move windows when configuration is reloaded.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowRule {
+    pub app_id: String,
+    pub workspace: usize,
+}
+
+pub fn matching_workspace(rules: &[WindowRule], app_id: &str) -> Option<usize> {
+    rules
+        .iter()
+        .find(|rule| rule.app_id == app_id)
+        .map(|rule| rule.workspace)
+}
+
 #[derive(Debug, Clone)]
 pub struct AnwiliteConfig {
     pub active_border: BorderStyle,
     pub inactive_border: Option<BorderStyle>,
     pub tiling: TilingSettings,
     pub apps: AppCommands,
+    pub window_rules: Vec<WindowRule>,
     pub keybindings: KeyBindings,
 }
 
@@ -40,6 +57,7 @@ impl Default for AnwiliteConfig {
             inactive_border: INACTIVE_BORDER,
             tiling: TilingSettings::default(),
             apps: AppCommands::default(),
+            window_rules: Vec::new(),
             keybindings: KeyBindings::default(),
         }
     }
@@ -53,6 +71,7 @@ impl AnwiliteConfig {
             && self.inactive_border == next.inactive_border
             && self.tiling == next.tiling
             && self.apps == next.apps
+            && self.window_rules == next.window_rules
             && self.keybindings == next.keybindings
         {
             return Ok(false);
@@ -70,6 +89,7 @@ struct FileConfig {
     borders: BorderOptions,
     tiling: TilingOptions,
     apps: AppOptions,
+    window_rules: Vec<WindowRule>,
     keybindings: Option<Vec<BindingSpec>>,
 }
 
@@ -96,6 +116,7 @@ struct TilingOptions {
     default_master_ratio: Option<u8>,
     start_tiled: Option<bool>,
     tiled_workspaces: Option<Vec<usize>>,
+    grid_workspaces: Option<Vec<usize>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -222,6 +243,21 @@ fn parse_config(contents: &str) -> Result<AnwiliteConfig, String> {
 
         tiling.tiled_workspaces = Some(mask);
     }
+    if let Some(workspaces) = options.grid_workspaces {
+        let mut mask = [false; WORKSPACE_COUNT];
+        for workspace in workspaces {
+            if !(1..=WORKSPACE_COUNT).contains(&workspace) {
+                return Err(format!(
+                    "invalid grid workspace {workspace}; expected 1..={WORKSPACE_COUNT}"
+                ));
+            }
+            if mask[workspace - 1] {
+                return Err(format!("grid workspace {workspace} appears more than once"));
+            }
+            mask[workspace - 1] = true;
+        }
+        tiling.grid_workspaces = Some(mask);
+    }
 
     if !tiling.is_valid() {
         return Err("invalid tiling settings: gaps must be 0..=64 \
@@ -267,6 +303,25 @@ fn parse_config(contents: &str) -> Result<AnwiliteConfig, String> {
     }
 
     config.apps = apps;
+
+    // Reject ambiguous rules rather than relying on declaration order.
+    let mut seen = std::collections::HashSet::new();
+    for rule in &file.window_rules {
+        if rule.app_id.trim().is_empty() || rule.app_id != rule.app_id.trim() {
+            return Err("window_rules.app_id must be a nonempty exact application ID".into());
+        }
+        if !(1..=WORKSPACE_COUNT).contains(&rule.workspace) {
+            return Err(format!(
+                "window rule for '{}': workspace must be 1..={WORKSPACE_COUNT}",
+                rule.app_id
+            ));
+        }
+        if !seen.insert(rule.app_id.as_str()) {
+            return Err(format!("duplicate window rule for '{}'", rule.app_id));
+        }
+    }
+    config.window_rules = file.window_rules;
+
     config.keybindings = match file.keybindings {
         Some(specs) => KeyBindings::from_explicit(&specs)?,
         None => KeyBindings::default(),
@@ -612,6 +667,36 @@ mod tests {
     }
 
     #[test]
+    fn quarter_snap_actions_load_from_toml_and_validate() {
+        let config = parse_config(
+            "[[keybindings]]\n\
+             key = \"Super+Ctrl+7\"\n\
+             action = \"snap_top_left\"\n\
+             [[keybindings]]\n\
+             key = \"Super+Ctrl+9\"\n\
+             action = \"snap_top_right\"\n",
+        )
+        .unwrap();
+
+        assert_ne!(config.keybindings, KeyBindings::default());
+        assert!(parse_config(
+            "[[keybindings]]\nkey = \"Super+Ctrl+7\"\naction = \"snap_top_left\"\nworkspace = 1\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn spatial_and_cycle_bindings_load_from_toml() {
+        let config = parse_config(
+            "[[keybindings]]\nkey = \"Super+Alt+Left\"\naction = \"focus_left\"\n\
+             [[keybindings]]\nkey = \"Alt+Tab\"\naction = \"cycle_windows\"\n\
+             [[keybindings]]\nkey = \"Super+Shift+Q\"\naction = \"close_window\"\n",
+        )
+        .unwrap();
+        assert_ne!(config.keybindings, KeyBindings::default());
+    }
+
+    #[test]
     fn invalid_keybinding_reload_keeps_previous_config() {
         let mut config = AnwiliteConfig::default();
 
@@ -626,9 +711,69 @@ mod tests {
     }
 
     #[test]
+    fn window_rules_match_exact_app_ids_and_workspaces() {
+        let config = parse_config(
+            "[[window_rules]]\napp_id = \"org.mozilla.firefox\"\nworkspace = 2\n\
+             [[window_rules]]\napp_id = \"foot\"\nworkspace = 3\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            matching_workspace(&config.window_rules, "org.mozilla.firefox"),
+            Some(2)
+        );
+        assert_eq!(matching_workspace(&config.window_rules, "foot"), Some(3));
+        assert_eq!(matching_workspace(&config.window_rules, "Foot"), None);
+        assert_eq!(matching_workspace(&config.window_rules, "firefox"), None);
+    }
+
+    #[test]
+    fn invalid_window_rules_are_rejected() {
+        assert!(parse_config("[[window_rules]]\napp_id = \"foo\"\nworkspace = 0\n").is_err());
+        assert!(parse_config("[[window_rules]]\napp_id = \"foo\"\nworkspace = 11\n").is_err());
+        assert!(parse_config("[[window_rules]]\napp_id = \"\"\nworkspace = 2\n").is_err());
+        assert!(
+            parse_config("[[window_rules]]\napp_id = \"foo\"\nworkspace = 2\nunknown = true\n")
+                .is_err()
+        );
+        assert!(parse_config("[[window_rules]]\napp_id = \"foo\"\nworkspace = 2\n[[window_rules]]\napp_id = \"foo\"\nworkspace = 3\n").is_err());
+    }
+
+    #[test]
+    fn window_rules_change_is_detected_on_reload() {
+        let mut config = AnwiliteConfig::default();
+        let next = parse_config("[[window_rules]]\napp_id = \"foot\"\nworkspace = 4\n").unwrap();
+        assert!(config.apply_reload(Ok(next.clone())).unwrap());
+        assert_eq!(matching_workspace(&config.window_rules, "foot"), Some(4));
+        assert!(!config.apply_reload(Ok(next)).unwrap());
+    }
+
+    #[test]
     fn application_menu_command_is_parsed() {
         let config = parse_config("[apps]\nmenu = [\"weston-terminal\"]\n").unwrap();
 
         assert_eq!(config.apps.menu, vec!["weston-terminal"]);
+    }
+}
+
+#[cfg(test)]
+mod grid_config_tests {
+    use super::*;
+    #[test]
+    fn grid_workspaces_are_independent_of_tiling_enablement() {
+        let config =
+            parse_config("[tiling]\ntiled_workspaces = [1, 3]\ngrid_workspaces = [3, 4]\n")
+                .unwrap();
+        let tiled = config.tiling.tiled_workspaces.unwrap();
+        let grids = config.tiling.grid_workspaces.unwrap();
+        assert!(tiled[0] && tiled[2]);
+        assert!(!tiled[3] && grids[3] && grids[2]);
+        assert!(!grids[0]);
+    }
+    #[test]
+    fn bad_grid_workspace_is_rejected() {
+        for list in ["[0]", "[11]", "[2, 2]"] {
+            assert!(parse_config(&format!("[tiling]\ngrid_workspaces = {list}\n")).is_err());
+        }
     }
 }
