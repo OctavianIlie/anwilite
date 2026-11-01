@@ -28,8 +28,8 @@ use smithay::wayland::socket::ListeningSocketSource;
 use smithay::{
     backend::{
         input::{
-            AbsolutePositionEvent, ButtonState, InputEvent, KeyState, KeyboardKeyEvent,
-            MouseButton, PointerButtonEvent,
+            AbsolutePositionEvent, Axis, ButtonState, InputEvent, KeyState, KeyboardKeyEvent,
+            MouseButton, PointerAxisEvent, PointerButtonEvent,
         },
         renderer::{
             element::{
@@ -47,7 +47,7 @@ use smithay::{
     input::{
         Seat, SeatHandler, SeatState,
         keyboard::FilterResult,
-        pointer::{ButtonEvent, MotionEvent},
+        pointer::{AxisFrame, ButtonEvent, MotionEvent},
     },
     reexports::wayland_server::{Display, protocol::wl_seat},
     utils::{Logical, Physical, Point, Rectangle, Serial, Transform},
@@ -1619,6 +1619,65 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                             );
 
                             pointer.frame(&mut state);
+                        }
+                    }
+
+                    InputEvent::PointerAxis { event } => {
+                        let time = start_time.elapsed().as_millis() as u32;
+
+                        let mut axis_frame = AxisFrame::new(time).source(event.source());
+
+                        let mut has_scroll = false;
+
+                        for axis in [Axis::Horizontal, Axis::Vertical] {
+                            let v120 = event.amount_v120(axis);
+
+                            // Winit may provide wheel steps instead of pixel values.
+                            let amount = event
+                                .amount(axis)
+                                .or_else(|| v120.map(|steps| steps * 15.0 / 120.0));
+
+                            let Some(amount) = amount else {
+                                continue;
+                            };
+
+                            if !amount.is_finite() || amount == 0.0 {
+                                continue;
+                            }
+
+                            axis_frame = axis_frame
+                                .value(axis, amount)
+                                .relative_direction(axis, event.relative_direction(axis));
+
+                            if let Some(steps) = v120
+                                && steps.is_finite()
+                                && steps != 0.0
+                            {
+                                axis_frame = axis_frame.v120(axis, steps.round() as i32);
+                            }
+
+                            has_scroll = true;
+                        }
+
+                        if has_scroll {
+                            // Refresh the pointer target, including popups and layers.
+                            let (x, y) = state.pointer_position;
+                            let focus = state.pointer_surface_at(x, y);
+
+                            pointer.motion(
+                                &mut state,
+                                focus,
+                                &MotionEvent {
+                                    location: (x, y).into(),
+                                    serial: smithay::utils::SERIAL_COUNTER.next_serial(),
+                                    time,
+                                },
+                            );
+
+                            pointer.axis(&mut state, axis_frame);
+                            pointer.frame(&mut state);
+
+                            state.needs_redraw = true;
                         }
                     }
 
