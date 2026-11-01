@@ -161,6 +161,8 @@ pub struct ManagedWindow {
     minimized: bool,
     minimized_order: u64,
     rule_checked: bool,
+    parent: Option<WlSurface>,
+    transient_placed: bool,
 }
 
 impl ManagedWindow {
@@ -404,6 +406,27 @@ fn window_geometry(window: &ManagedWindow) -> Option<Rectangle<i32, Logical>> {
     (geometry.size.w > 0 && geometry.size.h > 0).then_some(geometry)
 }
 
+// Position a parented XDG toplevel centrally, using XDG geometry (not shadows),
+// and keep its controls inside the layer-shell usable work area.
+fn centered_transient_origin(
+    area: SnapRect,
+    parent: SnapRect,
+    geometry: Rectangle<i32, Logical>,
+) -> (i32, i32) {
+    let x = i64::from(parent.x) + (i64::from(parent.width) - i64::from(geometry.size.w)) / 2
+        - i64::from(geometry.loc.x);
+    let y = i64::from(parent.y) + (i64::from(parent.height) - i64::from(geometry.size.h)) / 2
+        - i64::from(geometry.loc.y);
+    constrain_floating_origin(
+        area,
+        (
+            x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+            y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        ),
+        geometry,
+    )
+}
+
 // Update the xdg_toplevel tiled-edge hints. The caller must send a configure
 // after changing these pending states.
 fn set_tiled_edges(surface: &ToplevelSurface, tiled: bool) {
@@ -618,6 +641,10 @@ pub struct WindowManager {
 }
 
 impl WindowManager {
+    pub fn work_area_for_popup(&self, output_size: (i32, i32)) -> SnapRect {
+        self.current_work_area(output_size)
+    }
+
     fn current_work_area(&self, output_size: (i32, i32)) -> SnapRect {
         self.work_area.unwrap_or(SnapRect {
             x: 0,
@@ -737,7 +764,10 @@ impl WindowManager {
                     .windows
                     .iter()
                     .filter(|window| {
-                        window.workspace == workspace && window.surface.alive() && !window.minimized
+                        window.workspace == workspace
+                            && window.surface.alive()
+                            && !window.minimized
+                            && window.parent.is_none()
                     })
                     .collect();
 
@@ -887,6 +917,8 @@ impl WindowManager {
                 minimized: false,
                 minimized_order: 0,
                 rule_checked: false,
+                parent: None,
+                transient_placed: false,
             },
         );
     }
@@ -908,6 +940,9 @@ impl WindowManager {
             return false;
         };
 
+        if self.windows[index].parent.is_some() {
+            return false;
+        }
         if self.windows[index].rule_checked {
             return false;
         }
@@ -934,6 +969,103 @@ impl WindowManager {
         self.reflow_tiled_workspace(destination, output_size);
         println!("Anwilite: assigned new window to workspace {destination}");
         true
+    }
+
+    /// Parent metadata can arrive after new_toplevel or after app-id rules.
+    /// Parented XDG toplevels float over the parent's workspace; never consume
+    /// an ordinary master/stack or grid tile.
+    fn sync_transient_parent(
+        &mut self,
+        surface: &ToplevelSurface,
+        parent: Option<WlSurface>,
+        output_size: (i32, i32),
+    ) -> bool {
+        let Some(index) = self.windows.iter().position(|w| w.surface == *surface) else {
+            return false;
+        };
+        if self.windows[index].parent == parent {
+            return false;
+        }
+        let previous = self.windows[index].workspace;
+        self.windows[index].parent = parent.clone();
+        let Some(parent) = parent else {
+            // A parent can disappear during unmap/destroy; this may become a
+            // regular toplevel, so the active tile arrangement needs reflow.
+            self.windows[index].transient_placed = false;
+            self.reflow_tiled_workspace(previous, output_size);
+            return true;
+        };
+        let Some(parent_workspace) = self
+            .windows
+            .iter()
+            .find(|w| w.surface.wl_surface() == &parent && w.surface.alive())
+            .map(|w| w.workspace)
+        else {
+            return false;
+        };
+
+        let child = &mut self.windows[index];
+        child.workspace = parent_workspace;
+        child.rule_checked = true; // Workspace rules must never override the parent.
+        child.transient_placed = false;
+        // Usually still unconfigured, but handle applications that set_parent
+        // after their first configure, too.
+        if child.tiled.take().is_some() {
+            child.pre_tile = None;
+            set_tiled_edges(&child.surface, false);
+            child.surface.with_pending_state(|state| {
+                state.size = None;
+            });
+            if child.surface.is_initial_configure_sent() {
+                child.surface.send_pending_configure();
+            }
+        }
+        self.end_window_cycle();
+        self.reflow_tiled_workspace(previous, output_size);
+        if previous != parent_workspace {
+            self.reflow_tiled_workspace(parent_workspace, output_size);
+        }
+        self.raise_transients_of(&parent);
+        true
+    }
+
+    /// Must be invoked only after display.dispatch_clients() has returned.
+    /// A Smithay callback may hold XDG role data when it invokes the compositor.
+    pub fn refresh_transient_parents(&mut self, output_size: (i32, i32)) -> bool {
+        let updates: Vec<(ToplevelSurface, Option<WlSurface>)> = self
+            .windows
+            .iter()
+            .filter(|window| window.surface.alive())
+            .filter_map(|window| {
+                let parent = window.surface.parent();
+                (window.parent != parent).then(|| (window.surface.clone(), parent))
+            })
+            .collect();
+        let mut changed = false;
+        for (surface, parent) in updates {
+            changed |= self.sync_transient_parent(&surface, parent, output_size);
+        }
+        changed
+    }
+
+    /// Raise child windows without changing the relative order of master/stack tiles.
+    fn raise_transients_of(&mut self, parent: &WlSurface) {
+        let children: Vec<WlSurface> = self
+            .windows
+            .iter()
+            .filter(|w| w.surface.alive() && w.parent.as_ref() == Some(parent))
+            .map(|w| w.surface.wl_surface().clone())
+            .collect();
+        for child in children.into_iter().rev() {
+            if let Some(index) = self
+                .windows
+                .iter()
+                .position(|w| w.surface.wl_surface() == &child)
+            {
+                let window = self.windows.remove(index);
+                self.windows.insert(0, window);
+            }
+        }
     }
 
     pub fn current_workspace(&self) -> usize {
@@ -993,7 +1125,10 @@ impl WindowManager {
                 .windows
                 .iter()
                 .filter(|window| {
-                    window.workspace == workspace && window.surface.alive() && !window.minimized
+                    window.workspace == workspace
+                        && window.surface.alive()
+                        && !window.minimized
+                        && window.parent.is_none()
                 })
                 .collect();
             if participants.iter().any(|window| {
@@ -1059,7 +1194,10 @@ impl WindowManager {
             .windows
             .iter()
             .filter(|window| {
-                window.workspace == workspace && window.surface.alive() && !window.minimized
+                window.workspace == workspace
+                    && window.surface.alive()
+                    && !window.minimized
+                    && window.parent.is_none()
             })
             .collect();
 
@@ -1225,7 +1363,10 @@ impl WindowManager {
             .iter()
             .enumerate()
             .filter(|(_, window)| {
-                window.workspace == workspace && window.surface.alive() && !window.minimized
+                window.workspace == workspace
+                    && window.surface.alive()
+                    && !window.minimized
+                    && window.parent.is_none()
             })
             .map(|(index, _)| index)
             .collect();
@@ -1406,7 +1547,10 @@ impl WindowManager {
             .windows
             .iter()
             .filter(|window| {
-                window.workspace == workspace && window.surface.alive() && !window.minimized
+                window.workspace == workspace
+                    && window.surface.alive()
+                    && !window.minimized
+                    && window.parent.is_none()
             })
             .collect();
 
@@ -1491,6 +1635,10 @@ impl WindowManager {
         // Validate the window before modifying workspace state.
         let window = &self.windows[index];
 
+        // A transient cannot be moved separately from its parent.
+        if window.parent.is_some() {
+            return false;
+        }
         if window.pending_unsnap.is_some() || window.restoring.is_some() || window.maximized {
             return false;
         }
@@ -1535,6 +1683,12 @@ impl WindowManager {
         }
 
         self.windows.insert(0, window);
+        for child in &mut self.windows {
+            if child.parent.as_ref() == Some(focused) {
+                child.workspace = number;
+            }
+        }
+        self.raise_transients_of(focused);
 
         if self.last_focused[current - 1].as_ref() == Some(focused) {
             self.last_focused[current - 1] = None;
@@ -1662,6 +1816,7 @@ impl WindowManager {
     /// Make keyboard-focused floating windows visible without changing tile order.
     pub fn raise_focused_floating(&mut self, surface: &WlSurface) {
         if self.current_layout_mode() != LayoutMode::Floating {
+            self.raise_transients_of(surface);
             return;
         }
         if let Some(index) = self.windows.iter().position(|window| {
@@ -1671,6 +1826,7 @@ impl WindowManager {
             let window = self.windows.remove(index);
             self.windows.insert(0, window);
         }
+        self.raise_transients_of(surface);
     }
 
     fn globally_switchable(&self, surface: &WlSurface) -> bool {
@@ -1687,11 +1843,23 @@ impl WindowManager {
                 && other.tiled.is_some()
                 && other.maximized
                 && other.surface.wl_surface() != surface
+                && window.parent.as_ref() != Some(other.surface.wl_surface())
         })
     }
 
     pub fn end_window_cycle(&mut self) {
         self.window_cycle = None;
+    }
+
+    /// Parent XDG geometry origin for popup positioning (also maximized windows).
+    pub fn popup_root_origin(&self, root: &WlSurface) -> Option<(i32, i32)> {
+        self.windows
+            .iter()
+            .find(|window| self.is_window_visible(window) && window.surface.wl_surface() == root)
+            .and_then(|window| {
+                let geometry = window_geometry(window)?;
+                Some((window.x + geometry.loc.x, window.y + geometry.loc.y))
+            })
     }
 
     pub fn focused_window_rect(&self, focused: Option<&WlSurface>) -> Option<SnapRect> {
@@ -1736,7 +1904,10 @@ impl WindowManager {
             .iter()
             .enumerate()
             .filter(|(_, window)| {
-                window.workspace == workspace && window.surface.alive() && !window.minimized
+                window.workspace == workspace
+                    && window.surface.alive()
+                    && !window.minimized
+                    && window.parent.is_none()
             })
             .map(|(index, _)| index)
             .collect();
@@ -1839,6 +2010,14 @@ impl WindowManager {
             return false;
         }
 
+        // Hide children while their parent is minimized or no longer alive.
+        if let Some(parent) = window.parent.clone()
+            && self.windows.iter().any(|other| {
+                other.surface.wl_surface() == &parent && (other.minimized || !other.surface.alive())
+            })
+        {
+            return false;
+        }
         let maximized_tile = self.windows.iter().find(|other| {
             other.workspace == current
                 && other.surface.alive()
@@ -1847,7 +2026,10 @@ impl WindowManager {
                 && !other.minimized
         });
         match maximized_tile {
-            Some(zoomed) => zoomed.surface == window.surface,
+            Some(zoomed) => {
+                zoomed.surface == window.surface
+                    || window.parent.as_ref() == Some(zoomed.surface.wl_surface())
+            }
             None => true,
         }
     }
@@ -2017,6 +2199,7 @@ impl WindowManager {
             self.windows.insert(0, window);
         }
 
+        self.raise_transients_of(&surface);
         Some(surface)
     }
 
@@ -2326,12 +2509,17 @@ impl WindowManager {
             .iter()
             .position(|window| window.surface == surface)?;
 
-        if self.layout_modes[workspace - 1] == LayoutMode::Tiled {
+        if self.layout_modes[workspace - 1] == LayoutMode::Tiled
+            && self.windows[index].parent.is_none()
+        {
             let visible_count = self
                 .windows
                 .iter()
                 .filter(|window| {
-                    window.workspace == workspace && window.surface.alive() && !window.minimized
+                    window.workspace == workspace
+                        && window.surface.alive()
+                        && !window.minimized
+                        && window.parent.is_none()
                 })
                 .count();
 
@@ -2347,6 +2535,7 @@ impl WindowManager {
                 .filter(|(candidate, window)| {
                     window.workspace == workspace
                         && window.surface.alive()
+                        && window.parent.is_none()
                         && (!window.minimized || *candidate == index)
                 })
                 .map(|(candidate, _)| candidate)
@@ -2481,6 +2670,19 @@ impl WindowManager {
         // A committed XDG geometry update must not put maximized windows
         // back at the origin, behind an exclusive top or side panel.
         let maximized_origin = self.work_area.map_or((0, 0), |area| (area.x, area.y));
+        let parent_rect = self
+            .windows
+            .iter()
+            .find(|w| w.surface.wl_surface() == surface && !w.transient_placed)
+            .and_then(|w| w.parent.clone())
+            .and_then(|parent| {
+                self.windows
+                    .iter()
+                    .find(|w| w.surface.wl_surface() == &parent)
+            })
+            .and_then(|w| {
+                window_geometry(w).and_then(|geometry| absolute_window_rect((w.x, w.y), geometry))
+            });
         let Some(window) = self
             .windows
             .iter_mut()
@@ -2492,6 +2694,15 @@ impl WindowManager {
             return;
         };
 
+        if let Some(parent) = parent_rect
+            && !window.transient_placed
+            && !window.maximized
+            && window.tiled.is_none()
+            && window.snapped.is_none()
+        {
+            (window.x, window.y) = centered_transient_origin(area, parent, geometry);
+            window.transient_placed = true;
+        }
         if let Some(pending) = window.pending_unsnap {
             if (geometry.size.w, geometry.size.h) != pending.target_size {
                 return;
@@ -2685,9 +2896,32 @@ impl WindowManager {
             (px - drag.offset_x).round() as i32,
             (py - drag.offset_y).round() as i32,
         );
+        let previous = (window.x, window.y);
         (window.x, window.y) = window_geometry(window)
             .map(|geometry| constrain_floating_origin(area, wanted, geometry))
             .unwrap_or(wanted);
+        let delta = (
+            window.x.saturating_sub(previous.0),
+            window.y.saturating_sub(previous.1),
+        );
+        let parent = window.surface.wl_surface().clone();
+        if delta != (0, 0) {
+            for child in &mut self.windows {
+                if child.parent.as_ref() == Some(&parent)
+                    && !child.maximized
+                    && child.tiled.is_none()
+                    && child.snapped.is_none()
+                {
+                    let wanted = (
+                        child.x.saturating_add(delta.0),
+                        child.y.saturating_add(delta.1),
+                    );
+                    (child.x, child.y) = window_geometry(child)
+                        .map(|geo| constrain_floating_origin(area, wanted, geo))
+                        .unwrap_or(wanted);
+                }
+            }
+        }
     }
 
     pub fn end_drag(&mut self) {
@@ -3629,5 +3863,62 @@ mod floating_work_area_drag_bounds_tests {
             constrain_floating_origin(invalid, (30, 40), geometry(200, 200)),
             (30, 40)
         );
+    }
+}
+
+#[cfg(test)]
+mod transient_placement_tests {
+    use super::{SnapRect, centered_transient_origin};
+    use smithay::utils::{Logical, Rectangle};
+    #[test]
+    fn centered_over_parent_below_waybar() {
+        let area = SnapRect {
+            x: 0,
+            y: 30,
+            width: 1280,
+            height: 770,
+        };
+        let parent = SnapRect {
+            x: 100,
+            y: 100,
+            width: 600,
+            height: 400,
+        };
+        let child = Rectangle::<i32, Logical>::new((0, 0).into(), (300, 200).into());
+        assert_eq!(centered_transient_origin(area, parent, child), (250, 200));
+    }
+    #[test]
+    fn centered_dialog_accounts_for_xdg_geometry_offset() {
+        let area = SnapRect {
+            x: 0,
+            y: 30,
+            width: 1280,
+            height: 770,
+        };
+        let parent = SnapRect {
+            x: 100,
+            y: 100,
+            width: 600,
+            height: 400,
+        };
+        let child = Rectangle::<i32, Logical>::new((5, -3).into(), (300, 200).into());
+        assert_eq!(centered_transient_origin(area, parent, child), (245, 203));
+    }
+    #[test]
+    fn oversized_parent_cannot_push_dialog_beneath_panel() {
+        let area = SnapRect {
+            x: 0,
+            y: 30,
+            width: 800,
+            height: 600,
+        };
+        let parent = SnapRect {
+            x: -400,
+            y: -300,
+            width: 100,
+            height: 100,
+        };
+        let child = Rectangle::<i32, Logical>::new((0, 0).into(), (300, 200).into());
+        assert_eq!(centered_transient_origin(area, parent, child), (0, 30));
     }
 }
