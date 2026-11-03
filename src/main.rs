@@ -10,6 +10,7 @@ use calloop::timer::{TimeoutAction, Timer};
 use calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic};
 use keybindings::WorkspaceCommand;
 use layout::{SnapRect, focus_border_outside_tile};
+use smithay::utils::IsAlive;
 
 use ::winit::cursor::CursorIcon;
 use smithay::backend::renderer::damage::OutputDamageTracker;
@@ -47,7 +48,7 @@ use smithay::{
     input::{
         Seat, SeatHandler, SeatState,
         keyboard::FilterResult,
-        pointer::{AxisFrame, ButtonEvent, MotionEvent},
+        pointer::{AxisFrame, ButtonEvent, CursorImageStatus, CursorImageSurfaceData, MotionEvent},
     },
     reexports::wayland_server::{Display, protocol::wl_seat},
     utils::{Logical, Physical, Point, Rectangle, Serial, Transform},
@@ -478,11 +479,9 @@ impl SeatHandler for App {
         self.windows.remember_focus(focused);
         self.needs_redraw = true;
     }
-    fn cursor_image(
-        &mut self,
-        _seat: &Seat<Self>,
-        _image: smithay::input::pointer::CursorImageStatus,
-    ) {
+    fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+        self.client_cursor = image;
+        self.needs_redraw = true;
     }
 }
 
@@ -515,6 +514,8 @@ struct App {
     pending_popup_grabs: Vec<(PopupSurface, Serial)>,
     pending_popup_commits: Vec<WlSurface>,
     grabbed_popups: Vec<PopupSurface>,
+
+    client_cursor: CursorImageStatus,
 }
 
 impl App {
@@ -991,6 +992,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             pending_popup_grabs: Vec::new(),
             pending_popup_commits: Vec::new(),
             grabbed_popups: Vec::new(),
+            client_cursor: CursorImageStatus::default_named(),
         }
     };
     state.windows.configure_startup(config.tiling);
@@ -1084,8 +1086,12 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap();
     let pointer = state.seat.add_pointer();
     let mut host_cursor = CursorIcon::Default;
+    let mut host_cursor_visible = true;
     // Distinguish compositor-initiated border resize from client XDG resize.
     let mut border_resize_active = false;
+    // A popup-dismiss click must not activate the button beneath it.
+    // Swallow the matching release to avoid an unmatched button sequence.
+    let mut popup_dismiss_buttons = HashSet::<u32>::new();
     let mut launched_children = Vec::<std::process::Child>::new();
 
     if config.apps.autostart_terminal {
@@ -1189,8 +1195,11 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 WinitEvent::Focus(focused) => {
                     if !focused {
+                        popup_dismiss_buttons.clear();
                         backend.window().set_cursor(CursorIcon::Default);
+                        backend.window().set_cursor_visible(true);
                         host_cursor = CursorIcon::Default;
+                        host_cursor_visible = true;
                         if border_resize_active {
                             state.windows.finish_resize();
                             border_resize_active = false;
@@ -1573,6 +1582,9 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                         let y = event.y_transformed(output_size.h);
 
                         state.pointer_position = (x, y);
+                        if matches!(state.client_cursor, CursorImageStatus::Surface(_)) {
+                            state.needs_redraw = true;
+                        }
 
                         if state.windows.is_resizing() {
                             state.windows.update_resize(x, y);
@@ -1660,24 +1672,10 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                         }
 
                         if has_scroll {
-                            // Refresh the pointer target, including popups and layers.
-                            let (x, y) = state.pointer_position;
-                            let focus = state.pointer_surface_at(x, y);
-
-                            pointer.motion(
-                                &mut state,
-                                focus,
-                                &MotionEvent {
-                                    location: (x, y).into(),
-                                    serial: smithay::utils::SERIAL_COUNTER.next_serial(),
-                                    time,
-                                },
-                            );
-
+                            // Pointer focus is already updated by PointerMotionAbsolute.
+                            // Do not synthesize another motion event for scrolling.
                             pointer.axis(&mut state, axis_frame);
                             pointer.frame(&mut state);
-
-                            state.needs_redraw = true;
                         }
                     }
 
@@ -1687,6 +1685,15 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                         let serial = smithay::utils::SERIAL_COUNTER.next_serial();
 
                         let time = start_time.elapsed().as_millis() as u32;
+                        let button_code = event.button_code();
+
+                        // The popup dismissal swallowed the button press, so also
+                        // swallow its matching release.
+                        if event.state() == ButtonState::Released
+                            && popup_dismiss_buttons.remove(&button_code)
+                        {
+                            continue;
+                        }
 
                         let foreground_hit = state.foreground_layer_hit_at(x, y);
                         let popup_hit = if foreground_hit.is_none() {
@@ -1699,6 +1706,10 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                             && !state.grabbed_popups.is_empty()
                         {
                             state.dismiss_grabbed_popups();
+                            popup_dismiss_buttons.insert(button_code);
+                            state.move_press = None;
+                            // Do not deliver this click to the menu opener underneath.
+                            continue;
                         }
                         let ordinary_window_hit = if foreground_hit.is_none() && popup_hit.is_none()
                         {
@@ -1860,7 +1871,6 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                 },
                             );
 
-                            //
                             pointer.button(
                                 &mut state,
                                 &ButtonEvent {
@@ -1903,6 +1913,53 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
         display.dispatch_clients(&mut state)?;
         state.service_popup_requests();
+
+        if let CursorImageStatus::Surface(surface) = &state.client_cursor
+            && !surface.alive()
+        {
+            state.client_cursor = CursorImageStatus::default_named();
+        }
+
+        let (x, y) = state.pointer_position;
+
+        // The compositor's external resize borders take priority.
+        let resize_edge = if state.windows.is_resizing() {
+            state.windows.active_resize_edge()
+        } else if state.foreground_layer_hit_at(x, y).is_some()
+            || state.popup_hit_at(x, y).is_some()
+        {
+            None
+        } else {
+            state.windows.resize_hit_at(x, y).map(|(_, edge)| edge)
+        };
+
+        let pointer_over_client = state.pointer_surface_at(x, y).is_some();
+        let draw_client_surface = resize_edge.is_none()
+            && pointer_over_client
+            && matches!(&state.client_cursor, CursorImageStatus::Surface(_));
+
+        let (desired_icon, visible) = if let Some(edge) = resize_edge {
+            (resize_cursor_icon(edge), true)
+        } else if !pointer_over_client {
+            (CursorIcon::Default, true)
+        } else {
+            match &state.client_cursor {
+                CursorImageStatus::Named(icon) => (*icon, true),
+                CursorImageStatus::Hidden => (CursorIcon::Default, false),
+                CursorImageStatus::Surface(_) => (CursorIcon::Default, false),
+            }
+        };
+
+        if host_cursor_visible != visible {
+            backend.window().set_cursor_visible(visible);
+            host_cursor_visible = visible;
+        }
+
+        if visible && host_cursor != desired_icon {
+            backend.window().set_cursor(desired_icon);
+            host_cursor = desired_icon;
+        }
+
         // XDG metadata is safe to inspect only after request dispatch returns.
         // All compositor paths below use our cached parent reference.
         if state.windows.refresh_transient_parents(state.output_size) {
@@ -2005,6 +2062,40 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                 let focused_rect = state.windows.focused_window_rect(focused.as_ref());
 
                 let mut elements = Vec::<AnwiliteRenderElement>::new();
+
+                // Client surface cursors are hidden during compositor border resizing.
+                if draw_client_surface
+                    && let CursorImageStatus::Surface(surface) = &state.client_cursor
+                    && surface.alive()
+                {
+                    let hotspot = with_states(surface, |states| {
+                        states
+                            .data_map
+                            .get::<CursorImageSurfaceData>()
+                            .and_then(|data| data.lock().ok().map(|attrs| attrs.hotspot))
+                            .unwrap_or((0, 0).into())
+                    });
+
+                    let (x, y) = state.pointer_position;
+
+                    let cursor_origin = (
+                        (x - f64::from(hotspot.x)).round() as i32,
+                        (y - f64::from(hotspot.y)).round() as i32,
+                    );
+
+                    elements.extend(
+                        render_elements_from_surface_tree(
+                            renderer,
+                            surface,
+                            cursor_origin,
+                            1.0,
+                            1.0,
+                            Kind::Unspecified,
+                        )
+                        .into_iter()
+                        .map(AnwiliteRenderElement::Surface),
+                    );
+                }
 
                 // Foreground layer-shell surfaces are in front of normal windows.
                 // The render-elements list uses front-to-back stacking order.
@@ -2194,6 +2285,14 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                     window.surface.wl_surface(),
                     start_time.elapsed().as_millis() as u32,
                 );
+            }
+
+            // Send callbacks to client cursor surfaces so animations can advance.
+            if draw_client_surface
+                && let CursorImageStatus::Surface(surface) = &state.client_cursor
+                && surface.alive()
+            {
+                send_frames_surface_tree(surface, start_time.elapsed().as_millis() as u32);
             }
 
             // Each popup is a separate wl_surface tree and needs frame callbacks.
