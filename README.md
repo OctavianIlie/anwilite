@@ -311,9 +311,6 @@ Anwilite is its own Rust/Smithay compositor, not a fork of another window manage
 
 The compositor should remain usable for everyday work while allowing games to request uninterrupted fullscreen presentation and appropriate input handling. Visual effects should not take priority over frame consistency, and claims about gaming compatibility or low latency will require testing on real hardware.
 
-## Contributing
-
-Anwilite is under active early development. For an up-to-date developer handoff and prioritized implementation backlog, see [`HANDOFF.md`](HANDOFF.md). Reproducible bug reports, code review and design feedback are welcome. For technical issues, include your Rust version, Linux distribution, host compositor, GPU or virtual machine, steps to reproduce, and relevant Anwilite logs.
 
 ## License
 
