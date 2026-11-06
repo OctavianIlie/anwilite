@@ -21,10 +21,12 @@ use smithay::desktop::{
 };
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
+use smithay::wayland::selection::data_device::set_data_device_focus;
 use smithay::wayland::shell::wlr_layer::{
     KeyboardInteractivity, Layer, LayerSurface, LayerSurfaceCachedState, WlrLayerShellHandler,
     WlrLayerShellState,
 };
+
 use smithay::wayland::socket::ListeningSocketSource;
 use smithay::{
     backend::{
@@ -50,7 +52,7 @@ use smithay::{
         keyboard::FilterResult,
         pointer::{AxisFrame, ButtonEvent, CursorImageStatus, CursorImageSurfaceData, MotionEvent},
     },
-    reexports::wayland_server::{Display, protocol::wl_seat},
+    reexports::wayland_server::{Display, DisplayHandle, protocol::wl_seat},
     utils::{Logical, Physical, Point, Rectangle, Serial, Transform},
     wayland::{
         buffer::BufferHandler,
@@ -82,7 +84,7 @@ use std::{os::unix::io::OwnedFd, sync::Arc};
 use wayland_protocols::xdg::shell::server::xdg_toplevel;
 use wayland_server::protocol::wl_output::WlOutput;
 use wayland_server::{
-    Client,
+    Client, Resource,
     backend::{ClientData, ClientId, DisconnectReason},
     protocol::{
         wl_buffer,
@@ -475,10 +477,18 @@ impl SeatHandler for App {
         &mut self.seat_state
     }
 
-    fn focus_changed(&mut self, _seat: &Seat<Self>, focused: Option<&WlSurface>) {
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
+        // Keep Anwilite's existing focus bookkeeping.
         self.windows.remember_focus(focused);
+
+        // Clipboard selection follows the focused Wayland client.
+        let client = focused.and_then(|surface| surface.client());
+
+        set_data_device_focus(&self.display_handle, seat, client);
+
         self.needs_redraw = true;
     }
+
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
         self.client_cursor = image;
         self.needs_redraw = true;
@@ -516,11 +526,10 @@ struct App {
     grabbed_popups: Vec<PopupSurface>,
 
     client_cursor: CursorImageStatus,
+    display_handle: DisplayHandle,
 }
 
 impl App {
-    /// Resolve the ancestor window / layer geometry without reading popup role
-    /// state during a Smithay dispatch callback.
     fn popup_parent_origin(&self, popup: &PopupSurface) -> Option<(i32, i32)> {
         let kind = PopupKind::Xdg(popup.clone());
         let root = find_popup_root_surface(&kind).ok()?;
@@ -644,8 +653,6 @@ impl App {
     }
 
     fn apply_new_window_rule(&mut self, surface: &ToplevelSurface) {
-        // Smithay reports set_app_id through XdgShellHandler::app_id_changed.
-        // Resolve the metadata after that event; no poll or title matching.
         let app_id = with_states(surface.wl_surface(), |states| {
             states
                 .data_map
@@ -993,6 +1000,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             pending_popup_commits: Vec::new(),
             grabbed_popups: Vec::new(),
             client_cursor: CursorImageStatus::default_named(),
+            display_handle: dh.clone(),
         }
     };
     state.windows.configure_startup(config.tiling);
