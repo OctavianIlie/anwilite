@@ -88,6 +88,7 @@ use wayland_server::{
     backend::{ClientData, ClientId, DisconnectReason},
     protocol::{
         wl_buffer,
+        wl_data_source::WlDataSource,
         wl_surface::{self, WlSurface},
     },
 };
@@ -186,14 +187,9 @@ impl XdgShellHandler for App {
         });
 
         surface.send_configure();
-        let workspace = self.windows.current_workspace();
-
-        if self
-            .windows
-            .reflow_tiled_workspace(workspace, self.output_size)
-        {
-            self.needs_redraw = true;
-        }
+        // Do not tile a new XDG toplevel before its parent information
+        // has been reconciled after Wayland request dispatch.
+        self.pending_tiling_reflow = true;
 
         // Do not steal keyboard focus from a visible layer-shell launcher.
         if self.active_layer_keyboard.is_none()
@@ -397,7 +393,31 @@ impl DataDeviceHandler for App {
     }
 }
 
-impl ClientDndGrabHandler for App {}
+impl ClientDndGrabHandler for App {
+    fn started(
+        &mut self,
+        source: Option<WlDataSource>,
+        icon: Option<WlSurface>,
+        _seat: Seat<Self>,
+    ) {
+        println!(
+            "Anwilite DnD: started source={} icon={}",
+            source.is_some(),
+            icon.is_some()
+        );
+        self.needs_redraw = true;
+    }
+
+    fn dropped(&mut self, target: Option<WlSurface>, validated: bool, _seat: Seat<Self>) {
+        println!(
+            "Anwilite DnD: dropped target={} validated={}",
+            target.is_some(),
+            validated
+        );
+        self.needs_redraw = true;
+    }
+}
+
 impl ServerDndGrabHandler for App {
     fn send(&mut self, _mime_type: String, _fd: OwnedFd, _seat: Seat<Self>) {}
 }
@@ -455,7 +475,16 @@ impl CompositorHandler for App {
         self.windows
             .trace_geometry_on_commit(surface, self.output_size);
 
-        self.windows.reflow_for_surface(surface, self.output_size);
+        // Defer tiling until XDG parent metadata has been reconciled.
+        // Cursor, layer and popup commits need no window-layout reflow.
+        if self
+            .windows
+            .windows
+            .iter()
+            .any(|window| window.surface.wl_surface() == surface)
+        {
+            self.pending_tiling_reflow = true;
+        }
 
         self.surface_commit_count += 1;
         self.needs_redraw = true;
@@ -524,6 +553,7 @@ struct App {
     pending_popup_grabs: Vec<(PopupSurface, Serial)>,
     pending_popup_commits: Vec<WlSurface>,
     grabbed_popups: Vec<PopupSurface>,
+    pending_tiling_reflow: bool,
 
     client_cursor: CursorImageStatus,
     display_handle: DisplayHandle,
@@ -999,6 +1029,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             pending_popup_grabs: Vec::new(),
             pending_popup_commits: Vec::new(),
             grabbed_popups: Vec::new(),
+            pending_tiling_reflow: false,
             client_cursor: CursorImageStatus::default_named(),
             display_handle: dh.clone(),
         }
@@ -1971,6 +2002,13 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
         // XDG metadata is safe to inspect only after request dispatch returns.
         // All compositor paths below use our cached parent reference.
         if state.windows.refresh_transient_parents(state.output_size) {
+            state.needs_redraw = true;
+        }
+
+        // All set_parent requests from this dispatch are now visible.
+        if std::mem::take(&mut state.pending_tiling_reflow)
+            && state.windows.reflow_all_tiled_workspaces(state.output_size)
+        {
             state.needs_redraw = true;
         }
 
