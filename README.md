@@ -12,20 +12,20 @@ Anwilite is built with [Smithay](https://github.com/Smithay/smithay) (currently 
 
 | Feature | Status |
 | --- | --- |
-| Nested Wayland compositor using Winit and GLES | Working |
-| XDG toplevel windows, keyboard and pointer input | Working |
-| Floating windows, dragging, interactive resizing, click-to-focus | Working |
-| Ten workspaces, move-and-follow, workspace-local focus history | Working |
-| Per-workspace floating or automatic tiling | Working |
-| Master-and-stack tiling, gaps, adjustable ratios, tile navigation and swapping | Working |
-| Snapping, maximizing, minimizing and restoring windows | Working |
-| Focus borders and configurable window appearance | Working |
-| TOML configuration, configurable application commands and keybindings | Working |
-| Show desktop and application-launcher shortcuts | Working |
-| Layer-shell surfaces, output information and layer input handling | Working in the nested backend |
-| Waybar, Swaybg and Fuzzel integration | Working in the development session |
-| Exclusive work areas for panels and docks | Implemented; manually tested with Waybar |
-| Output resizing, damage tracking and redraw-on-demand | Working in the nested backend |
+| Nested Wayland compositor using Winit and GLES | ✅ Working |
+| XDG toplevel windows, keyboard and pointer input | ✅ Working |
+| Floating windows, dragging, interactive resizing, click-to-focus | ✅ Working |
+| Ten workspaces, move-and-follow, workspace-local focus history | ✅ Working |
+| Per-workspace floating or automatic tiling | ✅ Working |
+| Master-and-stack tiling, gaps, adjustable ratios, tile navigation and swapping | ✅ Working |
+| Snapping, maximizing, minimizing and restoring windows | ✅ Working |
+| Focus borders and configurable window appearance | ✅ Working |
+| TOML configuration, configurable application commands and keybindings | ✅ Working |
+| Show desktop and application-launcher shortcuts | ✅ Working |
+| Layer-shell surfaces, output information and layer input handling | ✅ Working in the nested backend |
+| Waybar, Swaybg and Fuzzel integration | ✅ Working in the development session |
+| Exclusive work areas for panels and docks | ✅ Implemented; manually tested with Waybar |
+| Output resizing, damage tracking and redraw-on-demand | ✅ Working in the nested backend |
 | XDG popup menus, nested submenus, dismissal and transient dialogs | ✅ Manually tested in Dolphin |
 | Vertical/horizontal mouse-wheel and pointer-axis scrolling | ✅ Manually tested in Dolphin and terminal |
 | Client-supplied pointer cursors, hotspot alignment and compositor resize cursors | ✅ 23/23 cursor checks passed |
@@ -41,7 +41,7 @@ Anwilite is built with [Smithay](https://github.com/Smithay/smithay) (currently 
 | Native DRM/KMS, libinput and independent login session | Planned |
 | Multi-monitor management, variable refresh rate and direct scanout | Planned |
 
-**✅ means a feature has passed manual tests in the nested development session.** An item marked implemented or working without ✅ is not necessarily covered by the recent acceptance tests. Checkboxes in the roadmap indicate implemented milestones; they do not certify production readiness.
+**✅ marks functionality reported working or implemented in the nested development environment.** Specific manual acceptance-test counts are shown where available. Checked roadmap items indicate implemented milestones, not production readiness.
 
 The latest test round passed **8/8 drag-icon and regression checks** using the *render-only* Stage 2 approach. Earlier checks passed 23/23 for client cursors, 6/6 for popup click-through, 6/6 for clipboard, 8/8 for Dolphin file transfer, and the transient-dialog layout regression tests. These are separate manual test rounds, not a single automated suite. Cross-application drops, icon surface offset correctness, and all failure-path cleanup still need dedicated testing.
 
@@ -239,14 +239,14 @@ The following stages describe planned capabilities, not guaranteed release dates
 - [x] ✅ Floating windows, moving, interactive resizing, maximize and restore.
 - [x] ✅ Ten workspaces, switching, move-and-follow, and per-workspace focus history.
 - [x] ✅ Left/right half-screen snapping and original-geometry restoration.
-- [x] Configurable inner and outer gaps for snapping and tiling.
-- [x] Drag to unsnap without jumping.
+- [x] ✅ Configurable inner and outer gaps for snapping and tiling.
+- [x] ✅ Drag to unsnap without jumping.
 - [x] ✅ Automatic master-and-stack tiling for one, two, and three or more windows, with dynamic reflow.
-- [x] Per-workspace floating/tiling modes and adjustable master-width ratios.
+- [x] ✅ Per-workspace floating/tiling modes and adjustable master-width ratios.
 - [x] ✅ Tile focus navigation, swapping, and promotion to master.
-- [x] Minimize/restore, show desktop, and configurable application-launcher shortcuts.
-- [x] Configurable keybindings, application commands, appearance, and startup tiling preferences.
-- [x] Focus borders and exclusive work areas respected by maximized, snapped, and tiled windows.
+- [x] ✅ Minimize/restore, show desktop, and configurable application-launcher shortcuts.
+- [x] ✅ Configurable keybindings, application commands, appearance, and startup tiling preferences.
+- [x] ✅ Focus borders and exclusive work areas respected by maximized, snapped, and tiled windows.
 - [x] ✅ Quarter-screen snapping and additional placement transitions.
 - [x] ✅ Spatial directional focus, global Alt+Tab, and further window-management shortcuts.
 - [x] ✅ Configurable automatic window/workspace rules and additional layout types (including grid).
@@ -256,8 +256,8 @@ The following stages describe planned capabilities, not guaranteed release dates
 
 ### Stage 2 — Desktop protocols and control plane
 
-- [x] Layer-shell support for background, bottom, top, and overlay surfaces in the nested backend.
-- [x] Layer-shell exclusive zones, keyboard/pointer focus handling, and virtual output information.
+- [x] ✅ Layer-shell support for background, bottom, top, and overlay surfaces in the nested backend.
+- [x] ✅ Layer-shell exclusive zones, keyboard/pointer focus handling, and virtual output information.
 - [x] ✅ XDG popup placement, grabbing, repositioning, nested submenus, outside-click and Escape dismissal; Dolphin menus and transient dialogs tested.
 - [x] ✅ Pointer-axis scrolling (vertical and horizontal) without synthetic motion on every scroll event.
 - [x] ✅ Application-requested cursor rendering, cursor hotspots, and compositor resize-cursor precedence (23/23 tests).
