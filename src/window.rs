@@ -163,6 +163,9 @@ pub struct ManagedWindow {
     rule_checked: bool,
     parent: Option<WlSurface>,
     transient_placed: bool,
+    // A newly opened client that cannot fit a tile remains floating without
+    // changing the layout mode of its workspace (e.g. a large file dialog).
+    auto_floating: bool,
 }
 
 impl ManagedWindow {
@@ -768,6 +771,7 @@ impl WindowManager {
                             && window.surface.alive()
                             && !window.minimized
                             && window.parent.is_none()
+                            && !window.auto_floating
                     })
                     .collect();
 
@@ -919,6 +923,7 @@ impl WindowManager {
                 rule_checked: false,
                 parent: None,
                 transient_placed: false,
+                auto_floating: false,
             },
         );
     }
@@ -1129,6 +1134,7 @@ impl WindowManager {
                         && window.surface.alive()
                         && !window.minimized
                         && window.parent.is_none()
+                        && !window.auto_floating
                 })
                 .collect();
             if participants.iter().any(|window| {
@@ -1198,6 +1204,7 @@ impl WindowManager {
                     && window.surface.alive()
                     && !window.minimized
                     && window.parent.is_none()
+                    && !window.auto_floating
             })
             .collect();
 
@@ -1367,12 +1374,37 @@ impl WindowManager {
                     && window.surface.alive()
                     && !window.minimized
                     && window.parent.is_none()
+                    && !window.auto_floating
             })
             .map(|(index, _)| index)
             .collect();
 
-        let Some(targets) = self.tile_targets_for_workspace(workspace, indices.len(), output_size)
-        else {
+        let targets = self.tile_targets_for_workspace(workspace, indices.len(), output_size);
+
+        let cant_fit = targets.as_ref().is_none_or(|targets| {
+            indices
+                .iter()
+                .zip(targets.iter())
+                .any(|(&index, &target)| !window_can_fit_tile(&self.windows[index], target))
+        });
+        if cant_fit
+            && let Some(newcomer) = indices
+                .iter()
+                .copied()
+                .find(|&index| self.windows[index].tiled.is_none())
+        {
+            eprintln!(
+                "Anwilite: keeping incompatible new window floating on workspace {} ({} other windows)",
+                workspace,
+                indices.len().saturating_sub(1),
+            );
+            self.windows[newcomer].auto_floating = true;
+            // The remaining windows may need reflow from N to N-1 tiles.
+            let _ = self.reflow_tiled_workspace(workspace, output_size);
+            return true;
+        }
+
+        let Some(targets) = targets else {
             let maximized_surfaces: Vec<ToplevelSurface> = indices
                 .iter()
                 .filter_map(|&index| {
@@ -1551,6 +1583,7 @@ impl WindowManager {
                     && window.surface.alive()
                     && !window.minimized
                     && window.parent.is_none()
+                    && !window.auto_floating
             })
             .collect();
 
@@ -1908,6 +1941,7 @@ impl WindowManager {
                     && window.surface.alive()
                     && !window.minimized
                     && window.parent.is_none()
+                    && !window.auto_floating
             })
             .map(|(index, _)| index)
             .collect();
@@ -2511,6 +2545,7 @@ impl WindowManager {
 
         if self.layout_modes[workspace - 1] == LayoutMode::Tiled
             && self.windows[index].parent.is_none()
+            && !self.windows[index].auto_floating
         {
             let visible_count = self
                 .windows
@@ -2520,6 +2555,7 @@ impl WindowManager {
                         && window.surface.alive()
                         && !window.minimized
                         && window.parent.is_none()
+                        && !window.auto_floating
                 })
                 .count();
 
@@ -2536,6 +2572,7 @@ impl WindowManager {
                     window.workspace == workspace
                         && window.surface.alive()
                         && window.parent.is_none()
+                        && !window.auto_floating
                         && (!window.minimized || *candidate == index)
                 })
                 .map(|(candidate, _)| candidate)

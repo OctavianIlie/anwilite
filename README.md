@@ -2,7 +2,7 @@
 
 **A Rust Wayland compositor and hybrid window manager for [Octlitch Linux](https://octlitch.com).**
 
-> **Status: experimental / pre-alpha.** Anwilite runs as a nested Wayland compositor with working floating and tiled window management, configurable controls, and a basic desktop environment. It is not yet a standalone login session or a replacement for a production desktop, and gaming compatibility is still under development.
+> **Status: experimental / pre-alpha.** Anwilite runs as a nested Wayland compositor with working floating and tiled window management, configurable controls, a basic desktop environment, and tested Wayland clipboard and file drag-and-drop workflows. It is not yet a standalone login session or a replacement for a production desktop, and gaming compatibility is still under development.
 
 Anwilite is built with [Smithay](https://github.com/Smithay/smithay) (currently Smithay 0.7), Rust, Calloop, and OpenGL ES. It aims to provide a responsive, keyboard-driven desktop with flexible window management, a cohesive Octlitch visual identity, and a solid foundation for Linux gaming.
 
@@ -26,11 +26,24 @@ Anwilite is built with [Smithay](https://github.com/Smithay/smithay) (currently 
 | Waybar, Swaybg and Fuzzel integration | Working in the development session |
 | Exclusive work areas for panels and docks | Implemented; manually tested with Waybar |
 | Output resizing, damage tracking and redraw-on-demand | Working in the nested backend |
+| XDG popup menus, nested submenus, dismissal and transient dialogs | ✅ Manually tested in Dolphin |
+| Vertical/horizontal mouse-wheel and pointer-axis scrolling | ✅ Manually tested in Dolphin and terminal |
+| Client-supplied pointer cursors, hotspot alignment and compositor resize cursors | ✅ 23/23 cursor checks passed |
+| Popup click-through prevention | ✅ 6/6 regression checks passed |
+| Wayland clipboard copy/paste between nested applications and workspaces | ✅ 6/6 clipboard checks passed |
+| Dolphin-to-Dolphin file drag-and-drop, copy, cancel and overwrite | ✅ 8/8 transfer checks passed |
+| Client-supplied drag-icon rendering (render-only implementation) | ✅ 8/8 Stage 2 checks passed |
+| Overwrite and copy-progress dialogs over tiled and grid workspaces | ✅ Layout regression checks passed |
+| Cross-application drag-and-drop, full drag-icon offset semantics | Not yet verified |
 | True fullscreen distinct from maximize | Planned |
 | Relative pointer input and pointer locking/confinement | Planned |
 | XWayland, Steam and Proton workflows | Planned |
 | Native DRM/KMS, libinput and independent login session | Planned |
 | Multi-monitor management, variable refresh rate and direct scanout | Planned |
+
+**✅ means a feature has passed manual tests in the nested development session.** An item marked implemented or working without ✅ is not necessarily covered by the recent acceptance tests. Checkboxes in the roadmap indicate implemented milestones; they do not certify production readiness.
+
+The latest test round passed **8/8 drag-icon and regression checks** using the *render-only* Stage 2 approach. Earlier checks passed 23/23 for client cursors, 6/6 for popup click-through, 6/6 for clipboard, 8/8 for Dolphin file transfer, and the transient-dialog layout regression tests. These are separate manual test rounds, not a single automated suite. Cross-application drops, icon surface offset correctness, and all failure-path cleanup still need dedicated testing.
 
 These results describe the current nested development environment. They are not a claim of broad hardware compatibility or finished production-quality behavior.
 
@@ -53,6 +66,16 @@ Tiling also checks client-reported size constraints. When a layout cannot accomm
 Anwilite draws active-window indicators with configurable colors, thickness, and spacing. Window focus follows the compositor's visible-window and layer-shell rules. Tiled and snapped windows use placement-aware clipping and borders.
 
 Applications can draw their own window decorations. A client may choose to hide its titlebar buttons while maximized; Anwilite does not yet provide a complete compositor-drawn titlebar and button system.
+
+### Input, clipboard, popups and drag-and-drop
+
+Anwilite forwards mouse-wheel and horizontal/vertical pointer-axis events to Wayland clients. Client-requested cursor images are handled as named host cursors or compositor-rendered Wayland cursor surfaces; the compositor retains control over external window-resize indicators. In nested manual tests, cursor, scrolling, popup and window interactions worked together without reported regressions. ✅
+
+The standard Wayland data device supports copy/paste between clients inside the nested session, including after switching workspaces or interacting with menus. Dolphin-to-Dolphin file drag-and-drop, cancellation, rejected drops and overwrite confirmation were exercised. The overwrite and copy-progress windows float without knocking the two Dolphin windows out of their tiled layout. ✅
+
+Client-supplied drag icon surfaces are drawn above application windows and follow the pointer. **The currently tested implementation is Stage 2 (render-only):** it retains the optional icon `wl_surface`, requests redraw on pointer motion, draws the surface, supplies frame callbacks, and clears it at drag completion. It intentionally does **not** modify `SurfaceAttributes::buffer_delta`; full client-controlled committed offsets/hotspots and cross-application transfers are follow-up work.
+
+The standard nested clipboard is **not** a persistent clipboard manager or an automatic bridge to the host KDE clipboard. Similarly, supporting a drag icon does not imply that every application accepts every dragged MIME type.
 
 ### Panels, wallpaper and launcher
 
@@ -173,13 +196,14 @@ Desktop application activation can still interact with processes in the host ses
 ```text
 Anwilite (Rust / Smithay)
 ├── Wayland protocols
-│   ├── Compositor, XDG shell, seats, data device
+│   ├── Compositor, XDG shell, seats, data device (clipboard and DnD)
 │   ├── Virtual output and XDG output information
 │   └── Layer shell (panels, overlays, backgrounds)
 ├── Window management
 │   ├── Floating, snapping, maximize/minimize
-│   ├── Workspaces, focus, tiling and layout constraints
+│   ├── Workspaces, focus, tiling, transient placement and layout constraints
 │   └── Exclusive work areas and focus indicators
+├── Pointer axis, client cursor and client drag-icon rendering
 ├── Configuration and application launching
 ├── Calloop event loop and Wayland socket
 └── Winit + OpenGL ES (current nested backend)
@@ -208,41 +232,51 @@ These optimizations have been exercised in the development environment, **not** 
 
 ## Roadmap
 
-The following stages describe planned capabilities, not guaranteed release dates. Checked items are implemented in the current nested development environment unless otherwise noted. A feature being implemented does not imply production readiness.
+The following stages describe planned capabilities, not guaranteed release dates. Checked items are implemented in the current nested development environment unless otherwise noted. **✅ identifies specifically manual-tested functionality**; an unchecked item remains open even when some related code exists. A feature being implemented does not imply production readiness.
 
 ### Stage 1 — Hybrid window manager
 
-- [x] Floating windows, moving, interactive resizing, maximize and restore.
-- [x] Ten workspaces, switching, move-and-follow, and per-workspace focus history.
-- [x] Left/right half-screen snapping and original-geometry restoration.
+- [x] ✅ Floating windows, moving, interactive resizing, maximize and restore.
+- [x] ✅ Ten workspaces, switching, move-and-follow, and per-workspace focus history.
+- [x] ✅ Left/right half-screen snapping and original-geometry restoration.
 - [x] Configurable inner and outer gaps for snapping and tiling.
 - [x] Drag to unsnap without jumping.
-- [x] Automatic master-and-stack tiling for one, two, and three or more windows, with dynamic reflow.
+- [x] ✅ Automatic master-and-stack tiling for one, two, and three or more windows, with dynamic reflow.
 - [x] Per-workspace floating/tiling modes and adjustable master-width ratios.
-- [x] Tile focus navigation, swapping, and promotion to master.
+- [x] ✅ Tile focus navigation, swapping, and promotion to master.
 - [x] Minimize/restore, show desktop, and configurable application-launcher shortcuts.
 - [x] Configurable keybindings, application commands, appearance, and startup tiling preferences.
 - [x] Focus borders and exclusive work areas respected by maximized, snapped, and tiled windows.
-- [x] Quarter-screen snapping and additional placement transitions.
-- [x] Spatial directional focus, global Alt+Tab, and further window-management shortcuts.
-- [x] Configurable automatic window/workspace rules and additional layout types (including grid).
-- [ ] More robust handling of size-constrained clients, transient dialogs, and uncommon window lifecycle transitions.
+- [x] ✅ Quarter-screen snapping and additional placement transitions.
+- [x] ✅ Spatial directional focus, global Alt+Tab, and further window-management shortcuts.
+- [x] ✅ Configurable automatic window/workspace rules and additional layout types (including grid).
+- [x] ✅ Parent-associated Dolphin overwrite dialogs float over tiled/grid windows without switching the workspace to floating mode; repeated overwrite/cancel tests passed.
+- [ ] Broader size-constraint, transient-parent, fullscreen-transition, and uncommon window-lifecycle hardening (beyond the tested Dolphin scenario).
 - [ ] Optional decoration policies, including compositor-drawn controls where appropriate.
 
 ### Stage 2 — Desktop protocols and control plane
 
 - [x] Layer-shell support for background, bottom, top, and overlay surfaces in the nested backend.
 - [x] Layer-shell exclusive zones, keyboard/pointer focus handling, and virtual output information.
-- [x] XDG popup placement, grabbing, repositioning, nested submenus, outside-click and Escape dismissal; Dolphin transient-dialog behavior tested.
+- [x] ✅ XDG popup placement, grabbing, repositioning, nested submenus, outside-click and Escape dismissal; Dolphin menus and transient dialogs tested.
+- [x] ✅ Pointer-axis scrolling (vertical and horizontal) without synthetic motion on every scroll event.
+- [x] ✅ Application-requested cursor rendering, cursor hotspots, and compositor resize-cursor precedence (23/23 tests).
+- [x] ✅ Popup click-through protection for outside-click dismissals (6/6 regression tests).
+- [x] ✅ Standard Wayland clipboard focus and copy/paste between nested clients (6/6 tests).
+- [x] ✅ Client-originated file drag-and-drop with Dolphin copy, overwrite, cancel and rejected-drop paths (8/8 transfer tests).
+- [x] ✅ Client-supplied drag icon surface rendering, pointer tracking and removal on drop/cancel (Stage 2 render-only; 8/8 checks).
+- [ ] Complete drag-icon offset/hotspot semantics, comprehensive destruction/cancel cleanup, and drag animations beyond current tests.
+- [ ] Test and harden cross-application drag-and-drop (Dolphin ↔ Kate/KWrite/Firefox and supported MIME types).
+- [ ] Primary selection, middle-click paste, persistent clipboard/history and optional data-control protocol.
+- [ ] Text-input/IME, input-method, tablet/touch and other desktop interaction protocols.
 - [ ] True fullscreen with correct stacking, focus, and restore semantics, separate from maximize.
 - [ ] Anwilite IPC API and events for workspaces, active windows, layouts, and configuration.
-- [ ] Clipboard and drag-and-drop hardening, primary selection, and text input/IME support.
 - [ ] Notifications, screencopy/screenshot paths, portals, and additional desktop protocols.
 - [ ] Output management beyond the current single virtual output.
 
 ### Stage 3 — Desktop shell and experience
 
-- [x] Working nested-development integration with Waybar, Swaybg, and Fuzzel.
+- [x] ✅ Working nested-development integration with Waybar, Swaybg, and Fuzzel.
 - [ ] Develop an Anwilite-specific Quickshell/QML desktop shell and visual identity.
 - [ ] Top bar with workspace indicators and active-window information.
 - [ ] Keyboard-driven app launcher and power/session menu as part of the finished shell.
@@ -279,7 +313,7 @@ The compositor should remain usable for everyday work while allowing games to re
 
 ## Contributing
 
-Anwilite is under active early development. Reproducible bug reports, code review and design feedback are welcome. For technical issues, include your Rust version, Linux distribution, host compositor, GPU or virtual machine, steps to reproduce, and relevant Anwilite logs.
+Anwilite is under active early development. For an up-to-date developer handoff and prioritized implementation backlog, see [`HANDOFF.md`](HANDOFF.md). Reproducible bug reports, code review and design feedback are welcome. For technical issues, include your Rust version, Linux distribution, host compositor, GPU or virtual machine, steps to reproduce, and relevant Anwilite logs.
 
 ## License
 

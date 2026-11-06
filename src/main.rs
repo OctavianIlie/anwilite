@@ -88,6 +88,7 @@ use wayland_server::{
     backend::{ClientData, ClientId, DisconnectReason},
     protocol::{
         wl_buffer,
+        wl_data_source::WlDataSource,
         wl_surface::{self, WlSurface},
     },
 };
@@ -186,14 +187,9 @@ impl XdgShellHandler for App {
         });
 
         surface.send_configure();
-        let workspace = self.windows.current_workspace();
-
-        if self
-            .windows
-            .reflow_tiled_workspace(workspace, self.output_size)
-        {
-            self.needs_redraw = true;
-        }
+        // Do not tile a new XDG toplevel before its parent information
+        // has been reconciled after Wayland request dispatch.
+        self.pending_tiling_reflow = true;
 
         // Do not steal keyboard focus from a visible layer-shell launcher.
         if self.active_layer_keyboard.is_none()
@@ -397,7 +393,37 @@ impl DataDeviceHandler for App {
     }
 }
 
-impl ClientDndGrabHandler for App {}
+impl ClientDndGrabHandler for App {
+    fn started(
+        &mut self,
+        source: Option<WlDataSource>,
+        icon: Option<WlSurface>,
+        _seat: Seat<Self>,
+    ) {
+        println!(
+            "Anwilite DnD: started source={} icon={}",
+            source.is_some(),
+            icon.is_some()
+        );
+        // Track the client's icon surface, but do NOT render or alter its buffer.
+        self.dnd_debug_icon = icon;
+        self.dnd_debug_icon_commit_seen = false;
+        self.needs_redraw = true;
+    }
+
+    fn dropped(&mut self, target: Option<WlSurface>, validated: bool, _seat: Seat<Self>) {
+        println!(
+            "Anwilite DnD: dropped target={} validated={} icon_commit_seen={}",
+            target.is_some(),
+            validated,
+            self.dnd_debug_icon_commit_seen
+        );
+        self.dnd_debug_icon = None;
+        self.dnd_debug_icon_commit_seen = false;
+        self.needs_redraw = true;
+    }
+}
+
 impl ServerDndGrabHandler for App {
     fn send(&mut self, _mime_type: String, _fd: OwnedFd, _seat: Seat<Self>) {}
 }
@@ -413,6 +439,12 @@ impl CompositorHandler for App {
 
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
+
+        // Diagnostic only: identify whether the source commits its icon surface.
+        if self.dnd_debug_icon.as_ref() == Some(surface) && !self.dnd_debug_icon_commit_seen {
+            self.dnd_debug_icon_commit_seen = true;
+            println!("Anwilite DnD: icon surface committed");
+        }
         // PopupManager::commit may read XDG role state. Process it only after
         // display.dispatch_clients() has completed, avoiding callback re-entry.
         self.pending_popup_commits.push(surface.clone());
@@ -455,7 +487,16 @@ impl CompositorHandler for App {
         self.windows
             .trace_geometry_on_commit(surface, self.output_size);
 
-        self.windows.reflow_for_surface(surface, self.output_size);
+        // Defer tiling until XDG parent metadata has been reconciled.
+        // Cursor, layer and popup commits need no window-layout reflow.
+        if self
+            .windows
+            .windows
+            .iter()
+            .any(|window| window.surface.wl_surface() == surface)
+        {
+            self.pending_tiling_reflow = true;
+        }
 
         self.surface_commit_count += 1;
         self.needs_redraw = true;
@@ -507,6 +548,9 @@ struct App {
     pointer_position: (f64, f64),
     move_press: Option<(Serial, ToplevelSurface)>,
     xdg_drag_active: bool,
+    // Diagnostic-only state; do not draw or mutate the icon surface.
+    dnd_debug_icon: Option<WlSurface>,
+    dnd_debug_icon_commit_seen: bool,
     needs_redraw: bool,
     output_size: (i32, i32),
     surface_commit_count: u64,
@@ -524,6 +568,7 @@ struct App {
     pending_popup_grabs: Vec<(PopupSurface, Serial)>,
     pending_popup_commits: Vec<WlSurface>,
     grabbed_popups: Vec<PopupSurface>,
+    pending_tiling_reflow: bool,
 
     client_cursor: CursorImageStatus,
     display_handle: DisplayHandle,
@@ -983,6 +1028,8 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             pointer_position: (0.0, 0.0),
             move_press: None,
             xdg_drag_active: false,
+            dnd_debug_icon: None,
+            dnd_debug_icon_commit_seen: false,
             needs_redraw: true,
             output_size: (1, 1), // Updated immediately after Winit initializes.
             surface_commit_count: 0,
@@ -999,6 +1046,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             pending_popup_grabs: Vec::new(),
             pending_popup_commits: Vec::new(),
             grabbed_popups: Vec::new(),
+            pending_tiling_reflow: false,
             client_cursor: CursorImageStatus::default_named(),
             display_handle: dh.clone(),
         }
@@ -1101,6 +1149,9 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
     // Swallow the matching release to avoid an unmatched button sequence.
     let mut popup_dismiss_buttons = HashSet::<u32>::new();
     let mut launched_children = Vec::<std::process::Child>::new();
+
+    // Visible marker to distinguish this build from older compositor logs.
+    println!("Anwilite DnD: stage2 render-only active");
 
     if config.apps.autostart_terminal {
         launch_configured_app("terminal", &config.apps.terminal, &mut launched_children);
@@ -1590,7 +1641,11 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                         let y = event.y_transformed(output_size.h);
 
                         state.pointer_position = (x, y);
-                        if matches!(state.client_cursor, CursorImageStatus::Surface(_)) {
+                        if state.dnd_debug_icon.is_some()
+                            || matches!(state.client_cursor, CursorImageStatus::Surface(_))
+                        {
+                            // The drag surface follows the pointer, even while
+                            // Smithay's DnD pointer grab is active.
                             state.needs_redraw = true;
                         }
 
@@ -1922,6 +1977,16 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
         display.dispatch_clients(&mut state)?;
         state.service_popup_requests();
 
+        if state
+            .dnd_debug_icon
+            .as_ref()
+            .is_some_and(|surface| !surface.alive())
+        {
+            println!("Anwilite DnD: icon surface destroyed");
+            state.dnd_debug_icon = None;
+            state.dnd_debug_icon_commit_seen = false;
+        }
+
         if let CursorImageStatus::Surface(surface) = &state.client_cursor
             && !surface.alive()
         {
@@ -1971,6 +2036,13 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
         // XDG metadata is safe to inspect only after request dispatch returns.
         // All compositor paths below use our cached parent reference.
         if state.windows.refresh_transient_parents(state.output_size) {
+            state.needs_redraw = true;
+        }
+
+        // All set_parent requests from this dispatch are now visible.
+        if std::mem::take(&mut state.pending_tiling_reflow)
+            && state.windows.reflow_all_tiled_workspaces(state.output_size)
+        {
             state.needs_redraw = true;
         }
 
@@ -2096,6 +2168,26 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                             renderer,
                             surface,
                             cursor_origin,
+                            1.0,
+                            1.0,
+                            Kind::Unspecified,
+                        )
+                        .into_iter()
+                        .map(AnwiliteRenderElement::Surface),
+                    );
+                }
+
+                // Render the client's drag icon above applications and layers.
+                // This stage deliberately does NOT modify SurfaceAttributes,
+                // buffer_delta, or client buffers; offsets come in a later stage.
+                if let Some(surface) = state.dnd_debug_icon.as_ref().filter(|s| s.alive()) {
+                    let (x, y) = state.pointer_position;
+                    let origin = (x.round() as i32, y.round() as i32);
+                    elements.extend(
+                        render_elements_from_surface_tree(
+                            renderer,
+                            surface,
+                            origin,
                             1.0,
                             1.0,
                             Kind::Unspecified,
@@ -2300,6 +2392,11 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                 && let CursorImageStatus::Surface(surface) = &state.client_cursor
                 && surface.alive()
             {
+                send_frames_surface_tree(surface, start_time.elapsed().as_millis() as u32);
+            }
+
+            // Let client-provided drag icons update and animate during a drag.
+            if let Some(surface) = state.dnd_debug_icon.as_ref().filter(|s| s.alive()) {
                 send_frames_surface_tree(surface, start_time.elapsed().as_millis() as u32);
             }
 
