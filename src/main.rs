@@ -405,19 +405,37 @@ impl ClientDndGrabHandler for App {
             source.is_some(),
             icon.is_some()
         );
-        // Track the client's icon surface, but do NOT render or alter its buffer.
+        // Capture only the source client's identity for interoperability logs.
+        // Smithay remains responsible for MIME negotiation and data transfer.
+        self.dnd_source_client_id = source
+            .as_ref()
+            .and_then(|source| source.client())
+            .map(|client| client.id());
+
+        // Keep the tested Stage 2 render-only client icon unchanged.
         self.dnd_debug_icon = icon;
         self.dnd_debug_icon_commit_seen = false;
         self.needs_redraw = true;
     }
 
     fn dropped(&mut self, target: Option<WlSurface>, validated: bool, _seat: Seat<Self>) {
+        let target_client_id = target
+            .as_ref()
+            .and_then(|surface| surface.client())
+            .map(|client| client.id());
+        let cross_client = self
+            .dnd_source_client_id
+            .as_ref()
+            .zip(target_client_id.as_ref())
+            .map(|(source, target)| source != target);
+
         println!(
-            "Anwilite DnD: dropped target={} validated={} icon_commit_seen={}",
+            "Anwilite DnD: dropped target={} validated={} icon_commit_seen={} cross_client={cross_client:?}",
             target.is_some(),
             validated,
             self.dnd_debug_icon_commit_seen
         );
+        self.dnd_source_client_id = None;
         self.dnd_debug_icon = None;
         self.dnd_debug_icon_commit_seen = false;
         self.needs_redraw = true;
@@ -548,7 +566,9 @@ struct App {
     pointer_position: (f64, f64),
     move_press: Option<(Serial, ToplevelSurface)>,
     xdg_drag_active: bool,
-    // Diagnostic-only state; do not draw or mutate the icon surface.
+    // Only for diagnostics: compare drag source and target Wayland clients.
+    dnd_source_client_id: Option<ClientId>,
+    // The Stage 2 drag icon is rendered without changing client buffer state.
     dnd_debug_icon: Option<WlSurface>,
     dnd_debug_icon_commit_seen: bool,
     needs_redraw: bool,
@@ -1028,6 +1048,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             pointer_position: (0.0, 0.0),
             move_press: None,
             xdg_drag_active: false,
+            dnd_source_client_id: None,
             dnd_debug_icon: None,
             dnd_debug_icon_commit_seen: false,
             needs_redraw: true,
