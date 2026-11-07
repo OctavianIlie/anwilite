@@ -2,7 +2,7 @@
 
 **A Rust Wayland compositor and hybrid window manager for [Octlitch Linux](https://octlitch.com).**
 
-> **Status: experimental / pre-alpha.** Anwilite runs as a nested Wayland compositor with working floating and tiled window management, configurable controls, a basic desktop environment, and tested Wayland clipboard and file drag-and-drop workflows. It is not yet a standalone login session or a replacement for a production desktop, and gaming compatibility is still under development.
+> **Status: experimental / pre-alpha.** Anwilite runs as a nested Wayland compositor with per-workspace Windowed, Tiled and Grid layouts, true XDG fullscreen, configurable controls, a basic desktop environment, and tested Wayland clipboard and Dolphin file drag-and-drop workflows. It is not yet a standalone login session or a replacement for a production desktop, and gaming compatibility is still under development.
 
 Anwilite is built with [Smithay](https://github.com/Smithay/smithay) (currently Smithay 0.7), Rust, Calloop, and OpenGL ES. It aims to provide a responsive, keyboard-driven desktop with flexible window management, a cohesive Octlitch visual identity, and a solid foundation for Linux gaming.
 
@@ -16,7 +16,8 @@ Anwilite is built with [Smithay](https://github.com/Smithay/smithay) (currently 
 | XDG toplevel windows, keyboard and pointer input | ✅ Working |
 | Floating windows, dragging, interactive resizing, click-to-focus | ✅ Working |
 | Ten workspaces, move-and-follow, workspace-local focus history | ✅ Working |
-| Per-workspace floating or automatic tiling | ✅ Working |
+| Independent per-workspace Windowed, Tiled and Grid modes | ✅ Working |
+| Windowed ↔ Tiled and Windowed ↔ Grid toggle shortcuts, including Tiled ↔ Grid transitions | ✅ Working |
 | Master-and-stack tiling, gaps, adjustable ratios, tile navigation and swapping | ✅ Working |
 | Snapping, maximizing, minimizing and restoring windows | ✅ Working |
 | Focus borders and configurable window appearance | ✅ Working |
@@ -24,6 +25,7 @@ Anwilite is built with [Smithay](https://github.com/Smithay/smithay) (currently 
 | Show desktop and application-launcher shortcuts | ✅ Working |
 | Layer-shell surfaces, output information and layer input handling | ✅ Working |
 | Waybar, Swaybg and Fuzzel integration | ✅ Working |
+| Waybar custom indicator for the active workspace’s layout mode | ✅ Working |
 | Exclusive work areas for panels and docks | ✅ Working |
 | Output resizing, damage tracking and redraw-on-demand | ✅ Working |
 | XDG popup menus, nested submenus, dismissal and transient dialogs | ✅ Working |
@@ -35,7 +37,7 @@ Anwilite is built with [Smithay](https://github.com/Smithay/smithay) (currently 
 | Client-supplied drag-icon rendering (render-only implementation) | ✅ Working |
 | Overwrite and copy-progress dialogs over tiled and grid workspaces | ✅ Working |
 | Cross-application drag-and-drop, full drag-icon offset semantics | Not yet verified |
-| True fullscreen distinct from maximize | Planned |
+| True XDG fullscreen distinct from maximize, with layout restoration | ✅ Working |
 | Relative pointer input and pointer locking/confinement | Planned |
 | XWayland, Steam and Proton workflows | Planned |
 | Native DRM/KMS, libinput and independent login session | Planned |
@@ -43,19 +45,20 @@ Anwilite is built with [Smithay](https://github.com/Smithay/smithay) (currently 
 
 **✅ Working** means the feature is functioning in the nested development environment. Checked roadmap boxes mark completed milestones, not production readiness.
 
-Drag-icon rendering, client cursors, popup dismissal, clipboard transfers, Dolphin file transfers, and transient dialog placement work in the nested development session. Cross-application drops, icon surface offset correctness, and broader failure-path cleanup still need testing.
 
 These results describe the current nested development environment. They are not a claim of broad hardware compatibility or finished production-quality behavior.
 
 ## Features
 
-### Floating and tiled windows
+### Windowed, Tiled and Grid layouts
 
-Each of the ten workspaces can independently use floating or automatic master-and-stack tiling.
+Each of the ten workspaces has its own layout mode; changing one workspace does not change the others.
 
-- **Floating:** drag, resize from window edges or corners, raise on click, snap to either half of the screen, maximize, restore, and minimize.
+- **Windowed (floating):** drag, resize from window edges or corners, raise on click, snap to either half of the screen, maximize, restore, and minimize.
 - **Tiled:** one window takes the usable area, two windows form master and stack columns, and additional windows stack vertically beside the master.
-- **Configurable layout:** independent outer and inner gaps, per-workspace master-width overrides, and a configurable default master ratio. Master ratios can be adjusted between 20% and 80%.
+- **Grid:** arrange windows in a workspace-local grid, with reflow as the set of windows changes.
+- **Mode shortcuts:** `Super + Shift + T` toggles between Windowed and Tiled; `Super + Shift + G` toggles between Windowed and Grid. From Tiled, the Grid shortcut enters Grid; from Grid, the Tiled shortcut enters Tiled. Pressing the same toggle again returns to Windowed.
+- **Configurable layout:** independent outer and inner gaps, per-workspace master-width overrides, and a configurable default master ratio for tiling. Master ratios can be adjusted between 20% and 80%.
 - **Window ordering:** navigate between tiles, swap adjacent tiles, or promote a window to the master position without losing its original floating geometry.
 - **Lifecycle handling:** recalculate placements when windows are opened, closed, minimized, restored, transferred between workspaces, or when the output changes size.
 
@@ -81,7 +84,7 @@ The standard nested clipboard is **not** a persistent clipboard manager or an au
 
 The development desktop currently uses:
 
-- **Waybar** for a panel and clock.
+- **Waybar** for a panel, clock and active-workspace layout-mode label.
 - **Swaybg** for the background.
 - **Fuzzel** as a keyboard-driven application launcher.
 
@@ -89,7 +92,10 @@ Anwilite supports `zwlr_layer_shell_v1` surfaces with the appropriate background
 
 Panels can request **exclusive zones**. For example, a 36-pixel top Waybar on a 1280 × 800 output reserves the work area `(0, 36)` with size `1280 × 764`. Maximized, snapped and tiled windows use the remaining work area. If the panel exits, its reserved space is released; when it returns, window placement is recalculated. Background layers still cover the full output.
 
-This is distinct from **true fullscreen**, which is a future feature intended to let games occupy the entire output independently of ordinary maximization.
+### True fullscreen
+
+True XDG fullscreen is implemented independently of maximize and the Windowed/Tiled/Grid layout mode. In the nested Winit backend, fullscreen occupies the entire **Anwilite virtual output**, hides Waybar and unrelated desktop content, and responds to changes in virtual-output size. Exiting fullscreen restores the window to its prior placement, including its tile or grid cell. The underlying workspace mode is not changed.
+
 
 ### Configuration
 
@@ -99,7 +105,7 @@ The main configuration is located at:
 ~/.config/anwilite/config.toml
 ```
 
-It provides settings for tiling, gaps, master ratios, borders, application launch commands and keyboard bindings. Anwilite checks for configuration changes during the session and applies supported changes after validation. Some settings or active window transitions may require a restart or a later retry.
+It provides settings for workspace layout modes, tiling, gaps, master ratios, borders, application launch commands and keyboard bindings. Anwilite checks for configuration changes during the session and applies supported changes after validation. Some settings or active window transitions may require a restart or a later retry.
 
 Keybindings are user-editable through `[[keybindings]]` entries. A fully specified keybinding list is authoritative: removing an entry removes that binding rather than silently restoring it. Reserved recovery bindings remain available for reloading configuration.
 
@@ -114,7 +120,8 @@ The following are the familiar bindings used in the development setup. **Your `c
 | `Super + 1` … `Super + 9` | Switch to workspaces 1–9 |
 | `Super + 0` | Switch to workspace 10 |
 | `Super + Shift + 1` … `Super + Shift + 0` | Move the focused window to a workspace and follow it |
-| `Super + Shift + T` | Toggle tiling for the current workspace |
+| `Super + Shift + T` | Toggle Tiled mode for the current workspace (or switch Grid → Tiled) |
+| `Super + Shift + G` | Toggle Grid mode for the current workspace (or switch Tiled → Grid) |
 | `Super + H` / `Super + J` | Decrease / increase the master ratio |
 | `Super + R` | Reset the current workspace's master ratio |
 | `Super + Shift + H` / `Super + Shift + J` | Focus previous / next tile |
@@ -200,8 +207,8 @@ Anwilite (Rust / Smithay)
 │   ├── Virtual output and XDG output information
 │   └── Layer shell (panels, overlays, backgrounds)
 ├── Window management
-│   ├── Floating, snapping, maximize/minimize
-│   ├── Workspaces, focus, tiling, transient placement and layout constraints
+│   ├── Windowed, Tiled and Grid, snapping, maximize/minimize
+│   ├── Workspaces, focus, true fullscreen, transient placement and layout constraints
 │   └── Exclusive work areas and focus indicators
 ├── Pointer axis, client cursor and client drag-icon rendering
 ├── Configuration and application launching
@@ -215,7 +222,7 @@ The main Rust modules include:
 | File | Responsibility |
 | --- | --- |
 | `src/main.rs` | Compositor state, protocol handlers, input, event loop and rendering |
-| `src/window.rs` | Managed windows, placement, focus, tiling and interactive operations |
+| `src/window.rs` | Managed windows, placement, focus, Windowed/Tiled/Grid layouts, fullscreen state and interactive operations |
 | `src/layout.rs` | Testable snapping, tile geometry, gaps and placement calculations |
 | `src/workspace.rs` | Workspace state and switching |
 | `src/config.rs` | Configuration parsing, validation and reload |
@@ -242,7 +249,7 @@ The following stages describe planned capabilities, not guaranteed release dates
 - [x] Configurable inner and outer gaps for snapping and tiling.
 - [x] Drag to unsnap without jumping.
 - [x] Automatic master-and-stack tiling for one, two, and three or more windows, with dynamic reflow.
-- [x] Per-workspace floating/tiling modes and adjustable master-width ratios.
+- [x] Independent per-workspace Windowed/Tiled/Grid modes, T/G toggles, and adjustable master-width ratios.
 - [x] Tile focus navigation, swapping, and promotion to master.
 - [x] Minimize/restore, show desktop, and configurable application-launcher shortcuts.
 - [x] Configurable keybindings, application commands, appearance, and startup tiling preferences.
@@ -269,7 +276,7 @@ The following stages describe planned capabilities, not guaranteed release dates
 - [ ] Test and harden cross-application drag-and-drop (Dolphin ↔ Kate/KWrite/Firefox and supported MIME types).
 - [ ] Primary selection, middle-click paste, persistent clipboard/history and optional data-control protocol.
 - [ ] Text-input/IME, input-method, tablet/touch and other desktop interaction protocols.
-- [ ] True fullscreen with correct stacking, focus, and restore semantics, separate from maximize.
+- [x] True fullscreen with correct stacking, input handling and restore semantics, separate from maximize (eight nested Firefox acceptance tests passed).
 - [ ] Anwilite IPC API and events for workspaces, active windows, layouts, and configuration.
 - [ ] Notifications, screencopy/screenshot paths, portals, and additional desktop protocols.
 - [ ] Output management beyond the current single virtual output.
@@ -277,14 +284,15 @@ The following stages describe planned capabilities, not guaranteed release dates
 ### Stage 3 — Desktop shell and experience
 
 - [x] Working nested-development integration with Waybar, Swaybg, and Fuzzel.
+- [x] Waybar custom status label follows the active workspace's Windowed/Tiled/Grid mode.
 - [ ] Develop an Anwilite-specific Quickshell/QML desktop shell and visual identity.
-- [ ] Top bar with workspace indicators and active-window information.
+- [ ] Interactive workspace indicators, active-window information and workspace switching in the finished top bar.
 - [ ] Keyboard-driven app launcher and power/session menu as part of the finished shell.
 - [ ] Notifications, notification history, system tray, and quick settings.
 - [ ] Volume, brightness, battery/power, network, and Bluetooth controls where supported.
 - [ ] Cohesive themes, backgrounds, animations, and Octlitch Linux integration.
 
-Waybar, Swaybg, and Fuzzel are the current working development components. Quickshell/QML remains a planned shell direction; it is not implemented yet.
+Waybar, Swaybg, and Fuzzel are the current working development components. A working mode label is not the same as a finished interactive workspace switcher or active-window display. Quickshell/QML remains a planned shell direction; it is not implemented yet.
 
 ### Stage 4 — Gaming and hardware
 
@@ -304,6 +312,7 @@ Waybar, Swaybg, and Fuzzel are the current working development components. Quick
 - [ ] Default compositor and desktop-shell configurations, with a fallback desktop/session option.
 - [ ] Documentation, troubleshooting guides, bug templates, and a compatibility matrix.
 - [ ] Security review, stress testing, and reproducible release artifacts.
+
 
 ## Design principles
 
