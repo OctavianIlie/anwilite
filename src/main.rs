@@ -219,6 +219,34 @@ impl XdgShellHandler for App {
         }
     }
 
+    fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<WlOutput>) {
+        // Anwilite has one virtual output. The optional requested output is
+        // advisory; always use the dimensions of our ANWILITE-1 output.
+        if self.windows.enter_fullscreen(&surface, self.output_size) {
+            self.needs_redraw = true;
+            if self.active_layer_keyboard.is_none()
+                && let Some(keyboard) = self.seat.get_keyboard()
+            {
+                keyboard.set_focus(
+                    self,
+                    Some(surface.wl_surface().clone()),
+                    smithay::utils::SERIAL_COUNTER.next_serial(),
+                );
+            }
+        } else {
+            // Even a denied/repeated xdg_toplevel request needs a configure.
+            surface.send_configure();
+        }
+    }
+
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        if self.windows.exit_fullscreen(&surface, self.output_size) {
+            self.needs_redraw = true;
+        } else {
+            surface.send_configure();
+        }
+    }
+
     fn minimize_request(&mut self, surface: ToplevelSurface) {
         if self.windows.minimize_window(&surface, self.output_size) {
             if let Some(keyboard) = self.seat.get_keyboard() {
@@ -691,6 +719,9 @@ impl App {
     /// Topmost popup input must outrank the owning window and its resize region.
     fn popup_hit_at(&self, x: f64, y: f64) -> Option<(WlSurface, Point<f64, Logical>)> {
         for window in &self.windows.windows {
+            if !self.windows.is_window_visible(window) {
+                continue;
+            }
             let Some(root) = self.windows.popup_root_origin(window.surface.wl_surface()) else {
                 continue;
             };
@@ -918,6 +949,13 @@ impl App {
     }
 
     fn pointer_surface_at(&self, x: f64, y: f64) -> Option<(WlSurface, Point<f64, Logical>)> {
+        // The fullscreen client must receive pointer events even where a
+        // hidden Waybar/overlay would otherwise win the hit test.
+        if self.windows.fullscreen_window().is_some() {
+            return self
+                .popup_hit_at(x, y)
+                .or_else(|| self.windows.surface_at(x, y));
+        }
         if let Some(hit) = self.foreground_layer_hit_at(x, y) {
             return Some(hit.pointer_target);
         }
@@ -1163,6 +1201,10 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
     let mut presented_area: u128 = 0;
 
     let mut border_buffers: HashMap<WlSurface, [SolidColorBuffer; 4]> = HashMap::new();
+    // An opaque backdrop is required by xdg-shell if a fullscreen client
+    // uses transparent pixels or does not cover the entire output.
+    let mut fullscreen_background = SolidColorBuffer::new((1, 1), [0.0, 0.0, 0.0, 1.0]);
+    let mut fullscreen_background_size = (1, 1);
 
     let keyboard = state
         .seat
@@ -1713,7 +1755,8 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             // The host cursor reflects the compositor's effective resize
                             // region, rather than relying on client-side frame thickness.
-                            let next_cursor = if state.foreground_layer_hit_at(x, y).is_some()
+                            let next_cursor = if (state.windows.fullscreen_window().is_none()
+                                && state.foreground_layer_hit_at(x, y).is_some())
                                 || state.popup_hit_at(x, y).is_some()
                             {
                                 CursorIcon::Default
@@ -1806,7 +1849,11 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                             continue;
                         }
 
-                        let foreground_hit = state.foreground_layer_hit_at(x, y);
+                        let foreground_hit = if state.windows.fullscreen_window().is_none() {
+                            state.foreground_layer_hit_at(x, y)
+                        } else {
+                            None
+                        };
                         let popup_hit = if foreground_hit.is_none() {
                             state.popup_hit_at(x, y)
                         } else {
@@ -1828,7 +1875,8 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             false
                         };
-                        let background_hit = if foreground_hit.is_none()
+                        let background_hit = if state.windows.fullscreen_window().is_none()
+                            && foreground_hit.is_none()
                             && popup_hit.is_none()
                             && !ordinary_window_hit
                         {
@@ -2252,21 +2300,28 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
 
-                // Foreground layer-shell surfaces are in front of normal windows.
-                // The render-elements list uses front-to-back stacking order.
-                {
-                    let layer_map = layer_map_for_output(&state.output);
-                    for kind in [Layer::Overlay, Layer::Top] {
-                        for layer in layer_map.layers_on(kind).rev() {
-                            let Some(geometry) = layer_map.layer_geometry(layer) else {
-                                continue;
-                            };
-
+                if let Some(fullscreen) = state.windows.fullscreen_window() {
+                    // Popup surfaces are on top of fullscreen and its dialogs.
+                    for window in state
+                        .windows
+                        .windows
+                        .iter()
+                        .filter(|window| state.windows.is_window_visible(window))
+                    {
+                        let Some(root) =
+                            state.windows.popup_root_origin(window.surface.wl_surface())
+                        else {
+                            continue;
+                        };
+                        for (popup, relative) in
+                            PopupManager::popups_for_surface(window.surface.wl_surface())
+                        {
+                            let origin = popup_surface_origin(root, relative, popup.geometry());
                             elements.extend(
                                 render_elements_from_surface_tree(
                                     renderer,
-                                    layer.wl_surface(),
-                                    (geometry.loc.x, geometry.loc.y),
+                                    popup.wl_surface(),
+                                    origin,
                                     1.0,
                                     1.0,
                                     Kind::Unspecified,
@@ -2276,25 +2331,17 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                             );
                         }
                     }
-                }
 
-                // Popup menus are above every ordinary toplevel, even when
-                // they extend beyond the parent's rectangle (no tile cropping).
-                // Foreground layers such as Waybar remain above the popups.
-                for window in &state.windows.windows {
-                    let Some(root) = state.windows.popup_root_origin(window.surface.wl_surface())
-                    else {
-                        continue;
-                    };
-                    for (popup, relative) in
-                        PopupManager::popups_for_surface(window.surface.wl_surface())
-                    {
-                        let origin = popup_surface_origin(root, relative, popup.geometry());
+                    // Transient toplevel dialogs remain over fullscreen.
+                    for window in state.windows.windows.iter().filter(|window| {
+                        state.windows.is_window_visible(window)
+                            && window.surface != fullscreen.surface
+                    }) {
                         elements.extend(
                             render_elements_from_surface_tree(
                                 renderer,
-                                popup.wl_surface(),
-                                origin,
+                                window.surface.wl_surface(),
+                                (window.x, window.y),
                                 1.0,
                                 1.0,
                                 Kind::Unspecified,
@@ -2303,93 +2350,80 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                             .map(AnwiliteRenderElement::Surface),
                         );
                     }
-                }
-
-                // Window order is front-to-back.
-                for window in state
-                    .windows
-                    .windows
-                    .iter()
-                    .filter(|window| state.windows.is_window_visible(window))
-                {
-                    let is_focused = focused.as_ref() == Some(window.surface.wl_surface());
-
-                    // Use the same trusted geometry path as Lesson 29C.
-                    let rect = if is_focused {
-                        focused_rect
-                    } else {
-                        window.focus_rect()
-                    };
-
-                    // Draw this window's border, if enabled.
-                    if let (Some(style), Some(rect)) = (
-                        border_style(is_focused, config.active_border, config.inactive_border),
-                        rect,
-                    ) && let Some(edges) =
-                        focus_border_outside_tile(rect, style.thickness, style.clearance)
-                    {
-                        let buffers = border_buffers
-                            .entry(window.surface.wl_surface().clone())
-                            .or_insert_with(|| {
-                                std::array::from_fn(|_| SolidColorBuffer::new((1, 1), style.rgba))
-                            });
-
-                        for (buffer, edge) in buffers.iter_mut().zip(edges) {
-                            buffer.update((edge.width, edge.height), style.rgba);
-
-                            let border = SolidColorRenderElement::from_buffer(
-                                buffer,
-                                (edge.x, edge.y),
-                                1.0,
-                                1.0,
-                                Kind::Unspecified,
-                            );
-
-                            elements.push(AnwiliteRenderElement::FocusBorder(border));
-                        }
-                    }
-
-                    // Preserve the existing tiled/snapped client clipping.
-                    let clip = window.placed_rect_for_render().map(|tile| {
-                        Rectangle::<i32, Physical>::new(
-                            (tile.x, tile.y).into(),
-                            (tile.width, tile.height).into(),
-                        )
-                    });
-
-                    // Draw the application's surfaces after its border.
                     elements.extend(
                         render_elements_from_surface_tree(
                             renderer,
-                            window.surface.wl_surface(),
-                            (window.x, window.y),
+                            fullscreen.surface.wl_surface(),
+                            (fullscreen.x, fullscreen.y),
                             1.0,
                             1.0,
                             Kind::Unspecified,
                         )
                         .into_iter()
-                        .filter_map(move |element| match clip {
-                            Some(rect) => CropRenderElement::from_element(element, 1.0, rect)
-                                .map(AnwiliteRenderElement::ClippedSurface),
-                            None => Some(AnwiliteRenderElement::Surface(element)),
-                        }),
+                        .map(AnwiliteRenderElement::Surface),
                     );
-                }
 
-                // Bottom/background surfaces are behind ordinary windows.
-                {
-                    let layer_map = layer_map_for_output(&state.output);
-                    for kind in [Layer::Bottom, Layer::Background] {
-                        for layer in layer_map.layers_on(kind).rev() {
-                            let Some(geometry) = layer_map.layer_geometry(layer) else {
-                                continue;
-                            };
+                    // Prevent Waybar/background surfaces from showing through
+                    // transparent or letterboxed fullscreen client content.
+                    let dimensions = (size.w, size.h);
+                    if fullscreen_background_size != dimensions {
+                        fullscreen_background.update(dimensions, [0.0, 0.0, 0.0, 1.0]);
+                        fullscreen_background_size = dimensions;
+                    }
+                    elements.push(AnwiliteRenderElement::FocusBorder(
+                        SolidColorRenderElement::from_buffer(
+                            &fullscreen_background,
+                            (0, 0),
+                            1.0,
+                            1.0,
+                            Kind::Unspecified,
+                        ),
+                    ));
+                } else {
+                    // Foreground layer-shell surfaces are in front of normal windows.
+                    // The render-elements list uses front-to-back stacking order.
+                    {
+                        let layer_map = layer_map_for_output(&state.output);
+                        for kind in [Layer::Overlay, Layer::Top] {
+                            for layer in layer_map.layers_on(kind).rev() {
+                                let Some(geometry) = layer_map.layer_geometry(layer) else {
+                                    continue;
+                                };
 
+                                elements.extend(
+                                    render_elements_from_surface_tree(
+                                        renderer,
+                                        layer.wl_surface(),
+                                        (geometry.loc.x, geometry.loc.y),
+                                        1.0,
+                                        1.0,
+                                        Kind::Unspecified,
+                                    )
+                                    .into_iter()
+                                    .map(AnwiliteRenderElement::Surface),
+                                );
+                            }
+                        }
+                    }
+
+                    // Popup menus are above every ordinary toplevel, even when
+                    // they extend beyond the parent's rectangle (no tile cropping).
+                    // Foreground layers such as Waybar remain above the popups.
+                    for window in &state.windows.windows {
+                        let Some(root) =
+                            state.windows.popup_root_origin(window.surface.wl_surface())
+                        else {
+                            continue;
+                        };
+                        for (popup, relative) in
+                            PopupManager::popups_for_surface(window.surface.wl_surface())
+                        {
+                            let origin = popup_surface_origin(root, relative, popup.geometry());
                             elements.extend(
                                 render_elements_from_surface_tree(
                                     renderer,
-                                    layer.wl_surface(),
-                                    (geometry.loc.x, geometry.loc.y),
+                                    popup.wl_surface(),
+                                    origin,
                                     1.0,
                                     1.0,
                                     Kind::Unspecified,
@@ -2399,7 +2433,105 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                             );
                         }
                     }
-                }
+
+                    // Window order is front-to-back.
+                    for window in state
+                        .windows
+                        .windows
+                        .iter()
+                        .filter(|window| state.windows.is_window_visible(window))
+                    {
+                        let is_focused = focused.as_ref() == Some(window.surface.wl_surface());
+
+                        // Use the same trusted geometry path as Lesson 29C.
+                        let rect = if is_focused {
+                            focused_rect
+                        } else {
+                            window.focus_rect()
+                        };
+
+                        // Draw this window's border, if enabled.
+                        if let (Some(style), Some(rect)) = (
+                            border_style(is_focused, config.active_border, config.inactive_border),
+                            rect,
+                        ) && let Some(edges) =
+                            focus_border_outside_tile(rect, style.thickness, style.clearance)
+                        {
+                            let buffers = border_buffers
+                                .entry(window.surface.wl_surface().clone())
+                                .or_insert_with(|| {
+                                    std::array::from_fn(|_| {
+                                        SolidColorBuffer::new((1, 1), style.rgba)
+                                    })
+                                });
+
+                            for (buffer, edge) in buffers.iter_mut().zip(edges) {
+                                buffer.update((edge.width, edge.height), style.rgba);
+
+                                let border = SolidColorRenderElement::from_buffer(
+                                    buffer,
+                                    (edge.x, edge.y),
+                                    1.0,
+                                    1.0,
+                                    Kind::Unspecified,
+                                );
+
+                                elements.push(AnwiliteRenderElement::FocusBorder(border));
+                            }
+                        }
+
+                        // Preserve the existing tiled/snapped client clipping.
+                        let clip = window.placed_rect_for_render().map(|tile| {
+                            Rectangle::<i32, Physical>::new(
+                                (tile.x, tile.y).into(),
+                                (tile.width, tile.height).into(),
+                            )
+                        });
+
+                        // Draw the application's surfaces after its border.
+                        elements.extend(
+                            render_elements_from_surface_tree(
+                                renderer,
+                                window.surface.wl_surface(),
+                                (window.x, window.y),
+                                1.0,
+                                1.0,
+                                Kind::Unspecified,
+                            )
+                            .into_iter()
+                            .filter_map(move |element| match clip {
+                                Some(rect) => CropRenderElement::from_element(element, 1.0, rect)
+                                    .map(AnwiliteRenderElement::ClippedSurface),
+                                None => Some(AnwiliteRenderElement::Surface(element)),
+                            }),
+                        );
+                    }
+
+                    // Bottom/background surfaces are behind ordinary windows.
+                    {
+                        let layer_map = layer_map_for_output(&state.output);
+                        for kind in [Layer::Bottom, Layer::Background] {
+                            for layer in layer_map.layers_on(kind).rev() {
+                                let Some(geometry) = layer_map.layer_geometry(layer) else {
+                                    continue;
+                                };
+
+                                elements.extend(
+                                    render_elements_from_surface_tree(
+                                        renderer,
+                                        layer.wl_surface(),
+                                        (geometry.loc.x, geometry.loc.y),
+                                        1.0,
+                                        1.0,
+                                        Kind::Unspecified,
+                                    )
+                                    .into_iter()
+                                    .map(AnwiliteRenderElement::Surface),
+                                );
+                            }
+                        }
+                    }
+                } // End of normal desktop rendering; fullscreen hides Waybar and other windows.
 
                 let result = damage_tracker.render_output(
                     renderer,

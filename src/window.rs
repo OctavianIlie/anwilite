@@ -137,6 +137,13 @@ struct NormalGeometry {
     height: i32,
 }
 
+// Store the original geometry separately from the live fullscreen position.
+// Tiled/snapped/maximized state remains in ManagedWindow and is not destroyed.
+#[derive(Clone, Copy)]
+struct FullscreenRestore {
+    normal: NormalGeometry,
+}
+
 #[derive(Clone, Copy)]
 struct PendingUnsnap {
     target_size: (i32, i32),
@@ -151,6 +158,7 @@ pub struct ManagedWindow {
     pub x: i32,
     pub y: i32,
     maximized: bool,
+    fullscreen_restore: Option<FullscreenRestore>,
     snapped: Option<(SnapSide, SnapRect)>,
     saved_normal: Option<NormalGeometry>,
     restoring: Option<(NormalGeometry, Instant)>,
@@ -172,7 +180,7 @@ impl ManagedWindow {
     // A placement clip is used for both tiled and snapped windows.
     // Floating windows have no placement clip.
     pub fn placed_rect_for_render(&self) -> Option<SnapRect> {
-        if self.maximized {
+        if self.maximized || self.fullscreen_restore.is_some() {
             return None;
         }
 
@@ -214,7 +222,7 @@ impl ManagedWindow {
 
     pub fn focus_rect(&self) -> Option<SnapRect> {
         // Keep the existing no-border policy for maximized windows.
-        if self.maximized || self.minimized {
+        if self.maximized || self.minimized || self.fullscreen_restore.is_some() {
             return None;
         }
 
@@ -392,6 +400,42 @@ fn origin_for_maximized_geometry(
         work_origin.0 - geometry.loc.x,
         work_origin.1 - geometry.loc.y,
     )
+}
+
+// Fullscreen XDG geometry is output-local, never relative to Waybar's zone.
+// A client may choose a smaller buffer (for example a video aspect ratio),
+// in which case the client content is centered against a black backdrop.
+fn fullscreen_surface_origin(
+    output_size: (i32, i32),
+    geometry: Rectangle<i32, Logical>,
+) -> (i32, i32) {
+    (
+        (output_size.0 - geometry.size.w).max(0) / 2 - geometry.loc.x,
+        (output_size.1 - geometry.size.h).max(0) / 2 - geometry.loc.y,
+    )
+}
+
+fn fullscreen_restore_rect(
+    normal: NormalGeometry,
+    maximized: bool,
+    tile: Option<SnapRect>,
+    snap: Option<(SnapSide, SnapRect)>,
+    work_area: SnapRect,
+) -> SnapRect {
+    if maximized {
+        work_area
+    } else if let Some(rect) = tile {
+        rect
+    } else if let Some((_, rect)) = snap {
+        rect
+    } else {
+        SnapRect {
+            x: normal.left,
+            y: normal.top,
+            width: normal.width,
+            height: normal.height,
+        }
+    }
 }
 
 fn window_geometry(window: &ManagedWindow) -> Option<Rectangle<i32, Logical>> {
@@ -921,6 +965,7 @@ impl WindowManager {
                 y: 80 + offset,
                 workspace,
                 maximized: false,
+                fullscreen_restore: None,
                 saved_normal: None,
                 restoring: None,
                 snapped: None,
@@ -1122,6 +1167,7 @@ impl WindowManager {
         if self.is_dragging()
             || self.is_resizing()
             || self.settling.is_some()
+            || self.fullscreen_window().is_some()
             || self.current_desktop_mode() == desired
         {
             return false;
@@ -1195,7 +1241,11 @@ impl WindowManager {
     /// Switch only the active workspace's preferred tiling arrangement.
     /// Floating workspaces remember the choice until tiling is enabled.
     pub fn toggle_grid_layout(&mut self, output_size: (i32, i32)) -> bool {
-        if self.is_dragging() || self.is_resizing() || self.settling.is_some() {
+        if self.is_dragging()
+            || self.is_resizing()
+            || self.settling.is_some()
+            || self.fullscreen_window().is_some()
+        {
             return false;
         }
         let workspace = self.current_workspace();
@@ -1375,6 +1425,13 @@ impl WindowManager {
                 window.maximized = false;
             }
 
+            if let Some(fullscreen) = window.fullscreen_restore.as_mut() {
+                if let Some(normal) = saved {
+                    fullscreen.normal = normal;
+                }
+                continue;
+            }
+
             let Some(normal) = saved else {
                 if was_maximized_tile {
                     window.surface.with_pending_state(|state| {
@@ -1488,7 +1545,10 @@ impl WindowManager {
                 .filter_map(|&index| {
                     let window = &self.windows[index];
 
-                    if window.tiled.is_some() && window.maximized {
+                    if window.tiled.is_some()
+                        && window.maximized
+                        && window.fullscreen_restore.is_none()
+                    {
                         Some(window.surface.clone())
                     } else {
                         None
@@ -1533,7 +1593,10 @@ impl WindowManager {
                 .filter_map(|&index| {
                     let window = &self.windows[index];
 
-                    if window.tiled.is_some() && window.maximized {
+                    if window.tiled.is_some()
+                        && window.maximized
+                        && window.fullscreen_restore.is_none()
+                    {
                         Some(window.surface.clone())
                     } else {
                         None
@@ -1615,6 +1678,12 @@ impl WindowManager {
 
             window.tiled = Some(target);
 
+            // Keep this window's logical tile assigned while the fullscreen
+            // viewport temporarily overrides its surface geometry.
+            if window.fullscreen_restore.is_some() {
+                continue;
+            }
+
             // A tile that was *already* maximized stays zoomed in.
             if window.maximized {
                 continue;
@@ -1639,7 +1708,11 @@ impl WindowManager {
     }
 
     pub fn toggle_tiling(&mut self, output_size: (i32, i32)) -> bool {
-        if self.dragging.is_some() || self.resizing.is_some() || self.settling.is_some() {
+        if self.dragging.is_some()
+            || self.resizing.is_some()
+            || self.settling.is_some()
+            || self.fullscreen_window().is_some()
+        {
             return false;
         }
 
@@ -1719,7 +1792,11 @@ impl WindowManager {
         number: usize,
         output_size: (i32, i32),
     ) -> bool {
-        if self.is_dragging() || self.is_resizing() || self.settling.is_some() {
+        if self.is_dragging()
+            || self.is_resizing()
+            || self.settling.is_some()
+            || self.fullscreen_window().is_some()
+        {
             return false;
         }
 
@@ -2092,7 +2169,21 @@ impl WindowManager {
         }
     }
 
+    pub fn fullscreen_window(&self) -> Option<&ManagedWindow> {
+        let current = self.current_workspace();
+        self.windows.iter().find(|window| {
+            window.workspace == current
+                && window.surface.alive()
+                && !window.minimized
+                && window.fullscreen_restore.is_some()
+        })
+    }
+
     pub fn focused_surface(&self) -> Option<WlSurface> {
+        if let Some(fullscreen) = self.fullscreen_window() {
+            return Some(fullscreen.surface.wl_surface().clone());
+        }
+
         let current = self.current_workspace();
 
         if let Some(saved) = &self.last_focused[current - 1] {
@@ -2120,6 +2211,13 @@ impl WindowManager {
 
         if window.workspace != current || !window.surface.alive() || window.minimized {
             return false;
+        }
+
+        // Fullscreen occludes every normal toplevel. Its transient dialogs
+        // remain visible; the renderer must make the same decision.
+        if let Some(fullscreen) = self.fullscreen_window() {
+            return window.surface == fullscreen.surface
+                || window.parent.as_ref() == Some(fullscreen.surface.wl_surface());
         }
 
         // Hide children while their parent is minimized or no longer alive.
@@ -2249,7 +2347,7 @@ impl WindowManager {
         px: f64,
         py: f64,
     ) -> Option<(ToplevelSurface, xdg_toplevel::ResizeEdge)> {
-        if self.is_dragging() || self.is_resizing() {
+        if self.is_dragging() || self.is_resizing() || self.fullscreen_window().is_some() {
             return None;
         }
 
@@ -2375,11 +2473,124 @@ impl WindowManager {
         true
     }
 
+    /// Temporarily display an existing toplevel across the full output.
+    /// The workspace's Floating/MasterStack/Grid choice remains untouched.
+    pub fn enter_fullscreen(&mut self, surface: &ToplevelSurface, output_size: (i32, i32)) -> bool {
+        if output_size.0 <= 0
+            || output_size.1 <= 0
+            || self.is_dragging()
+            || self.is_resizing()
+            || self.settling.is_some()
+            || self.fullscreen_window().is_some()
+        {
+            return false;
+        }
+
+        let workspace = self.current_workspace();
+        let Some(index) = self.windows.iter().position(|window| {
+            window.surface == *surface
+                && window.surface.alive()
+                && !window.minimized
+                && window.workspace == workspace
+                && window.parent.is_none()
+                && window.fullscreen_restore.is_none()
+                && window.pending_unsnap.is_none()
+        }) else {
+            return false;
+        };
+        let window = &mut self.windows[index];
+        let Some(geometry) = window_geometry(window) else {
+            return false;
+        };
+        let normal = window.restoring.map_or(
+            NormalGeometry {
+                left: window.x + geometry.loc.x,
+                top: window.y + geometry.loc.y,
+                width: geometry.size.w,
+                height: geometry.size.h,
+            },
+            |(normal, _)| normal,
+        );
+        window.fullscreen_restore = Some(FullscreenRestore { normal });
+        window.restoring = None;
+        (window.x, window.y) = fullscreen_surface_origin(output_size, geometry);
+
+        set_tiled_edges(surface, false);
+        surface.with_pending_state(|state| {
+            state.states.unset(xdg_toplevel::State::Maximized);
+            state.states.set(xdg_toplevel::State::Fullscreen);
+            state.size = Some(output_size.into());
+        });
+        surface.send_configure();
+        self.show_desktop[workspace - 1] = false;
+        println!(
+            "Anwilite fullscreen: entered {}x{}",
+            output_size.0, output_size.1
+        );
+        true
+    }
+
+    pub fn exit_fullscreen(&mut self, surface: &ToplevelSurface, output_size: (i32, i32)) -> bool {
+        let area = self.current_work_area(output_size);
+        let gaps = self.tiling_settings.gaps;
+        let Some(window) = self
+            .windows
+            .iter_mut()
+            .find(|window| window.surface == *surface)
+        else {
+            return false;
+        };
+        let Some(restore) = window.fullscreen_restore.take() else {
+            return false;
+        };
+        // Refresh snapped placement for the current output size and panel zone.
+        if let Some((side, _)) = window.snapped
+            && let Some(rect) = snap_rect_in_area(area, side, gaps)
+        {
+            window.snapped = Some((side, rect));
+        }
+        let target = fullscreen_restore_rect(
+            restore.normal,
+            window.maximized,
+            window.tiled,
+            window.snapped,
+            area,
+        );
+        let geometry = window_geometry(window);
+        (window.x, window.y) = geometry.map_or((target.x, target.y), |geometry| {
+            (target.x - geometry.loc.x, target.y - geometry.loc.y)
+        });
+        // Only floating windows require a multi-commit size/position restore.
+        if !window.maximized && window.tiled.is_none() && window.snapped.is_none() {
+            window.restoring = Some((restore.normal, Instant::now()));
+        }
+        set_tiled_edges(surface, !window.maximized && window.tiled.is_some());
+        surface.with_pending_state(|state| {
+            state.states.unset(xdg_toplevel::State::Fullscreen);
+            state.fullscreen_output = None;
+            if window.maximized {
+                state.states.set(xdg_toplevel::State::Maximized);
+            } else {
+                state.states.unset(xdg_toplevel::State::Maximized);
+            }
+            state.size = Some((target.width, target.height).into());
+        });
+        surface.send_configure();
+        println!("Anwilite fullscreen: restored previous placement");
+        true
+    }
+
     pub fn maximize(&mut self, surface: &ToplevelSurface, output_size: (i32, i32)) -> bool {
         // Don't maximize during an interactive drag or resize.
         let area = self.current_work_area(output_size);
 
-        if self.dragging.is_some() || self.resizing.is_some() {
+        if self.dragging.is_some()
+            || self.resizing.is_some()
+            || self
+                .windows
+                .iter()
+                .any(|window| window.surface == *surface && window.fullscreen_restore.is_some())
+        {
             return false;
         }
 
@@ -2512,6 +2723,9 @@ impl WindowManager {
         let Some(window) = self.windows.iter_mut().find(|w| &w.surface == surface) else {
             return false;
         };
+        if window.fullscreen_restore.is_some() {
+            return false;
+        }
         if window.maximized
             && let Some(target) = window.tiled
         {
@@ -2569,6 +2783,12 @@ impl WindowManager {
         };
 
         if self.windows[index].minimized || self.windows[index].pending_unsnap.is_some() {
+            return false;
+        }
+        // A minimized surface must not retain a stale Fullscreen configure.
+        if self.windows[index].fullscreen_restore.is_some()
+            && !self.exit_fullscreen(surface, output_size)
+        {
             return false;
         }
 
@@ -2679,7 +2899,15 @@ impl WindowManager {
     pub fn resize_placed_windows(&mut self, output_size: (i32, i32)) {
         let area = self.current_work_area(output_size);
         for window in &mut self.windows {
-            if window.maximized {
+            if window.fullscreen_restore.is_some() {
+                if let Some(geometry) = window_geometry(window) {
+                    (window.x, window.y) = fullscreen_surface_origin(output_size, geometry);
+                }
+                window.surface.with_pending_state(|state| {
+                    state.size = Some(output_size.into());
+                });
+                window.surface.send_pending_configure();
+            } else if window.maximized {
                 if let Some(geometry) = window_geometry(window) {
                     (window.x, window.y) =
                         origin_for_maximized_geometry((area.x, area.y), geometry);
@@ -2752,7 +2980,7 @@ impl WindowManager {
                 }
 
                 window.tiled = Some(target);
-                if window.maximized {
+                if window.maximized || window.fullscreen_restore.is_some() {
                     continue;
                 }
 
@@ -2808,6 +3036,11 @@ impl WindowManager {
         let Some(geometry) = window_geometry(window) else {
             return;
         };
+
+        if window.fullscreen_restore.is_some() {
+            (window.x, window.y) = fullscreen_surface_origin(output_size, geometry);
+            return;
+        }
 
         if let Some(parent) = parent_rect
             && !window.transient_placed
@@ -2939,7 +3172,11 @@ impl WindowManager {
             return false;
         };
 
-        if window.maximized || window.pending_unsnap.is_some() || window.tiled.is_some() {
+        if window.maximized
+            || window.fullscreen_restore.is_some()
+            || window.pending_unsnap.is_some()
+            || window.tiled.is_some()
+        {
             return false;
         }
 
@@ -3072,6 +3309,7 @@ impl WindowManager {
             return false;
         };
         if window.maximized
+            || window.fullscreen_restore.is_some()
             || window.snapped.is_some()
             || window.pending_unsnap.is_some()
             || window.tiled.is_some()
@@ -4150,5 +4388,68 @@ mod direct_desktop_modes_tests {
         assert_eq!(wm.current_desktop_mode(), DesktopMode::Grid);
         assert!(wm.set_desktop_mode(DesktopMode::Tiled, OUTPUT));
         assert_eq!(wm.current_desktop_mode(), DesktopMode::Tiled);
+    }
+}
+
+#[cfg(test)]
+mod fullscreen_geometry_tests {
+    use super::*;
+
+    #[test]
+    fn fullscreen_ignores_waybar_and_centers_smaller_clients() {
+        let full = Rectangle::<i32, Logical>::new((0, 0).into(), (1280, 720).into());
+        assert_eq!(fullscreen_surface_origin((1280, 720), full), (0, 0));
+        let smaller = Rectangle::<i32, Logical>::new((8, 12).into(), (800, 500).into());
+        assert_eq!(fullscreen_surface_origin((1280, 720), smaller), (232, 98));
+    }
+
+    #[test]
+    fn fullscreen_restore_chooses_original_placement_type() {
+        let normal = NormalGeometry {
+            left: 90,
+            top: 100,
+            width: 700,
+            height: 450,
+        };
+        let work = SnapRect {
+            x: 0,
+            y: 32,
+            width: 1280,
+            height: 688,
+        };
+        let tile = SnapRect {
+            x: 12,
+            y: 44,
+            width: 615,
+            height: 660,
+        };
+        let snap = SnapRect {
+            x: 640,
+            y: 32,
+            width: 640,
+            height: 688,
+        };
+        let floating = SnapRect {
+            x: 90,
+            y: 100,
+            width: 700,
+            height: 450,
+        };
+        assert_eq!(
+            fullscreen_restore_rect(normal, false, None, None, work),
+            floating
+        );
+        assert_eq!(
+            fullscreen_restore_rect(normal, false, Some(tile), None, work),
+            tile
+        );
+        assert_eq!(
+            fullscreen_restore_rect(normal, false, None, Some((SnapSide::Right, snap)), work),
+            snap
+        );
+        assert_eq!(
+            fullscreen_restore_rect(normal, true, Some(tile), None, work),
+            work
+        );
     }
 }
