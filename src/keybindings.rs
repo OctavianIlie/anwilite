@@ -14,6 +14,11 @@ pub enum WorkspaceCommand {
     Restore,
     ToggleTiling,
     ToggleGrid,
+    ToggleTiledMode,
+    ToggleGridMode,
+    SetFloating,
+    SetTiled,
+    SetGrid,
     AdjustMasterRatio(i8),
     ResetMasterRatio,
     FocusTile(TileFocusDirection),
@@ -180,6 +185,11 @@ fn parse_action(spec: &BindingSpec) -> Result<WorkspaceCommand, String> {
         ("launch_file_manager", None) => Ok(Command::LaunchFileManager),
         ("toggle_tiling", None) => Ok(Command::ToggleTiling),
         ("toggle_grid", None) => Ok(Command::ToggleGrid),
+        ("toggle_tiled_mode", None) => Ok(Command::ToggleTiledMode),
+        ("toggle_grid_mode", None) => Ok(Command::ToggleGridMode),
+        ("set_floating", None) => Ok(Command::SetFloating),
+        ("set_tiled", None) => Ok(Command::SetTiled),
+        ("set_grid", None) => Ok(Command::SetGrid),
         ("minimize", None) => Ok(Command::Minimize),
         ("restore_minimized", None) => Ok(Command::RestoreMinimized),
         ("maximize", None) => Ok(Command::Maximize),
@@ -237,8 +247,9 @@ impl Default for KeyBindings {
         let defaults = [
             ("M", Command::Minimize),
             ("Shift+M", Command::RestoreMinimized),
-            ("Shift+T", Command::ToggleTiling),
-            ("Shift+G", Command::ToggleGrid),
+            ("Shift+F", Command::SetFloating),
+            ("Shift+T", Command::ToggleTiledMode),
+            ("Shift+G", Command::ToggleGridMode),
             ("Shift+H", Command::FocusTile(TileFocusDirection::Previous)),
             ("Shift+J", Command::FocusTile(TileFocusDirection::Next)),
             (
@@ -689,11 +700,11 @@ mod tests {
 mod grid_keybinding_tests {
     use super::*;
     #[test]
-    fn grid_toggle_has_nested_and_default_shortcuts() {
+    fn grid_direct_shortcuts_and_legacy_toggle_both_work() {
         for name in ["Super+Shift+G", "Ctrl+Alt+Shift+G"] {
             assert_eq!(
                 KeyBindings::default().action_for(Shortcut::parse(name).unwrap()),
-                Some(WorkspaceCommand::ToggleGrid)
+                Some(WorkspaceCommand::ToggleGridMode)
             );
             let explicit = KeyBindings::from_explicit(&[BindingSpec {
                 key: name.into(),
@@ -714,5 +725,67 @@ mod grid_keybinding_tests {
             }])
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod desktop_mode_keybinding_tests {
+    use super::*;
+
+    #[test]
+    fn builtins_toggle_tiling_and_grid_against_windowed() {
+        for (key, expected) in [
+            ("Shift+F", WorkspaceCommand::SetFloating),
+            ("Shift+T", WorkspaceCommand::ToggleTiledMode),
+            ("Shift+G", WorkspaceCommand::ToggleGridMode),
+        ] {
+            for prefix in ["Super+", "Ctrl+Alt+"] {
+                let shortcut = Shortcut::parse(&format!("{prefix}{key}")).unwrap();
+                assert_eq!(KeyBindings::default().action_for(shortcut), Some(expected));
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_toggle_actions_are_supported_and_reject_workspace_numbers() {
+        for (action, expected) in [
+            ("toggle_tiled_mode", WorkspaceCommand::ToggleTiledMode),
+            ("toggle_grid_mode", WorkspaceCommand::ToggleGridMode),
+        ] {
+            let binding = BindingSpec {
+                key: "Super+Y".into(),
+                action: action.into(),
+                workspace: None,
+            };
+            let bindings = KeyBindings::from_explicit(&[binding]).unwrap();
+            assert_eq!(
+                bindings.action_for(Shortcut::parse("Super+Y").unwrap()),
+                Some(expected)
+            );
+            let invalid = BindingSpec {
+                key: "Super+Y".into(),
+                action: action.into(),
+                workspace: Some(1),
+            };
+            assert!(KeyBindings::from_explicit(&[invalid]).is_err());
+        }
+    }
+
+    #[test]
+    fn explicit_mode_actions_are_supported_and_reject_workspace_numbers() {
+        for action in ["set_floating", "set_tiled", "set_grid"] {
+            let binding = BindingSpec {
+                key: "Super+Y".into(),
+                action: action.into(),
+                workspace: None,
+            };
+            assert!(KeyBindings::from_explicit(&[binding]).is_ok());
+            let invalid = BindingSpec {
+                key: "Super+Y".into(),
+                action: action.into(),
+                workspace: Some(1),
+            };
+            assert!(KeyBindings::from_explicit(&[invalid]).is_err());
+        }
     }
 }

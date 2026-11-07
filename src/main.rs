@@ -2,6 +2,7 @@ mod appearance;
 mod config;
 mod keybindings;
 mod layout;
+mod mode_status;
 mod window;
 mod workspace;
 
@@ -92,7 +93,7 @@ use wayland_server::{
         wl_surface::{self, WlSurface},
     },
 };
-use window::WindowManager;
+use window::{DesktopMode, WindowManager};
 
 fn resize_cursor_icon(edge: xdg_toplevel::ResizeEdge) -> CursorIcon {
     use xdg_toplevel::ResizeEdge as Edge;
@@ -1073,6 +1074,12 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     state.windows.configure_startup(config.tiling);
+    // Waybar reads a per-session JSON status file; no host-Waybar signals.
+    let mut mode_status = mode_status::ModeStatus::new();
+    mode_status.update(
+        state.windows.current_workspace(),
+        state.windows.current_desktop_mode(),
+    );
     let mut event_loop = EventLoop::<Vec<UnixStream>>::try_new()?;
     const CONFIG_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -1418,6 +1425,21 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                     WorkspaceCommand::ToggleGrid => {
                                         state.windows.toggle_grid_layout(state.output_size)
                                     }
+                                    WorkspaceCommand::ToggleTiledMode => state
+                                        .windows
+                                        .toggle_desktop_mode(DesktopMode::Tiled, state.output_size),
+                                    WorkspaceCommand::ToggleGridMode => state
+                                        .windows
+                                        .toggle_desktop_mode(DesktopMode::Grid, state.output_size),
+                                    WorkspaceCommand::SetFloating => state
+                                        .windows
+                                        .set_desktop_mode(DesktopMode::Floating, state.output_size),
+                                    WorkspaceCommand::SetTiled => state
+                                        .windows
+                                        .set_desktop_mode(DesktopMode::Tiled, state.output_size),
+                                    WorkspaceCommand::SetGrid => state
+                                        .windows
+                                        .set_desktop_mode(DesktopMode::Grid, state.output_size),
 
                                     WorkspaceCommand::AdjustMasterRatio(delta) => {
                                         state.windows.adjust_master_ratio(delta, state.output_size)
@@ -1605,6 +1627,11 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                             | WorkspaceCommand::MoveAndFollow(_)
                                             | WorkspaceCommand::ToggleTiling
                                             | WorkspaceCommand::ToggleGrid
+                                            | WorkspaceCommand::ToggleTiledMode
+                                            | WorkspaceCommand::ToggleGridMode
+                                            | WorkspaceCommand::SetFloating
+                                            | WorkspaceCommand::SetTiled
+                                            | WorkspaceCommand::SetGrid
                                             | WorkspaceCommand::Minimize
                                             | WorkspaceCommand::ToggleShowDesktop
                                             | WorkspaceCommand::CycleWindow(_)
@@ -2131,6 +2158,13 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // Also detects workspace switches, config reloads, or fallback to
+        // floating caused by an incompatible layout during client commits.
+        // Only writes the JSON file when the displayed state changes.
+        mode_status.update(
+            state.windows.current_workspace(),
+            state.windows.current_desktop_mode(),
+        );
         display.flush_clients()?;
 
         if state.needs_redraw {

@@ -456,6 +456,15 @@ pub enum LayoutMode {
     Tiled,
 }
 
+/// Public three-way presentation of the active workspace's layout.
+/// The existing Floating/Tiled + MasterStack/Grid engine remains unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DesktopMode {
+    Floating,
+    Tiled,
+    Grid,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TransferAction {
     KeepPlacement,
@@ -1093,6 +1102,75 @@ impl WindowManager {
 
     pub fn current_layout_mode(&self) -> LayoutMode {
         self.layout_modes[self.current_workspace() - 1]
+    }
+
+    /// Report the real (rather than merely preferred) mode on this workspace.
+    pub fn current_desktop_mode(&self) -> DesktopMode {
+        if self.current_layout_mode() == LayoutMode::Floating {
+            DesktopMode::Floating
+        } else {
+            match self.tile_pattern_for_workspace(self.current_workspace()) {
+                TilePattern::MasterStack => DesktopMode::Tiled,
+                TilePattern::Grid => DesktopMode::Grid,
+            }
+        }
+    }
+
+    /// Select a layout directly, from any of the other two layouts.
+    /// Failed transitions leave both the active mode and grid preference intact.
+    pub fn set_desktop_mode(&mut self, desired: DesktopMode, output_size: (i32, i32)) -> bool {
+        if self.is_dragging()
+            || self.is_resizing()
+            || self.settling.is_some()
+            || self.current_desktop_mode() == desired
+        {
+            return false;
+        }
+
+        let workspace = self.current_workspace();
+        let slot = workspace - 1;
+        match desired {
+            DesktopMode::Floating => {
+                self.stop_tiling_workspace(workspace);
+                true
+            }
+            DesktopMode::Tiled | DesktopMode::Grid => {
+                let wanted_pattern = match desired {
+                    DesktopMode::Tiled => TilePattern::MasterStack,
+                    DesktopMode::Grid => TilePattern::Grid,
+                    DesktopMode::Floating => unreachable!(),
+                };
+                if self.layout_modes[slot] == LayoutMode::Tiled {
+                    // Existing toggle validates every prospective tile before
+                    // switching the pattern, including client min/max sizes.
+                    self.toggle_grid_layout(output_size)
+                } else {
+                    let previous = self.tile_patterns[slot];
+                    self.tile_patterns[slot] = wanted_pattern;
+                    if self.toggle_tiling(output_size) {
+                        true
+                    } else {
+                        self.tile_patterns[slot] = previous;
+                        false
+                    }
+                }
+            }
+        }
+    }
+
+    /// Switch to the requested tiled layout, or return to Floating when the
+    /// shortcut for the *already active* layout is pressed again.
+    ///
+    /// T: Floating <-> MasterStack; G: Floating <-> Grid.
+    /// Pressing the other shortcut switches directly between the two tiled
+    /// patterns, without visiting Floating in between.
+    pub fn toggle_desktop_mode(&mut self, mode: DesktopMode, output_size: (i32, i32)) -> bool {
+        let desired = if self.current_desktop_mode() == mode {
+            DesktopMode::Floating
+        } else {
+            mode
+        };
+        self.set_desktop_mode(desired, output_size)
     }
 
     fn tile_targets_for_workspace(
@@ -3957,5 +4035,120 @@ mod transient_placement_tests {
         };
         let child = Rectangle::<i32, Logical>::new((0, 0).into(), (300, 200).into());
         assert_eq!(centered_transient_origin(area, parent, child), (0, 30));
+    }
+}
+
+#[cfg(test)]
+mod direct_desktop_modes_tests {
+    use super::*;
+
+    const OUTPUT: (i32, i32) = (1280, 800);
+
+    #[test]
+    fn every_mode_is_reachable_directly_from_every_other_mode() {
+        for initial in [DesktopMode::Floating, DesktopMode::Tiled, DesktopMode::Grid] {
+            for destination in [DesktopMode::Floating, DesktopMode::Tiled, DesktopMode::Grid] {
+                let mut wm = WindowManager::default();
+                wm.configure_startup(TilingSettings::default());
+                if initial != DesktopMode::Floating {
+                    assert!(wm.set_desktop_mode(initial, OUTPUT));
+                }
+                assert_eq!(wm.current_desktop_mode(), initial);
+                if initial == destination {
+                    assert!(!wm.set_desktop_mode(destination, OUTPUT));
+                } else {
+                    assert!(wm.set_desktop_mode(destination, OUTPUT));
+                }
+                assert_eq!(wm.current_desktop_mode(), destination);
+            }
+        }
+    }
+
+    #[test]
+    fn t_shortcut_toggles_tiled_windowed() {
+        let mut wm = WindowManager::default();
+        wm.configure_startup(TilingSettings::default());
+        assert!(wm.toggle_desktop_mode(DesktopMode::Tiled, OUTPUT));
+        assert_eq!(wm.current_desktop_mode(), DesktopMode::Tiled);
+        assert!(wm.toggle_desktop_mode(DesktopMode::Tiled, OUTPUT));
+        assert_eq!(wm.current_desktop_mode(), DesktopMode::Floating);
+    }
+
+    #[test]
+    fn g_shortcut_toggles_grid_windowed() {
+        let mut wm = WindowManager::default();
+        wm.configure_startup(TilingSettings::default());
+        assert!(wm.toggle_desktop_mode(DesktopMode::Grid, OUTPUT));
+        assert_eq!(wm.current_desktop_mode(), DesktopMode::Grid);
+        assert!(wm.toggle_desktop_mode(DesktopMode::Grid, OUTPUT));
+        assert_eq!(wm.current_desktop_mode(), DesktopMode::Floating);
+    }
+
+    #[test]
+    fn t_and_g_switch_directly_and_second_press_returns_to_windowed() {
+        let mut wm = WindowManager::default();
+        wm.configure_startup(TilingSettings::default());
+
+        // Windowed -> Tiled -> Grid -> Windowed
+        assert!(wm.toggle_desktop_mode(DesktopMode::Tiled, OUTPUT));
+        assert_eq!(wm.current_desktop_mode(), DesktopMode::Tiled);
+        assert!(wm.toggle_desktop_mode(DesktopMode::Grid, OUTPUT));
+        assert_eq!(wm.current_desktop_mode(), DesktopMode::Grid);
+        assert!(wm.toggle_desktop_mode(DesktopMode::Grid, OUTPUT));
+        assert_eq!(wm.current_desktop_mode(), DesktopMode::Floating);
+
+        // Windowed -> Grid -> Tiled -> Windowed
+        assert!(wm.toggle_desktop_mode(DesktopMode::Grid, OUTPUT));
+        assert_eq!(wm.current_desktop_mode(), DesktopMode::Grid);
+        assert!(wm.toggle_desktop_mode(DesktopMode::Tiled, OUTPUT));
+        assert_eq!(wm.current_desktop_mode(), DesktopMode::Tiled);
+        assert!(wm.toggle_desktop_mode(DesktopMode::Tiled, OUTPUT));
+        assert_eq!(wm.current_desktop_mode(), DesktopMode::Floating);
+    }
+
+    #[test]
+    fn mode_toggles_apply_only_to_current_workspace() {
+        let mut wm = WindowManager::default();
+        wm.configure_startup(TilingSettings::default());
+        assert!(wm.toggle_desktop_mode(DesktopMode::Grid, OUTPUT));
+        assert!(wm.switch_to_workspace(2));
+        assert_eq!(wm.current_desktop_mode(), DesktopMode::Floating);
+        assert!(wm.toggle_desktop_mode(DesktopMode::Tiled, OUTPUT));
+        assert!(wm.switch_to_workspace(1));
+        assert_eq!(wm.current_desktop_mode(), DesktopMode::Grid);
+        assert!(wm.toggle_desktop_mode(DesktopMode::Grid, OUTPUT));
+        assert_eq!(wm.current_desktop_mode(), DesktopMode::Floating);
+        assert!(wm.switch_to_workspace(2));
+        assert_eq!(wm.current_desktop_mode(), DesktopMode::Tiled);
+    }
+
+    #[test]
+    fn mode_is_independent_for_each_workspace() {
+        let mut wm = WindowManager::default();
+        wm.configure_startup(TilingSettings::default());
+        assert!(wm.set_desktop_mode(DesktopMode::Grid, OUTPUT));
+        assert!(wm.switch_to_workspace(2));
+        assert_eq!(wm.current_desktop_mode(), DesktopMode::Floating);
+        assert!(wm.set_desktop_mode(DesktopMode::Tiled, OUTPUT));
+        assert!(wm.switch_to_workspace(1));
+        assert_eq!(wm.current_desktop_mode(), DesktopMode::Grid);
+        assert!(wm.switch_to_workspace(2));
+        assert_eq!(wm.current_desktop_mode(), DesktopMode::Tiled);
+    }
+
+    #[test]
+    fn startup_grid_is_shown_only_when_layout_is_tiled() {
+        let mut wm = WindowManager::default();
+        let mut grids = [false; WORKSPACE_COUNT];
+        grids[0] = true;
+        wm.configure_startup(TilingSettings {
+            grid_workspaces: Some(grids),
+            ..TilingSettings::default()
+        });
+        assert_eq!(wm.current_desktop_mode(), DesktopMode::Floating);
+        assert!(wm.set_desktop_mode(DesktopMode::Grid, OUTPUT));
+        assert_eq!(wm.current_desktop_mode(), DesktopMode::Grid);
+        assert!(wm.set_desktop_mode(DesktopMode::Tiled, OUTPUT));
+        assert_eq!(wm.current_desktop_mode(), DesktopMode::Tiled);
     }
 }
