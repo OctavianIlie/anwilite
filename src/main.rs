@@ -112,6 +112,11 @@ fn resize_cursor_icon(edge: xdg_toplevel::ResizeEdge) -> CursorIcon {
 
 const ANWILITE_SOCKET_NAME: &str = "octlitch-0";
 
+/// Per-key diagnostics. Off by default: they print the code of every key
+/// pressed (passwords included) to stdout, which is usually captured by the
+/// journal or a log file. Enable only while debugging input handling.
+const LOG_KEY_EVENTS: bool = false;
+
 /// Area relative to the geometry origin of the popup's direct parent.
 fn popup_constraint_area(area: SnapRect, parent: (i32, i32)) -> Rectangle<i32, Logical> {
     Rectangle::new(
@@ -1044,7 +1049,7 @@ fn launch_configured_app(label: &str, argv: &[String], children: &mut Vec<std::p
 
 pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = config::load();
-    let mut last_config_snapshot = config::snapshot();
+    let mut config_watcher = config::ConfigWatcher::new();
 
     assert!(
         config.active_border.is_valid(),
@@ -1237,31 +1242,36 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             state.windows.pending_resize_wait()
         };
         event_loop.dispatch(wait, &mut pending_clients)?;
+        // Housekeeping runs on the 500 ms timer tick instead of on every
+        // loop iteration (which includes every pointer-motion event).
+        let housekeeping_due = reload_due.replace(false);
+
         // Check whether applications launched by Anwilite have exited.
-        launched_children.retain_mut(|child| match child.try_wait() {
-            Ok(None) => true,
+        if housekeeping_due {
+            launched_children.retain_mut(|child| match child.try_wait() {
+                Ok(None) => true,
 
-            Ok(Some(status)) => {
-                println!("Anwilite: process {} exited with {status}", child.id());
+                Ok(Some(status)) => {
+                    println!("Anwilite: process {} exited with {status}", child.id());
 
-                false
-            }
+                    false
+                }
 
-            Err(error) => {
-                eprintln!("Anwilite: cannot check process {}: {error}", child.id());
+                Err(error) => {
+                    eprintln!("Anwilite: cannot check process {}: {error}", child.id());
 
-                false
-            }
-        });
+                    false
+                }
+            });
 
-        if reload_due.replace(false)
-            && config::snapshot_changed(&mut last_config_snapshot, config::snapshot())
-        {
-            let output_size = state.output_size;
+            // One stat() per tick; the file is only read when it changed.
+            if config_watcher.changed() {
+                let output_size = state.output_size;
 
-            if reload_configuration(&mut config, &mut state.windows, output_size) {
-                state.window_rules = config.window_rules.clone();
-                state.needs_redraw = true;
+                if reload_configuration(&mut config, &mut state.windows, output_size) {
+                    state.window_rules = config.window_rules.clone();
+                    state.needs_redraw = true;
+                }
             }
         }
 
@@ -1341,12 +1351,14 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     let held_keys = keyboard.pressed_keys();
 
-                    println!(
-                        "Anwilite host focus: focused={}, held_keys={:?}, modifiers_before={:?}",
-                        focused,
-                        held_keys,
-                        keyboard.modifier_state(),
-                    );
+                    if LOG_KEY_EVENTS {
+                        println!(
+                            "Anwilite host focus: focused={}, held_keys={:?}, modifiers_before={:?}",
+                            focused,
+                            held_keys,
+                            keyboard.modifier_state(),
+                        );
+                    }
 
                     for keycode in held_keys {
                         let serial = smithay::utils::SERIAL_COUNTER.next_serial();
@@ -1370,7 +1382,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                     InputEvent::Keyboard { event } => {
                         let serial = smithay::utils::SERIAL_COUNTER.next_serial();
                         let time = start_time.elapsed().as_millis() as u32;
-                        if event.state() == KeyState::Pressed {
+                        if LOG_KEY_EVENTS && event.state() == KeyState::Pressed {
                             let focused = keyboard.current_focus();
 
                             println!(
@@ -1621,7 +1633,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                                     }
 
                                     WorkspaceCommand::ReloadConfig => {
-                                        last_config_snapshot = config::snapshot();
+                                        config_watcher.resync();
                                         let reloaded = reload_configuration(
                                             &mut config,
                                             &mut state.windows,
@@ -2148,13 +2160,17 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
         let previous_count = state.windows.windows.len();
 
         state.windows.retain_live();
-        border_buffers.retain(|surface, _| {
-            state
-                .windows
-                .windows
-                .iter()
-                .any(|window| window.surface.wl_surface() == surface)
-        });
+        // Buffers exist only for windows that were drawn, so a surplus means
+        // some window is gone. Skips an O(n^2) scan on every loop iteration.
+        if border_buffers.len() > state.windows.windows.len() {
+            border_buffers.retain(|surface, _| {
+                state
+                    .windows
+                    .windows
+                    .iter()
+                    .any(|window| window.surface.wl_surface() == surface)
+            });
+        }
 
         if state.windows.windows.len() != previous_count {
             println!(
@@ -2247,7 +2263,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                 let focused = keyboard.current_focus();
                 let focused_rect = state.windows.focused_window_rect(focused.as_ref());
 
-                let mut elements = Vec::<AnwiliteRenderElement>::new();
+                let mut elements = Vec::<AnwiliteRenderElement>::with_capacity(64);
 
                 // Client surface cursors are hidden during compositor border resizing.
                 if draw_client_surface

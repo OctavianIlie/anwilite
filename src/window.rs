@@ -174,6 +174,9 @@ pub struct ManagedWindow {
     // A newly opened client that cannot fit a tile remains floating without
     // changing the layout mode of its workspace (e.g. a large file dialog).
     auto_floating: bool,
+    // Tiled mode only: set when a tile was focused after this floating-class
+    // window, so it is drawn behind the tiles until it is focused again.
+    sent_back: bool,
 }
 
 impl ManagedWindow {
@@ -978,6 +981,7 @@ impl WindowManager {
                 parent: None,
                 transient_placed: false,
                 auto_floating: false,
+                sent_back: false,
             },
         );
         self.keep_floating_above_tiles(workspace);
@@ -1539,6 +1543,7 @@ impl WindowManager {
             .filter(|window| window.workspace == workspace)
         {
             window.auto_floating = false;
+            window.sent_back = false;
             // A maximized tile is only zoomed within the tiled workspace.
             // Exiting tiling must also clear its maximized protocol state.
             let was_maximized_tile = window.tiled.is_some() && window.maximized;
@@ -2141,18 +2146,90 @@ impl WindowManager {
         Some(surface)
     }
 
+    /// Tiled mode stacking, front to back:
+    ///   0. auto-floating windows and transients that are not sent back,
+    ///   1. ordinary tiles (their relative order is the tile order),
+    ///   2. auto-floating windows a tile has since taken focus from.
+    /// The sort is stable, so tile order is never disturbed.
     fn keep_floating_above_tiles(&mut self, workspace: usize) {
         if self.layout_modes[workspace - 1] != LayoutMode::Tiled {
             return;
         }
 
         self.windows.sort_by_key(|window| {
-            !(window.workspace == workspace && (window.auto_floating || window.parent.is_some()))
+            if window.workspace != workspace {
+                return 1u8;
+            }
+            match (
+                window.auto_floating || window.parent.is_some(),
+                window.sent_back,
+            ) {
+                (true, false) => 0,
+                (false, _) => 1,
+                (true, true) => 2,
+            }
         });
+    }
+
+    /// Mark `root` and its transients as in front of / behind the tiles.
+    fn set_sent_back(&mut self, root: &WlSurface, sent_back: bool) {
+        for window in &mut self.windows {
+            let belongs =
+                window.surface.wl_surface() == root || window.parent.as_ref() == Some(root);
+            if belongs && (!sent_back || window.auto_floating || window.parent.is_some()) {
+                window.sent_back = sent_back;
+            }
+        }
+    }
+
+    /// Focus decides which side of the tiles a floating-class window is on:
+    /// focusing it brings it (and its dialogs) forward; focusing a tile sends
+    /// every auto-floating window behind the tiles.
+    fn restack_floating_for_focus(&mut self, surface: &WlSurface) {
+        let Some((workspace, root, is_floating_class)) = self
+            .windows
+            .iter()
+            .find(|window| self.is_window_visible(window) && window.surface.wl_surface() == surface)
+            .map(|window| {
+                (
+                    window.workspace,
+                    window.parent.clone().unwrap_or_else(|| surface.clone()),
+                    window.auto_floating || window.parent.is_some(),
+                )
+            })
+        else {
+            return;
+        };
+
+        if self.layout_modes[workspace - 1] != LayoutMode::Tiled {
+            return;
+        }
+
+        if is_floating_class {
+            self.set_sent_back(&root, false);
+        } else {
+            let floating_roots: Vec<WlSurface> = self
+                .windows
+                .iter()
+                .filter(|window| {
+                    window.workspace == workspace
+                        && window.auto_floating
+                        && window.parent.is_none()
+                        && window.surface.alive()
+                })
+                .map(|window| window.surface.wl_surface().clone())
+                .collect();
+            for floating in floating_roots {
+                self.set_sent_back(&floating, true);
+            }
+        }
+        self.keep_floating_above_tiles(workspace);
     }
 
     /// Make keyboard-focused floating windows visible without changing tile order.
     pub fn raise_focused_floating(&mut self, surface: &WlSurface) {
+        self.restack_floating_for_focus(surface);
+
         if let Some(index) = self.windows.iter().position(|window| {
             self.is_window_visible(window) && window.surface.wl_surface() == surface
         }) {
@@ -2373,9 +2450,9 @@ impl WindowManager {
         }
 
         // Hide children while their parent is minimized or no longer alive.
-        if let Some(parent) = window.parent.clone()
+        if let Some(parent) = window.parent.as_ref()
             && self.windows.iter().any(|other| {
-                other.surface.wl_surface() == &parent && (other.minimized || !other.surface.alive())
+                other.surface.wl_surface() == parent && (other.minimized || !other.surface.alive())
             })
         {
             return false;
@@ -2546,25 +2623,15 @@ impl WindowManager {
     }
 
     pub fn raise_at(&mut self, px: f64, py: f64) -> Option<WlSurface> {
-        let current = self.current_workspace();
+        let surface = self
+            .windows
+            .iter()
+            .find(|window| self.is_window_visible(window) && Self::hit_window(window, px, py))
+            .map(|window| window.surface.wl_surface().clone())?;
 
-        let index = self.windows.iter().position(|window| {
-            self.is_window_visible(window) && Self::hit_window(window, px, py)
-        })?;
-
-        let surface = self.windows[index].surface.wl_surface().clone();
-
-        // Floating windows are raised when clicked.
-        // Tiled windows keep their layout order.
-        if self.layout_modes[current - 1] == LayoutMode::Floating
-            || self.windows[index].auto_floating
-            || self.windows[index].parent.is_some()
-        {
-            let window = self.windows.remove(index);
-            self.windows.insert(0, window);
-        }
-
-        self.raise_transients_of(&surface);
+        // Same stacking policy as keyboard focus: floating windows rise when
+        // clicked, tiles keep their order and send auto-floating windows back.
+        self.raise_focused_floating(&surface);
         Some(surface)
     }
 

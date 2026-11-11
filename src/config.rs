@@ -3,7 +3,11 @@ use crate::keybindings::{BindingSpec, KeyBindings};
 use crate::layout::TilingSettings;
 use crate::workspace::WORKSPACE_COUNT;
 use serde::Deserialize;
-use std::{env, fs, io, path::PathBuf};
+use std::{
+    env, fs, io,
+    path::{Path, PathBuf},
+    time::SystemTime,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppCommands {
@@ -349,17 +353,93 @@ pub enum ConfigFileSnapshot {
     ReadError(io::ErrorKind),
 }
 
-pub fn snapshot() -> ConfigFileSnapshot {
-    let Some(path) = config_path() else {
+/// Cheap fingerprint of the config file, obtained with one `stat` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileStamp {
+    Missing,
+    File {
+        modified: Option<SystemTime>,
+        len: u64,
+    },
+    Error(io::ErrorKind),
+}
+
+fn stamp_of(path: Option<&Path>) -> FileStamp {
+    let Some(path) = path else {
+        return FileStamp::Missing;
+    };
+
+    match fs::metadata(path) {
+        Ok(metadata) => FileStamp::File {
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => FileStamp::Missing,
+        Err(error) => FileStamp::Error(error.kind()),
+    }
+}
+
+fn read_snapshot(path: Option<&Path>) -> ConfigFileSnapshot {
+    let Some(path) = path else {
         return ConfigFileSnapshot::Missing;
     };
 
     match fs::read(path) {
         Ok(contents) => ConfigFileSnapshot::Contents(contents),
-
         Err(error) if error.kind() == io::ErrorKind::NotFound => ConfigFileSnapshot::Missing,
-
         Err(error) => ConfigFileSnapshot::ReadError(error.kind()),
+    }
+}
+
+/// Detects configuration edits without reading the file on every poll.
+/// A poll costs one `stat`; the file is only read (and compared byte for
+/// byte, so a mere `touch` never triggers a reload) when its modification
+/// time or length changes.
+pub struct ConfigWatcher {
+    path: Option<PathBuf>,
+    stamp: FileStamp,
+    snapshot: ConfigFileSnapshot,
+}
+
+impl Default for ConfigWatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ConfigWatcher {
+    pub fn new() -> Self {
+        Self::for_path(config_path())
+    }
+
+    fn for_path(path: Option<PathBuf>) -> Self {
+        let mut watcher = Self {
+            path,
+            stamp: FileStamp::Missing,
+            snapshot: ConfigFileSnapshot::Missing,
+        };
+        watcher.resync();
+        watcher
+    }
+
+    /// Adopt the file's current state as the baseline (e.g. after a manual reload).
+    pub fn resync(&mut self) {
+        // The stamp is taken before the read: an edit that lands in between
+        // changes the stamp again, so the next poll still notices it.
+        self.stamp = stamp_of(self.path.as_deref());
+        self.snapshot = read_snapshot(self.path.as_deref());
+    }
+
+    /// True once per actual change of the configuration file's contents.
+    pub fn changed(&mut self) -> bool {
+        let stamp = stamp_of(self.path.as_deref());
+        if stamp == self.stamp {
+            return false;
+        }
+        self.stamp = stamp;
+
+        let current = read_snapshot(self.path.as_deref());
+        snapshot_changed(&mut self.snapshot, current)
     }
 }
 
@@ -528,6 +608,34 @@ mod tests {
 
         // Deleting the configuration is also a change.
         assert!(snapshot_changed(&mut previous, ConfigFileSnapshot::Missing,));
+    }
+
+    #[test]
+    fn watcher_reports_each_edit_once_and_ignores_touch() {
+        let dir = env::temp_dir().join(format!("anwilite-watch-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        // A missing file is a valid baseline.
+        let mut watcher = ConfigWatcher::for_path(Some(path.clone()));
+        assert!(!watcher.changed());
+
+        fs::write(&path, b"color=teal").unwrap();
+        assert!(watcher.changed());
+        assert!(!watcher.changed());
+
+        // Same contents, new modification time: no reload.
+        fs::write(&path, b"color=teal").unwrap();
+        assert!(!watcher.changed());
+
+        fs::write(&path, b"color=purple!").unwrap();
+        assert!(watcher.changed());
+
+        fs::remove_file(&path).unwrap();
+        assert!(watcher.changed());
+        assert!(!watcher.changed());
+
+        let _ = fs::remove_dir(&dir);
     }
 
     #[test]
