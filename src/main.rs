@@ -568,6 +568,9 @@ impl SeatHandler for App {
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
         // Keep Anwilite's existing focus bookkeeping.
         self.windows.remember_focus(focused);
+        if let Some(surface) = focused {
+            self.windows.raise_focused_floating(surface);
+        }
 
         // Clipboard selection follows the focused Wayland client.
         let client = focused.and_then(|surface| surface.client());

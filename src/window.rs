@@ -980,6 +980,7 @@ impl WindowManager {
                 auto_floating: false,
             },
         );
+        self.keep_floating_above_tiles(workspace);
     }
 
     /// Apply a workspace rule once when the client first supplies an app ID.
@@ -1254,6 +1255,9 @@ impl WindowManager {
             TilePattern::Grid => TilePattern::MasterStack,
         };
         if self.current_layout_mode() == LayoutMode::Tiled {
+            self.exclude_windows_that_cannot_fit(workspace, next, output_size);
+        }
+        if self.current_layout_mode() == LayoutMode::Tiled {
             let participants: Vec<&ManagedWindow> = self
                 .windows
                 .iter()
@@ -1405,6 +1409,128 @@ impl WindowManager {
 
         true
     }
+    fn float_incompatible_window(&mut self, index: usize) {
+        let window = &mut self.windows[index];
+        window.auto_floating = true;
+
+        if window.tiled.is_none() {
+            return;
+        }
+
+        let normal = window.pre_tile.take();
+        let was_maximized = window.maximized;
+
+        window.tiled = None;
+        window.maximized = false;
+        set_tiled_edges(&window.surface, false);
+
+        if let Some(fullscreen) = window.fullscreen_restore.as_mut() {
+            if let Some(normal) = normal {
+                fullscreen.normal = normal;
+            }
+            return;
+        }
+
+        if let Some(normal) = normal {
+            if let Some(geometry) = window_geometry(window) {
+                window.x = normal.left - geometry.loc.x;
+                window.y = normal.top - geometry.loc.y;
+            }
+            window.restoring = Some((normal, Instant::now()));
+        }
+
+        window.surface.with_pending_state(|state| {
+            if was_maximized {
+                state.states.unset(xdg_toplevel::State::Maximized);
+            }
+            state.size = normal.map(|n| (n.width, n.height).into());
+        });
+
+        window.surface.send_configure();
+    }
+    fn exclude_windows_that_cannot_fit(
+        &mut self,
+        workspace: usize,
+        pattern: TilePattern,
+        output_size: (i32, i32),
+    ) {
+        loop {
+            let indices: Vec<usize> = self
+                .windows
+                .iter()
+                .enumerate()
+                .filter(|(_, w)| {
+                    w.workspace == workspace
+                        && w.surface.alive()
+                        && !w.minimized
+                        && w.parent.is_none()
+                        && !w.auto_floating
+                })
+                .map(|(i, _)| i)
+                .collect();
+
+            if indices.is_empty() {
+                return;
+            }
+
+            let targets = layout_rects_in_area(
+                self.current_work_area(output_size),
+                indices.len(),
+                self.tiling_settings.gaps,
+                self.master_ratio_for_workspace(workspace),
+                pattern,
+            );
+
+            let incompatible = if targets.as_ref().is_some_and(|rects| {
+                indices
+                    .iter()
+                    .zip(rects.iter())
+                    .all(|(&i, &rect)| window_can_fit_tile(&self.windows[i], rect))
+            }) {
+                None
+            } else {
+                indices
+                    .iter()
+                    .copied()
+                    .find(|&candidate| {
+                        let remaining: Vec<_> = indices
+                            .iter()
+                            .copied()
+                            .filter(|&i| i != candidate)
+                            .collect();
+
+                        layout_rects_in_area(
+                            self.current_work_area(output_size),
+                            remaining.len(),
+                            self.tiling_settings.gaps,
+                            self.master_ratio_for_workspace(workspace),
+                            pattern,
+                        )
+                        .is_some_and(|rects| {
+                            remaining
+                                .iter()
+                                .zip(rects.iter())
+                                .all(|(&i, &rect)| window_can_fit_tile(&self.windows[i], rect))
+                        })
+                    })
+                    .or_else(|| {
+                        indices
+                            .iter()
+                            .copied()
+                            .find(|&i| self.windows[i].tiled.is_none())
+                    })
+                    .or_else(|| indices.last().copied())
+            };
+
+            let Some(index) = incompatible else {
+                return;
+            };
+
+            eprintln!("Anwilite: excluding incompatible window from tiling");
+            self.float_incompatible_window(index);
+            self.keep_floating_above_tiles(workspace);
+        }
+    }
 
     fn stop_tiling_workspace(&mut self, workspace: usize) {
         for window in self
@@ -1412,6 +1538,7 @@ impl WindowManager {
             .iter_mut()
             .filter(|window| window.workspace == workspace)
         {
+            window.auto_floating = false;
             // A maximized tile is only zoomed within the tiled workspace.
             // Exiting tiling must also clear its maximized protocol state.
             let was_maximized_tile = window.tiled.is_some() && window.maximized;
@@ -1515,6 +1642,12 @@ impl WindowManager {
             .collect();
 
         let targets = self.tile_targets_for_workspace(workspace, indices.len(), output_size);
+
+        self.exclude_windows_that_cannot_fit(
+            workspace,
+            self.tile_patterns[workspace - 1],
+            output_size,
+        );
 
         let cant_fit = targets.as_ref().is_none_or(|targets| {
             indices
@@ -1724,7 +1857,7 @@ impl WindowManager {
             self.stop_tiling_workspace(workspace);
             return true;
         }
-
+        self.exclude_windows_that_cannot_fit(workspace, self.tile_patterns[slot], output_size);
         // FLOATING -> TILED
         let windows: Vec<&ManagedWindow> = self
             .windows
@@ -1912,8 +2045,15 @@ impl WindowManager {
             .collect();
 
         let focused = focused?;
-        let current_index = tiles.iter().position(|surface| surface == focused)?;
-        let next_index = adjacent_tile_index(current_index, tiles.len(), direction)?;
+
+        let next_index = match tiles.iter().position(|surface| surface == focused) {
+            Some(index) => adjacent_tile_index(index, tiles.len(), direction)?,
+
+            None => match direction {
+                TileFocusDirection::Next => 0,
+                TileFocusDirection::Previous => tiles.len().checked_sub(1)?,
+            },
+        };
 
         Some(tiles[next_index].clone())
     }
@@ -2001,19 +2141,31 @@ impl WindowManager {
         Some(surface)
     }
 
-    /// Make keyboard-focused floating windows visible without changing tile order.
-    pub fn raise_focused_floating(&mut self, surface: &WlSurface) {
-        if self.current_layout_mode() != LayoutMode::Floating {
-            self.raise_transients_of(surface);
+    fn keep_floating_above_tiles(&mut self, workspace: usize) {
+        if self.layout_modes[workspace - 1] != LayoutMode::Tiled {
             return;
         }
+
+        self.windows.sort_by_key(|window| {
+            !(window.workspace == workspace && (window.auto_floating || window.parent.is_some()))
+        });
+    }
+
+    /// Make keyboard-focused floating windows visible without changing tile order.
+    pub fn raise_focused_floating(&mut self, surface: &WlSurface) {
         if let Some(index) = self.windows.iter().position(|window| {
             self.is_window_visible(window) && window.surface.wl_surface() == surface
-        }) && index != 0
-        {
-            let window = self.windows.remove(index);
-            self.windows.insert(0, window);
+        }) {
+            let should_raise = self.current_layout_mode() == LayoutMode::Floating
+                || self.windows[index].auto_floating
+                || self.windows[index].parent.is_some();
+
+            if should_raise && index != 0 {
+                let window = self.windows.remove(index);
+                self.windows.insert(0, window);
+            }
         }
+
         self.raise_transients_of(surface);
     }
 
@@ -2404,7 +2556,10 @@ impl WindowManager {
 
         // Floating windows are raised when clicked.
         // Tiled windows keep their layout order.
-        if self.layout_modes[current - 1] == LayoutMode::Floating {
+        if self.layout_modes[current - 1] == LayoutMode::Floating
+            || self.windows[index].auto_floating
+            || self.windows[index].parent.is_some()
+        {
             let window = self.windows.remove(index);
             self.windows.insert(0, window);
         }
