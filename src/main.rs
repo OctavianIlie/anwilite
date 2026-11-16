@@ -448,6 +448,7 @@ impl ClientDndGrabHandler for App {
 
         // Keep the tested Stage 2 render-only client icon unchanged.
         self.dnd_debug_icon = icon;
+        self.dnd_icon_offset = Point::from((0, 0));
         self.dnd_debug_icon_commit_seen = false;
         self.needs_redraw = true;
     }
@@ -471,6 +472,7 @@ impl ClientDndGrabHandler for App {
         );
         self.dnd_source_client_id = None;
         self.dnd_debug_icon = None;
+        self.dnd_icon_offset = Point::from((0, 0));
         self.dnd_debug_icon_commit_seen = false;
         self.needs_redraw = true;
     }
@@ -497,6 +499,27 @@ impl CompositorHandler for App {
             self.dnd_debug_icon_commit_seen = true;
             println!("Anwilite DnD: icon surface committed");
         }
+
+        if self.dnd_debug_icon.as_ref() == Some(surface) {
+            let delta = with_states(surface, |states| {
+                states
+                    .cached_state
+                    .get::<SurfaceAttributes>()
+                    .current()
+                    .buffer_delta
+                    .take()
+                    .unwrap_or_else(|| Point::from((0, 0)))
+            });
+            if delta != Point::from((0, 0)) {
+                self.dnd_icon_offset += delta;
+                println!(
+                    "Anwilite DnD: icon offset += {delta:?} => {:?}",
+                    self.dnd_icon_offset
+                );
+                self.needs_redraw = true;
+            }
+        }
+
         // PopupManager::commit may read XDG role state. Process it only after
         // display.dispatch_clients() has completed, avoiding callback re-entry.
         self.pending_popup_commits.push(surface.clone());
@@ -607,6 +630,7 @@ struct App {
     dnd_source_client_id: Option<ClientId>,
     // The Stage 2 drag icon is rendered without changing client buffer state.
     dnd_debug_icon: Option<WlSurface>,
+    dnd_icon_offset: Point<i32, Logical>,
     dnd_debug_icon_commit_seen: bool,
     needs_redraw: bool,
     output_size: (i32, i32),
@@ -1097,6 +1121,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             xdg_drag_active: false,
             dnd_source_client_id: None,
             dnd_debug_icon: None,
+            dnd_icon_offset: Point::from((0, 0)),
             dnd_debug_icon_commit_seen: false,
             needs_redraw: true,
             output_size: (1, 1), // Updated immediately after Winit initializes.
@@ -2095,6 +2120,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
         {
             println!("Anwilite DnD: icon surface destroyed");
             state.dnd_debug_icon = None;
+            state.dnd_icon_offset = Point::from((0, 0));
             state.dnd_debug_icon_commit_seen = false;
         }
 
@@ -2301,10 +2327,13 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Render the client's drag icon above applications and layers.
                 // This stage deliberately does NOT modify SurfaceAttributes,
-                // buffer_delta, or client buffers; offsets come in a later stage.
+
                 if let Some(surface) = state.dnd_debug_icon.as_ref().filter(|s| s.alive()) {
                     let (x, y) = state.pointer_position;
-                    let origin = (x.round() as i32, y.round() as i32);
+                    let origin = (
+                        x.round() as i32 + state.dnd_icon_offset.x,
+                        y.round() as i32 + state.dnd_icon_offset.y,
+                    );
                     elements.extend(
                         render_elements_from_surface_tree(
                             renderer,
