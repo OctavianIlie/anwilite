@@ -1,5 +1,6 @@
 mod appearance;
 mod config;
+mod ipc;
 mod keybindings;
 mod layout;
 mod mode_status;
@@ -1197,6 +1198,9 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
         |_, _, _pending_clients| Ok(PostAction::Continue),
     )?;
 
+    // Lesson 38: local control/status socket for bars, shells and scripts.
+    let mut ipc_server = ipc::IpcServer::new(&event_loop.handle());
+
     let mut pending_clients = Vec::new();
     let mut clients = Vec::new();
 
@@ -2282,6 +2286,73 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // Lesson 38: IPC requests run here, after Wayland dispatch and focus
+        // recovery, and take the same focus path as keyboard shortcuts.
+        let ipc_handle = event_loop.handle();
+        for (client, command) in ipc_server.poll(&ipc_handle) {
+            let (result, changed) = match command {
+                ipc::IpcCommand::SwitchWorkspace(number) => {
+                    if number == state.windows.current_workspace() {
+                        (Ok(()), false)
+                    } else if state.windows.switch_to_workspace(number) {
+                        (Ok(()), true)
+                    } else {
+                        (
+                            Err("cannot switch workspace during a window move or resize".into()),
+                            false,
+                        )
+                    }
+                }
+                ipc::IpcCommand::SetMode(mode) => {
+                    if state.windows.current_desktop_mode() == mode {
+                        (Ok(()), false)
+                    } else if state.windows.set_desktop_mode(mode, state.output_size) {
+                        (Ok(()), true)
+                    } else {
+                        (
+                            Err(format!(
+                                "cannot switch to {} now (window size limits, fullscreen or a window operation in progress)",
+                                ipc::mode_name(mode)
+                            )),
+                            false,
+                        )
+                    }
+                }
+            };
+
+            if changed {
+                state.windows.end_window_cycle();
+                let focus = state.windows.focused_surface();
+                keyboard.set_focus(
+                    &mut state,
+                    focus,
+                    smithay::utils::SERIAL_COUNTER.next_serial(),
+                );
+
+                let (x, y) = state.pointer_position;
+                let pointer_focus = state.pointer_surface_at(x, y);
+                pointer.motion(
+                    &mut state,
+                    pointer_focus,
+                    &MotionEvent {
+                        location: (x, y).into(),
+                        serial: smithay::utils::SERIAL_COUNTER.next_serial(),
+                        time: start_time.elapsed().as_millis() as u32,
+                    },
+                );
+                pointer.frame(&mut state);
+                state.needs_redraw = true;
+                println!("Anwilite IPC: {command:?}");
+            }
+
+            ipc_server.reply(client, result);
+        }
+        if ipc_server.has_clients() {
+            let focused = keyboard.current_focus();
+            let snapshot = ipc_snapshot(&state, focused.as_ref());
+            ipc_server.publish(&ipc_handle, &snapshot);
+        }
+
         // Also detects workspace switches, config reloads, or fallback to
         // floating caused by an incompatible layout during client commits.
         // Only writes the JSON file when the displayed state changes.
@@ -2734,6 +2805,49 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             frame_timer = std::time::Instant::now();
         }
     }
+}
+
+/// Lesson 38: the state published to IPC clients (one JSON line).
+fn ipc_snapshot(state: &App, focused: Option<&WlSurface>) -> String {
+    // Only report a real managed window, not a launcher layer or popup.
+    let (app_id, title) = focused
+        .filter(|surface| state.windows.focus_is_valid(surface))
+        .map(|surface| {
+            with_states(surface, |states| {
+                states
+                    .data_map
+                    .get::<XdgToplevelSurfaceData>()
+                    .and_then(|data| {
+                        data.lock()
+                            .ok()
+                            .map(|data| (data.app_id.clone(), data.title.clone()))
+                    })
+                    .unwrap_or((None, None))
+            })
+        })
+        .unwrap_or((None, None));
+
+    let mut window_counts = [0; workspace::WORKSPACE_COUNT];
+    for window in &state.windows.windows {
+        if window.surface.alive()
+            && let Some(count) = window
+                .workspace
+                .checked_sub(1)
+                .and_then(|index| window_counts.get_mut(index))
+        {
+            *count += 1;
+        }
+    }
+
+    ipc::Snapshot {
+        workspace: state.windows.current_workspace(),
+        mode: state.windows.current_desktop_mode(),
+        fullscreen: state.windows.fullscreen_window().is_some(),
+        focused_app_id: app_id.as_deref(),
+        focused_title: title.as_deref(),
+        window_counts,
+    }
+    .to_json()
 }
 
 pub fn send_frames_surface_tree(surface: &wl_surface::WlSurface, time: u32) {
