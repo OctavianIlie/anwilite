@@ -1,4 +1,3 @@
-
 use crate::window::DesktopMode;
 use crate::workspace::WORKSPACE_COUNT;
 use calloop::{Interest, LoopHandle, Mode, PostAction, RegistrationToken, generic::Generic};
