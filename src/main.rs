@@ -23,6 +23,9 @@ use smithay::desktop::{
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
 use smithay::wayland::selection::data_device::set_data_device_focus;
+use smithay::wayland::selection::primary_selection::{
+    PrimarySelectionHandler, PrimarySelectionState, set_primary_focus,
+};
 use smithay::wayland::shell::wlr_layer::{
     KeyboardInteractivity, Layer, LayerSurface, LayerSurfaceCachedState, WlrLayerShellHandler,
     WlrLayerShellState,
@@ -47,7 +50,8 @@ use smithay::{
         },
         winit::{self, WinitEvent},
     },
-    delegate_compositor, delegate_data_device, delegate_seat, delegate_shm, delegate_xdg_shell,
+    delegate_compositor, delegate_data_device, delegate_primary_selection, delegate_seat,
+    delegate_shm, delegate_xdg_shell,
     input::{
         Seat, SeatHandler, SeatState,
         keyboard::FilterResult,
@@ -427,6 +431,13 @@ impl DataDeviceHandler for App {
     }
 }
 
+// Lesson 37: primary selection (select text, middle-click to paste).
+impl PrimarySelectionHandler for App {
+    fn primary_selection_state(&self) -> &PrimarySelectionState {
+        &self.primary_selection_state
+    }
+}
+
 impl ClientDndGrabHandler for App {
     fn started(
         &mut self,
@@ -600,10 +611,11 @@ impl SeatHandler for App {
             self.windows.raise_focused_floating(surface);
         }
 
-        // Clipboard selection follows the focused Wayland client.
+        // Clipboard and middle-click selection follow the focused Wayland client.
         let client = focused.and_then(|surface| surface.client());
 
-        set_data_device_focus(&self.display_handle, seat, client);
+        set_data_device_focus(&self.display_handle, seat, client.clone());
+        set_primary_focus(&self.display_handle, seat, client);
 
         self.needs_redraw = true;
     }
@@ -620,6 +632,7 @@ struct App {
     shm_state: ShmState,
     seat_state: SeatState<Self>,
     data_device_state: DataDeviceState,
+    primary_selection_state: PrimarySelectionState,
 
     seat: Seat<Self>,
     windows: WindowManager,
@@ -1114,6 +1127,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             shm_state,
             seat_state,
             data_device_state: DataDeviceState::new::<App>(&dh),
+            primary_selection_state: PrimarySelectionState::new::<App>(&dh),
             seat,
             windows: WindowManager::default(),
             pointer_position: (0.0, 0.0),
@@ -1248,6 +1262,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
     let mut host_cursor_visible = true;
     // Distinguish compositor-initiated border resize from client XDG resize.
     let mut border_resize_active = false;
+    let mut middle_move_active = false;
     // A popup-dismiss click must not activate the button beneath it.
     // Swallow the matching release to avoid an unmatched button sequence.
     let mut popup_dismiss_buttons = HashSet::<u32>::new();
@@ -2028,18 +2043,34 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                             state.needs_redraw = true;
                         }
 
-                        // Octlitch's window-dragging behavior.
-                        if event.button() == Some(MouseButton::Middle)
-                            && foreground_hit.is_none()
-                            && popup_hit.is_none()
-                            && ordinary_window_hit
-                        {
+                        // Super/Alt + middle-drag moves a window. A plain middle
+                        // click goes to the application (paste, open link in tab).
+                        let middle_move_modifier = {
+                            let modifiers = keyboard.modifier_state();
+                            modifiers.logo || modifiers.alt
+                        };
+                        let compositor_middle_move = event.button() == Some(MouseButton::Middle)
+                            && match event.state() {
+                                ButtonState::Pressed => {
+                                    middle_move_modifier
+                                        && foreground_hit.is_none()
+                                        && popup_hit.is_none()
+                                        && ordinary_window_hit
+                                }
+                                // Swallow exactly the release whose press we swallowed,
+                                // even if the modifier was released first.
+                                ButtonState::Released => middle_move_active,
+                            };
+
+                        if compositor_middle_move {
                             match event.state() {
                                 ButtonState::Pressed => {
+                                    middle_move_active = true;
                                     state.windows.start_drag(x, y);
                                 }
 
                                 ButtonState::Released => {
+                                    middle_move_active = false;
                                     state.windows.end_drag();
 
                                     let focus = state.pointer_surface_at(x, y);
@@ -2325,8 +2356,8 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
 
-                // Render the client's drag icon above applications and layers.
-                // This stage deliberately does NOT modify SurfaceAttributes,
+                // Render the client's drag icon above applications and layers,
+                // shifted by the client's accumulated attach/offset deltas.
 
                 if let Some(surface) = state.dnd_debug_icon.as_ref().filter(|s| s.alive()) {
                     let (x, y) = state.pointer_position;
@@ -2745,6 +2776,7 @@ delegate_compositor!(App);
 delegate_shm!(App);
 delegate_seat!(App);
 delegate_data_device!(App);
+delegate_primary_selection!(App);
 delegate_output!(App);
 delegate_layer_shell!(App);
 
