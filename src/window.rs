@@ -1452,6 +1452,72 @@ impl WindowManager {
 
         window.surface.send_configure();
     }
+
+    fn readmit_auto_floating_windows(&mut self, workspace: usize, output_size: (i32, i32)) -> bool {
+        if self.layout_modes[workspace - 1] != LayoutMode::Tiled {
+            return false;
+        }
+        let candidates: Vec<usize> = self
+            .windows
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| {
+                w.workspace == workspace
+                    && w.auto_floating
+                    && w.surface.alive()
+                    && !w.minimized
+                    && w.parent.is_none()
+                    && !w.maximized
+                    && w.snapped.is_none()
+                    && w.fullscreen_restore.is_none()
+                    && w.restoring.is_none()
+                    && w.pending_unsnap.is_none()
+                    && window_geometry(w).is_some()
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let mut admitted = false;
+        for candidate in candidates {
+            let participants: Vec<usize> = self
+                .windows
+                .iter()
+                .enumerate()
+                .filter(|(index, w)| {
+                    w.workspace == workspace
+                        && w.surface.alive()
+                        && !w.minimized
+                        && w.parent.is_none()
+                        && (!w.auto_floating || *index == candidate)
+                })
+                .map(|(index, _)| index)
+                .collect();
+
+            let Some(targets) =
+                self.tile_targets_for_workspace(workspace, participants.len(), output_size)
+            else {
+                continue;
+            };
+
+            if participants
+                .iter()
+                .zip(targets.iter())
+                .all(|(&index, &target)| window_can_fit_tile(&self.windows[index], target))
+            {
+                let window = &mut self.windows[candidate];
+                window.auto_floating = false;
+                window.sent_back = false;
+                admitted = true;
+                println!(
+                    "Anwilite: readmitted auto-floating window to tiling on workspace {workspace}"
+                );
+            }
+        }
+        if admitted {
+            self.keep_floating_above_tiles(workspace);
+        }
+        admitted
+    }
+
     fn exclude_windows_that_cannot_fit(
         &mut self,
         workspace: usize,
@@ -1631,6 +1697,8 @@ impl WindowManager {
         if self.layout_modes[workspace - 1] != LayoutMode::Tiled {
             return false;
         }
+
+        self.readmit_auto_floating_windows(workspace, output_size);
 
         let indices: Vec<usize> = self
             .windows
@@ -3216,6 +3284,11 @@ impl WindowManager {
                 });
 
                 window.surface.send_pending_configure();
+            }
+        }
+        for workspace in 1..=WORKSPACE_COUNT {
+            if self.readmit_auto_floating_windows(workspace, output_size) {
+                self.reflow_tiled_workspace(workspace, output_size);
             }
         }
     }
