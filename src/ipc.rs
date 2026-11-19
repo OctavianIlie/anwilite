@@ -1,7 +1,9 @@
 use crate::window::DesktopMode;
 use crate::workspace::WORKSPACE_COUNT;
 use calloop::{Interest, LoopHandle, Mode, PostAction, RegistrationToken, generic::Generic};
+use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::hash::Hash;
 use std::io::{self, ErrorKind, Read, Write as _};
 use std::os::fd::AsFd;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -19,6 +21,56 @@ const MAX_PENDING_OUTPUT: usize = 256 * 1024;
 pub enum IpcCommand {
     SwitchWorkspace(usize),
     SetMode(DesktopMode),
+    FocusWindow(u64),
+    CloseWindow(u64),
+    ReloadConfig,
+}
+
+/// Stable numeric ids for windows, handed out the first time a window is
+/// seen and never reused. Generic so it can be unit-tested without Wayland.
+pub struct IdMap<K> {
+    next: u64,
+    ids: HashMap<K, u64>,
+}
+
+impl<K: Hash + Eq + Clone> IdMap<K> {
+    pub fn new() -> Self {
+        Self {
+            next: 1,
+            ids: HashMap::new(),
+        }
+    }
+
+    pub fn id_for(&mut self, key: &K) -> u64 {
+        if let Some(&id) = self.ids.get(key) {
+            return id;
+        }
+        let id = self.next;
+        self.next += 1;
+        self.ids.insert(key.clone(), id);
+        id
+    }
+
+    pub fn key_for(&self, id: u64) -> Option<K> {
+        self.ids
+            .iter()
+            .find(|(_, candidate)| **candidate == id)
+            .map(|(key, _)| key.clone())
+    }
+
+    /// Forget keys that no longer exist (closed windows).
+    pub fn retain(&mut self, mut keep: impl FnMut(&K) -> bool) {
+        self.ids.retain(|key, _| keep(key));
+    }
+}
+
+/// One managed window in a snapshot.
+pub struct WindowEntry<'a> {
+    pub id: u64,
+    pub app_id: Option<&'a str>,
+    pub title: Option<&'a str>,
+    pub workspace: usize,
+    pub focused: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -34,9 +86,14 @@ pub struct Snapshot<'a> {
     pub workspace: usize,
     pub mode: DesktopMode,
     pub fullscreen: bool,
+    pub focused_id: Option<u64>,
     pub focused_app_id: Option<&'a str>,
     pub focused_title: Option<&'a str>,
     pub window_counts: [usize; WORKSPACE_COUNT],
+    /// Sorted by id, so a task list does not reshuffle when focus changes.
+    pub windows: Vec<WindowEntry<'a>>,
+    /// Increases after every successful config reload.
+    pub config_generation: u64,
 }
 
 impl Snapshot<'_> {
@@ -49,8 +106,18 @@ impl Snapshot<'_> {
             mode_name(self.mode),
             self.fullscreen,
         );
-        if self.focused_app_id.is_some() || self.focused_title.is_some() {
-            out.push_str(r#"{"app_id":"#);
+        if self.focused_id.is_some()
+            || self.focused_app_id.is_some()
+            || self.focused_title.is_some()
+        {
+            out.push_str(r#"{"id":"#);
+            match self.focused_id {
+                Some(id) => {
+                    let _ = write!(out, "{id}");
+                }
+                None => out.push_str("null"),
+            }
+            out.push_str(r#","app_id":"#);
             push_json_optional(&mut out, self.focused_app_id);
             out.push_str(r#","title":"#);
             push_json_optional(&mut out, self.focused_title);
@@ -70,7 +137,22 @@ impl Snapshot<'_> {
                 id == self.workspace
             );
         }
-        out.push_str("]}");
+        out.push_str(r#"],"windows":["#);
+        for (index, window) in self.windows.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            let _ = write!(out, r#"{{"id":{},"app_id":"#, window.id);
+            push_json_optional(&mut out, window.app_id);
+            out.push_str(r#","title":"#);
+            push_json_optional(&mut out, window.title);
+            let _ = write!(
+                out,
+                r#","workspace":{},"focused":{}}}"#,
+                window.workspace, window.focused
+            );
+        }
+        let _ = write!(out, r#"],"config_generation":{}}}"#, self.config_generation);
         out
     }
 }
@@ -111,8 +193,21 @@ fn parse_request(line: &str) -> Result<Request, String> {
             "grid" => Ok(Request::Command(IpcCommand::SetMode(DesktopMode::Grid))),
             _ => Err("mode must be windowed, tiled or grid".into()),
         },
-        ("state" | "subscribe" | "ping", Some(_)) => Err(format!("{verb} takes no argument")),
-        ("workspace" | "mode", None) => Err(format!("{verb} needs an argument")),
+        ("focus" | "close", Some(id)) => match id.parse::<u64>() {
+            Ok(id) if id > 0 => Ok(Request::Command(if verb == "focus" {
+                IpcCommand::FocusWindow(id)
+            } else {
+                IpcCommand::CloseWindow(id)
+            })),
+            _ => Err("window id must be a positive number".into()),
+        },
+        ("reload", None) => Ok(Request::Command(IpcCommand::ReloadConfig)),
+        ("state" | "subscribe" | "ping" | "reload", Some(_)) => {
+            Err(format!("{verb} takes no argument"))
+        }
+        ("workspace" | "mode" | "focus" | "close", None) => {
+            Err(format!("{verb} needs an argument"))
+        }
         _ => Err(format!("unknown request: {verb}")),
     }
 }
@@ -545,17 +640,77 @@ mod tests {
             workspace: 1,
             mode: DesktopMode::Tiled,
             fullscreen: false,
+            focused_id: Some(7),
             focused_app_id: Some("org.kde.kate"),
             focused_title: Some("notes \"draft\""),
             window_counts: counts,
+            windows: vec![
+                WindowEntry {
+                    id: 3,
+                    app_id: Some("org.kde.dolphin"),
+                    title: None,
+                    workspace: 1,
+                    focused: false,
+                },
+                WindowEntry {
+                    id: 7,
+                    app_id: Some("org.kde.kate"),
+                    title: Some("notes \"draft\""),
+                    workspace: 1,
+                    focused: true,
+                },
+            ],
+            config_generation: 2,
         }
         .to_json();
         assert!(json.starts_with(r#"{"type":"state","workspace":1,"mode":"tiled""#));
-        assert!(json.contains(r#""focused":{"app_id":"org.kde.kate","title":"notes \"draft\""}"#));
+        assert!(
+            json.contains(
+                r#""focused":{"id":7,"app_id":"org.kde.kate","title":"notes \"draft\""}"#
+            )
+        );
         assert!(json.contains(r#"{"id":1,"windows":2,"active":true}"#));
         assert!(json.contains(r#"{"id":10,"windows":0,"active":false}"#));
-        assert!(json.ends_with("]}"));
+        assert!(json.contains(
+            r#""windows":[{"id":3,"app_id":"org.kde.dolphin","title":null,"workspace":1,"focused":false},{"id":7,"#
+        ));
+        assert!(json.ends_with(r#"],"config_generation":2}"#));
         assert_eq!(json.lines().count(), 1);
+    }
+
+    #[test]
+    fn parses_window_and_config_commands() {
+        assert_eq!(
+            parse_request("focus 12"),
+            Ok(Request::Command(IpcCommand::FocusWindow(12)))
+        );
+        assert_eq!(
+            parse_request("close 4"),
+            Ok(Request::Command(IpcCommand::CloseWindow(4)))
+        );
+        assert_eq!(
+            parse_request("reload"),
+            Ok(Request::Command(IpcCommand::ReloadConfig))
+        );
+        for bad in ["focus", "focus 0", "focus -1", "close x", "reload now"] {
+            assert!(parse_request(bad).is_err(), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn window_ids_are_stable_and_never_reused() {
+        let mut ids = IdMap::new();
+        let kate = ids.id_for(&"kate");
+        let dolphin = ids.id_for(&"dolphin");
+        assert_eq!(ids.id_for(&"kate"), kate);
+        assert_ne!(kate, dolphin);
+        assert_eq!(ids.key_for(dolphin), Some("dolphin"));
+
+        ids.retain(|key| *key != "kate");
+        assert_eq!(ids.key_for(kate), None);
+        // A window that reappears (a new surface) gets a fresh id.
+        let reopened = ids.id_for(&"kate");
+        assert!(reopened > dolphin);
     }
 
     #[test]
@@ -564,12 +719,16 @@ mod tests {
             workspace: 4,
             mode: DesktopMode::Floating,
             fullscreen: true,
+            focused_id: None,
             focused_app_id: None,
             focused_title: None,
             window_counts: [0; WORKSPACE_COUNT],
+            windows: Vec::new(),
+            config_generation: 0,
         }
         .to_json();
         assert!(json.contains(r#""mode":"windowed","fullscreen":true,"focused":null"#));
+        assert!(json.contains(r#""windows":[],"config_generation":0}"#));
     }
 
     #[test]

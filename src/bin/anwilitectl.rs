@@ -23,6 +23,17 @@ struct State {
     mode: String,
     focused: Option<Focused>,
     workspaces: Vec<Workspace>,
+    windows: Vec<WindowInfo>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct WindowInfo {
+    id: u64,
+    app_id: Option<String>,
+    title: Option<String>,
+    workspace: usize,
+    focused: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -56,6 +67,10 @@ fn main() -> ExitCode {
         ["workspace", number] => one_shot(&format!("workspace {number}")),
         ["mode", mode] => one_shot(&format!("mode {mode}")),
         ["cycle-mode"] => cycle_mode(),
+        ["windows"] => list_windows(),
+        ["focus", id] => one_shot(&format!("focus {id}")),
+        ["close", id] => one_shot(&format!("close {id}")),
+        ["reload"] => one_shot("reload"),
         ["waybar", "workspace", number] => match number.parse::<usize>() {
             Ok(number) if (1..=10).contains(&number) => waybar(View::Workspace(number)),
             _ => usage(),
@@ -68,7 +83,7 @@ fn main() -> ExitCode {
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: anwilitectl state | ping | workspace <1-10> | mode <windowed|tiled|grid> | cycle-mode\n       anwilitectl waybar workspace <1-10> | waybar mode | waybar title"
+        "usage: anwilitectl state | ping | workspace <1-10> | mode <windowed|tiled|grid> | cycle-mode\n       anwilitectl windows | focus <id> | close <id> | reload\n       anwilitectl waybar workspace <1-10> | waybar mode | waybar title"
     );
     ExitCode::from(2)
 }
@@ -109,19 +124,45 @@ fn one_shot(line: &str) -> ExitCode {
     }
 }
 
-fn cycle_mode() -> ExitCode {
-    let state = match request("state") {
-        Ok(reply) => reply
-            .lines()
-            .find_map(|line| serde_json::from_str::<State>(line).ok())
-            .filter(|state| state.kind == "state"),
+/// Ask for one state snapshot, reporting errors on stderr.
+fn fetch_state() -> Option<State> {
+    let reply = match request("state") {
+        Ok(reply) => reply,
         Err(error) => {
             eprintln!("anwilitectl: cannot reach Anwilite: {error}");
-            return ExitCode::FAILURE;
+            return None;
         }
     };
-    let Some(state) = state else {
+    let state = reply
+        .lines()
+        .find_map(|line| serde_json::from_str::<State>(line).ok())
+        .filter(|state| state.kind == "state");
+    if state.is_none() {
         eprintln!("anwilitectl: unexpected reply from Anwilite");
+    }
+    state
+}
+
+fn list_windows() -> ExitCode {
+    let Some(state) = fetch_state() else {
+        return ExitCode::FAILURE;
+    };
+    println!("{:>4}  {:>2}  {:<40}  TITLE", "ID", "WS", "APP");
+    for window in &state.windows {
+        let marker = if window.focused { "*" } else { " " };
+        println!(
+            "{:>4}{marker} {:>2}  {:<40}  {}",
+            window.id,
+            window.workspace,
+            window.app_id.as_deref().unwrap_or("-"),
+            window.title.as_deref().unwrap_or("")
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+fn cycle_mode() -> ExitCode {
+    let Some(state) = fetch_state() else {
         return ExitCode::FAILURE;
     };
     let next = match state.mode.as_str() {
@@ -257,6 +298,8 @@ fn render_title(state: &State) -> String {
     .to_string()
 }
 
+/// Waybar renders custom-module text as Pango markup; a title such as
+/// "Q&A <draft>" must not be parsed as markup.
 fn pango_escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for character in text.chars() {

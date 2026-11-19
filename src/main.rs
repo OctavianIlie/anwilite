@@ -1024,16 +1024,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     run_winit()
 }
 
+/// Ok(true): new settings applied. Ok(false): file unchanged.
+/// Err: the reason the previous settings were kept (also reported over IPC).
 fn reload_configuration(
     current: &mut config::AnwiliteConfig,
     windows: &mut WindowManager,
     output_size: (i32, i32),
-) -> bool {
+) -> Result<bool, String> {
     let next = match config::try_load() {
         Ok(next) => next,
         Err(error) => {
-            eprintln!("Anwilite: reload failed: {error}");
-            return false;
+            let message = format!("reload failed: {error}");
+            eprintln!("Anwilite: {message}");
+            return Err(message);
         }
     };
 
@@ -1041,22 +1044,24 @@ fn reload_configuration(
     if next.tiling != current.tiling
         && let Err(error) = windows.apply_tiling_settings(next.tiling, output_size)
     {
-        eprintln!("Anwilite: reload rejected: {error}; keeping previous settings");
-        return false;
+        let message = format!("reload rejected: {error}; keeping previous settings");
+        eprintln!("Anwilite: {message}");
+        return Err(message);
     }
 
     match current.apply_reload(Ok(next)) {
         Ok(true) => {
             println!("Anwilite: configuration reloaded");
-            true
+            Ok(true)
         }
         Ok(false) => {
             println!("Anwilite: configuration unchanged");
-            false
+            Ok(false)
         }
         Err(error) => {
-            eprintln!("Anwilite: reload failed: {error}");
-            false
+            let message = format!("reload failed: {error}");
+            eprintln!("Anwilite: {message}");
+            Err(message)
         }
     }
 }
@@ -1200,6 +1205,10 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
     // Lesson 38: local control/status socket for bars, shells and scripts.
     let mut ipc_server = ipc::IpcServer::new(&event_loop.handle());
+    // Lesson 40: stable window ids for IPC, and a counter that tells
+    // subscribers when the configuration was reloaded.
+    let mut window_ids: ipc::IdMap<WlSurface> = ipc::IdMap::new();
+    let mut config_generation: u64 = 0;
 
     let mut pending_clients = Vec::new();
     let mut clients = Vec::new();
@@ -1312,8 +1321,10 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             if config_watcher.changed() {
                 let output_size = state.output_size;
 
-                if reload_configuration(&mut config, &mut state.windows, output_size) {
+                if let Ok(true) = reload_configuration(&mut config, &mut state.windows, output_size)
+                {
                     state.window_rules = config.window_rules.clone();
+                    config_generation += 1;
                     state.needs_redraw = true;
                 }
             }
@@ -1678,13 +1689,17 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
                                     WorkspaceCommand::ReloadConfig => {
                                         config_watcher.resync();
-                                        let reloaded = reload_configuration(
-                                            &mut config,
-                                            &mut state.windows,
-                                            state.output_size,
+                                        let reloaded = matches!(
+                                            reload_configuration(
+                                                &mut config,
+                                                &mut state.windows,
+                                                state.output_size,
+                                            ),
+                                            Ok(true)
                                         );
                                         if reloaded {
                                             state.window_rules = config.window_rules.clone();
+                                            config_generation += 1;
                                         }
                                         reloaded
                                     }
@@ -2290,7 +2305,10 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
         // recovery, and take the same focus path as keyboard shortcuts.
         let ipc_handle = event_loop.handle();
         for (client, command) in ipc_server.poll(&ipc_handle) {
-            let (result, changed) = match command {
+            // Set by `focus <id>`: the window to focus instead of the
+            // workspace's remembered one.
+            let mut focus_target: Option<WlSurface> = None;
+            let (result, changed): (Result<(), String>, bool) = match command {
                 ipc::IpcCommand::SwitchWorkspace(number) => {
                     if number == state.windows.current_workspace() {
                         (Ok(()), false)
@@ -2301,6 +2319,78 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                             Err("cannot switch workspace during a window move or resize".into()),
                             false,
                         )
+                    }
+                }
+                ipc::IpcCommand::FocusWindow(id) => {
+                    window_ids.retain(|surface| surface.alive());
+                    let target = window_ids.key_for(id).and_then(|surface| {
+                        state
+                            .windows
+                            .windows
+                            .iter()
+                            .find(|window| {
+                                window.surface.alive() && window.surface.wl_surface() == &surface
+                            })
+                            .map(|window| (surface, window.workspace))
+                    });
+                    match target {
+                        None => (Err(format!("no window with id {id}")), false),
+                        Some((surface, workspace)) => {
+                            let switched = workspace != state.windows.current_workspace();
+                            if switched && !state.windows.switch_to_workspace(workspace) {
+                                (
+                                    Err("cannot switch workspace during a window move or resize"
+                                        .into()),
+                                    false,
+                                )
+                            } else if state.windows.focus_is_valid(&surface) {
+                                state.windows.raise_focused_floating(&surface);
+                                focus_target = Some(surface);
+                                (Ok(()), true)
+                            } else {
+                                // Workspace may have changed; still refresh focus.
+                                (
+                                    Err(format!(
+                                        "window {id} is minimized or hidden (show desktop, fullscreen or a maximized tile)"
+                                    )),
+                                    switched,
+                                )
+                            }
+                        }
+                    }
+                }
+                ipc::IpcCommand::CloseWindow(id) => {
+                    window_ids.retain(|surface| surface.alive());
+                    let toplevel = window_ids.key_for(id).and_then(|surface| {
+                        state
+                            .windows
+                            .windows
+                            .iter()
+                            .find(|window| {
+                                window.surface.alive() && window.surface.wl_surface() == &surface
+                            })
+                            .map(|window| window.surface.clone())
+                    });
+                    match toplevel {
+                        Some(toplevel) => {
+                            // Same request as the window's own close button;
+                            // the app may still ask "save changes?".
+                            toplevel.send_close();
+                            (Ok(()), false)
+                        }
+                        None => (Err(format!("no window with id {id}")), false),
+                    }
+                }
+                ipc::IpcCommand::ReloadConfig => {
+                    config_watcher.resync();
+                    match reload_configuration(&mut config, &mut state.windows, state.output_size) {
+                        Ok(true) => {
+                            state.window_rules = config.window_rules.clone();
+                            config_generation += 1;
+                            (Ok(()), true)
+                        }
+                        Ok(false) => (Ok(()), false),
+                        Err(error) => (Err(error), false),
                     }
                 }
                 ipc::IpcCommand::SetMode(mode) => {
@@ -2322,7 +2412,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
             if changed {
                 state.windows.end_window_cycle();
-                let focus = state.windows.focused_surface();
+                let focus = focus_target.or_else(|| state.windows.focused_surface());
                 keyboard.set_focus(
                     &mut state,
                     focus,
@@ -2349,7 +2439,8 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
         }
         if ipc_server.has_clients() {
             let focused = keyboard.current_focus();
-            let snapshot = ipc_snapshot(&state, focused.as_ref());
+            let snapshot =
+                ipc_snapshot(&state, focused.as_ref(), &mut window_ids, config_generation);
             ipc_server.publish(&ipc_handle, &snapshot);
         }
 
@@ -2807,47 +2898,85 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// Lesson 38: the state published to IPC clients (one JSON line).
-fn ipc_snapshot(state: &App, focused: Option<&WlSurface>) -> String {
-    // Only report a real managed window, not a launcher layer or popup.
-    let (app_id, title) = focused
-        .filter(|surface| state.windows.focus_is_valid(surface))
-        .map(|surface| {
-            with_states(surface, |states| {
-                states
-                    .data_map
-                    .get::<XdgToplevelSurfaceData>()
-                    .and_then(|data| {
-                        data.lock()
-                            .ok()
-                            .map(|data| (data.app_id.clone(), data.title.clone()))
-                    })
-                    .unwrap_or((None, None))
-            })
-        })
-        .unwrap_or((None, None));
+/// Lessons 38/40: the state published to IPC clients (one JSON line).
+fn ipc_snapshot(
+    state: &App,
+    focused: Option<&WlSurface>,
+    window_ids: &mut ipc::IdMap<WlSurface>,
+    config_generation: u64,
+) -> String {
+    // Forget closed windows so their ids are never handed out again.
+    window_ids.retain(|surface| surface.alive());
 
+    // Only report a real managed window, not a launcher layer or popup.
+    let focused = focused.filter(|surface| state.windows.focus_is_valid(surface));
+
+    // Collect owned strings first; the snapshot borrows them below.
     let mut window_counts = [0; workspace::WORKSPACE_COUNT];
+    let mut collected: Vec<(u64, Option<String>, Option<String>, usize, bool)> = Vec::new();
     for window in &state.windows.windows {
-        if window.surface.alive()
-            && let Some(count) = window
-                .workspace
-                .checked_sub(1)
-                .and_then(|index| window_counts.get_mut(index))
+        if !window.surface.alive() {
+            continue;
+        }
+        if let Some(count) = window
+            .workspace
+            .checked_sub(1)
+            .and_then(|index| window_counts.get_mut(index))
         {
             *count += 1;
         }
+        let surface = window.surface.wl_surface();
+        let (app_id, title) = toplevel_app_id_and_title(surface);
+        collected.push((
+            window_ids.id_for(surface),
+            app_id,
+            title,
+            window.workspace,
+            focused == Some(surface),
+        ));
     }
+    // Stable order for task lists: oldest window first.
+    collected.sort_by_key(|(id, ..)| *id);
+
+    let focused_entry = collected.iter().find(|(.., is_focused)| *is_focused);
 
     ipc::Snapshot {
         workspace: state.windows.current_workspace(),
         mode: state.windows.current_desktop_mode(),
         fullscreen: state.windows.fullscreen_window().is_some(),
-        focused_app_id: app_id.as_deref(),
-        focused_title: title.as_deref(),
+        focused_id: focused_entry.map(|(id, ..)| *id),
+        focused_app_id: focused_entry.and_then(|(_, app_id, ..)| app_id.as_deref()),
+        focused_title: focused_entry.and_then(|(_, _, title, ..)| title.as_deref()),
         window_counts,
+        windows: collected
+            .iter()
+            .map(
+                |(id, app_id, title, workspace, is_focused)| ipc::WindowEntry {
+                    id: *id,
+                    app_id: app_id.as_deref(),
+                    title: title.as_deref(),
+                    workspace: *workspace,
+                    focused: *is_focused,
+                },
+            )
+            .collect(),
+        config_generation,
     }
     .to_json()
+}
+
+fn toplevel_app_id_and_title(surface: &WlSurface) -> (Option<String>, Option<String>) {
+    with_states(surface, |states| {
+        states
+            .data_map
+            .get::<XdgToplevelSurfaceData>()
+            .and_then(|data| {
+                data.lock()
+                    .ok()
+                    .map(|data| (data.app_id.clone(), data.title.clone()))
+            })
+            .unwrap_or((None, None))
+    })
 }
 
 pub fn send_frames_surface_tree(surface: &wl_surface::WlSurface, time: u32) {
